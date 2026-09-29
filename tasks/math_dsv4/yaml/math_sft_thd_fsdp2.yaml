@@ -28,10 +28,12 @@ training:
   recompute: True
   enable_mtp: False
   # For FSDP2 DeepSeek-V4 TopKRouter
-  freeze_router_weight: False
+  freeze_moe_router: False
   freeze_router_correction_bias: True
   router_correction_bias_update_speed: 1e-3
   router_correction_bias_use_abs_update: True
+  enable_torch_compile: True
+  log_torch_recompiles: False
 
 policy:
   dist_config:

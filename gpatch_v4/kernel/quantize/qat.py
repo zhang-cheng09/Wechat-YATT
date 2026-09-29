@@ -205,6 +205,7 @@ def act_quant(
     kernel = act_quant_kernel(
         N,
         block_size,
+        in_dtype=FP32 if x.dtype == torch.float32 else BF16,
         scale_dtype=FP32,
         round_scale=scale_fmt is not None,
         inplace=inplace,
@@ -353,7 +354,6 @@ fp8_simulate_qat_128x128 = _FP8SimulateQAT128x128.apply
 
 
 def _fp4_simulate(x: torch.Tensor, block_size: int) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16, f"FP4 QAT requires bfloat16 input, got {x.dtype}"
     assert block_size == 32, f"FP4 QAT requires 1x32 blocks, got {block_size}"
     N = x.size(-1)
     assert N % block_size == 0
@@ -366,7 +366,7 @@ def _fp4_simulate(x: torch.Tensor, block_size: int) -> torch.Tensor:
         dtype=torch.float8_e8m0fnu,
         device=x.device,
     )
-    kernel = _fp4_quant_kernel(N, block_size)
+    kernel = _fp4_quant_kernel(N, block_size, in_dtype=FP32 if x.dtype == torch.float32 else BF16)
     kernel(x_c.view(-1, N), out.view(-1, N), scale.view(-1, N // block_size))
     return out
 
@@ -389,23 +389,25 @@ fp4_simulate_qat = _FP4SimulateQAT.apply
 
 
 def fp8_qat_linear(module: nn.Linear, x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
-    """nn.Linear forward with FP8 QAT fake-quant on the weight tensor.
+    """nn.Linear forward with FP8 QAT fake-quant on the weight tensor and activation.
 
     Equivalent to ``module(x)`` but the weight is passed through
     ``fp8_simulate_qat_128x128`` (E4M3 + E8M0, 128×128 tiles, STE backward)
-    before the GEMM.  The bias (if any) is applied unchanged.
+    before the GEMM. The activation is passed through ``fp8_simulate_qat`` before the GEMM.
+    The bias (if any) is applied unchanged.
 
     ``block_size`` is kept for call-site compatibility and must be 128.
     """
     assert block_size == 128, (
         f"fp8_qat_linear uses 128×128 weight tiles, got block_size={block_size}"
     )
+    x = fp8_simulate_qat(x, 128)
     weight = fp8_simulate_qat_128x128(module.weight)
     return F.linear(x, weight, module.bias)
 
 
 def fp4_qat_linear(module: nn.Linear, x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-    """Run ``module`` with E2M1 FP4 fake-quantized weights.
+    """Run ``module`` with E2M1 FP4 fake-quantized weights and FP8 fake-quantized activation.
 
     Parameters
     ----------
@@ -427,5 +429,6 @@ def fp4_qat_linear(module: nn.Linear, x: torch.Tensor, block_size: int = 32) -> 
         If the weight is not bfloat16, ``block_size`` is not 32, or the input
         dimension is not divisible by 32.
     """
+    x = fp8_simulate_qat(x, 128)
     weight = fp4_simulate_qat(module.weight, block_size)
     return F.linear(x, weight, module.bias)

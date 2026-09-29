@@ -1,0 +1,8 @@
+{"prompt": [{"role": "user", "content": "1+1"}], "label": "2", "level": 0}
+{"prompt": [{"role": "user", "content": "2+2"}], "label": "4", "level": 0}
+{"prompt": [{"role": "user", "content": "3*3"}], "label": "9", "level": 1}
+{"prompt": [{"role": "user", "content": "4*4"}], "label": "16", "level": 1}
+{"prompt": [{"role": "user", "content": "12*13"}], "label": "156", "level": 2}
+{"prompt": [{"role": "user", "content": "15*16"}], "label": "240", "level": 2}
+{"prompt": [{"role": "user", "content": "hard-a"}], "label": "1", "level": 3}
+{"prompt": [{"role": "user", "content": "hard-b"}], "label": "2", "level": 3}

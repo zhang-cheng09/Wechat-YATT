@@ -165,12 +165,6 @@ def test_rotate_activation_rejects_non_power_of_two_dim():
         rotate_activation(x)
 
 
-def test_rotate_activation_rejects_non_bf16():
-    x = torch.randn(8, INDEX_HEAD_DIM, device="cuda", dtype=torch.float32)
-    with pytest.raises(AssertionError, match="bfloat16"):
-        rotate_activation(x)
-
-
 # ---------------------------------------------------------------------------
 # (b) FP4 量化误差随离群程度的下降
 # ---------------------------------------------------------------------------

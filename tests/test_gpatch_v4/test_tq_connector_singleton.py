@@ -2,11 +2,13 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+import torch
+from tensordict import TensorDict
 
 import gpatch_v4.transfer as transfer
 import gpatch_v4.transfer.tq_connector as tq_connector
 import gpatch_v4.orches.utils as orches_utils
-from gpatch_v4.configs.tq_config import TqConfig, TqMooncakeConfig
+from gpatch_v4.configs.tq_config import TransferQueueConfig, TqMooncakeConfig
 
 
 class _FakeConnector:
@@ -19,13 +21,13 @@ class _FakeConnector:
 
 
 def test_tq_config_generates_partition_id_when_enabled():
-    config = TqConfig(enable=True)
+    config = TransferQueueConfig(enable=True)
 
     assert config.partition_id is not None
     assert len(config.partition_id) == 12
     int(config.partition_id, 16)
-    assert TqConfig().partition_id is None
-    configured = TqConfig(enable=True, partition_id="configured")
+    assert TransferQueueConfig().partition_id is None
+    configured = TransferQueueConfig(enable=True, partition_id="configured")
     assert configured.partition_id == "configured"
 
 
@@ -37,10 +39,10 @@ def test_tq_config_resolves_mooncake_runtime_defaults(monkeypatch):
         orches_utils, "is_port_available", lambda port: True
     )
     monkeypatch.setattr(
-        TqConfig, "get_active_rdma_device", lambda self: "mlx5_bond_0"
+        TransferQueueConfig, "get_active_rdma_device", lambda self: "mlx5_bond_0"
     )
 
-    config = TqConfig(
+    config = TransferQueueConfig(
         enable=True,
         backend="MooncakeStore",
         mooncake=TqMooncakeConfig(protocol="rdma"),
@@ -61,7 +63,7 @@ def test_tq_config_replaces_occupied_mooncake_port_pair(monkeypatch):
         lambda port: port != 55050,
     )
 
-    config = TqConfig(enable=True, backend="MooncakeStore")
+    config = TransferQueueConfig(enable=True, backend="MooncakeStore")
 
     assert config.mooncake.metadata_server == "10.0.0.1:55000"
     assert config.mooncake.master_server_address == "10.0.0.1:55001"
@@ -76,19 +78,19 @@ def test_tq_config_fails_when_mooncake_port_range_is_exhausted(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="No two consecutive Mooncake ports"):
-        TqConfig(enable=True, backend="MooncakeStore")
+        TransferQueueConfig(enable=True, backend="MooncakeStore")
 
 
 def test_tq_config_preserves_explicit_mooncake_endpoints(monkeypatch):
     monkeypatch.setattr(
-        TqConfig,
+        TransferQueueConfig,
         "find_available_mooncake_port_pair",
         lambda self: pytest.fail(
             "explicit endpoints must not trigger port probing"
         ),
     )
 
-    config = TqConfig(
+    config = TransferQueueConfig(
         enable=True,
         backend="MooncakeStore",
         mooncake=TqMooncakeConfig(
@@ -102,7 +104,7 @@ def test_tq_config_preserves_explicit_mooncake_endpoints(monkeypatch):
 
 
 def test_tq_config_converts_mooncake_sizes_from_gb_to_bytes():
-    config = TqConfig(
+    config = TransferQueueConfig(
         mooncake=TqMooncakeConfig(global_segment_size_gb=8, local_buffer_size_gb=2),
     )
     mooncake = config.to_tq_config().backend.MooncakeStore
@@ -112,7 +114,7 @@ def test_tq_config_converts_mooncake_sizes_from_gb_to_bytes():
     assert mooncake.global_segment_size == 8 * 1024**3
     assert mooncake.local_buffer_size == 2 * 1024**3
 
-    defaults = TqConfig().to_tq_config().backend.MooncakeStore
+    defaults = TransferQueueConfig().to_tq_config().backend.MooncakeStore
     assert defaults.global_segment_size == 4 * 1024**3
     assert defaults.local_buffer_size == 1 * 1024**3
 
@@ -152,7 +154,7 @@ def test_tq_connector_clears_only_keys_for_exact_step(monkeypatch):
         ),
     )
     connector = object.__new__(transfer.TqConnector)
-    connector.tq_config = TqConfig(
+    connector.tq_config = TransferQueueConfig(
         enable=True,
         partition_id="test-partition",
     )
@@ -162,6 +164,48 @@ def test_tq_connector_clears_only_keys_for_exact_step(monkeypatch):
     assert cleared == [
         (["step1:uid:prompt"], "test-partition"),
         (["step1:uid:hidden"], "test-partition"),
+    ]
+
+
+def test_tq_connector_clear_groups_selected_keys_by_latest_schema(monkeypatch):
+    cleared = []
+
+    async def async_kv_list(partition_id):
+        return {
+            partition_id: {
+                "step1:uid:a": {"fields": ["tokens"]},
+                "step1:uid:b": {"fields": ["normalized_rewards", "tokens"]},
+                "step1:uid:c": {"fields": ["tokens"]},
+                "step1:uid:unrelated": {"fields": ["tokens"]},
+            }
+        }
+
+    async def async_kv_clear(keys, partition_id):
+        cleared.append((list(keys), partition_id))
+
+    monkeypatch.setattr(
+        tq_connector,
+        "tq",
+        SimpleNamespace(
+            async_kv_list=async_kv_list,
+            async_kv_clear=async_kv_clear,
+        ),
+    )
+    connector = object.__new__(transfer.TqConnector)
+    connector.tq_config = TransferQueueConfig(
+        enable=True,
+        partition_id="test-partition",
+    )
+
+    asyncio.run(connector.async_clear([
+        "step1:uid:c",
+        "step1:uid:b",
+        "step1:uid:a",
+    ]))
+
+    assert cleared == [
+        (["step1:uid:c", "step1:uid:a"], "test-partition"),
+        (["step1:uid:b"], "test-partition"),
     ]
 
 
@@ -188,7 +232,7 @@ def test_tq_connector_clears_legacy_keys_individually(monkeypatch):
         ),
     )
     connector = object.__new__(transfer.TqConnector)
-    connector.tq_config = TqConfig(
+    connector.tq_config = TransferQueueConfig(
         enable=True,
         partition_id="test-partition",
     )
@@ -201,11 +245,50 @@ def test_tq_connector_clears_legacy_keys_individually(monkeypatch):
     ]
 
 
+def test_tq_connector_put_preserves_complete_schema_tags(monkeypatch):
+    puts = []
+
+    async def async_kv_batch_put(**kwargs):
+        puts.append(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        tq_connector,
+        "tq",
+        SimpleNamespace(async_kv_batch_put=async_kv_batch_put),
+    )
+    connector = object.__new__(transfer.TqConnector)
+    connector.tq_config = TransferQueueConfig(
+        enable=True,
+        partition_id="test-partition",
+    )
+    update = TensorDict(
+        {"normalized_rewards": torch.tensor([1.0, -1.0])},
+        batch_size=[2],
+    )
+
+    asyncio.run(
+        connector.async_put(
+            update,
+            ["step3:uid:a", "step3:uid:b"],
+            ppo_step=3,
+            schema_fields=["tokens", "rollout_logprobs", "normalized_rewards"],
+        )
+    )
+
+    assert puts[0]["keys"] == ["step3:uid:a", "step3:uid:b"]
+    assert puts[0]["partition_id"] == "test-partition"
+    assert puts[0]["tags"] == [{
+        "ppo_step": 3,
+        "fields": ["normalized_rewards", "rollout_logprobs", "tokens"],
+    }] * 2
+
+
 def test_tq_connector_process_singleton_lifecycle(monkeypatch):
     monkeypatch.setattr(transfer, "TqConnector", _FakeConnector)
     monkeypatch.setattr(transfer, "_TQ_CONNECTOR", None)
 
-    config = TqConfig(enable=True, partition_id="first")
+    config = TransferQueueConfig(enable=True, partition_id="first")
     connector = transfer.init_tq_connector(config)
 
     assert transfer.init_tq_connector(config) is connector
@@ -213,7 +296,7 @@ def test_tq_connector_process_singleton_lifecycle(monkeypatch):
 
     with pytest.raises(AssertionError, match="different config"):
         transfer.init_tq_connector(
-            TqConfig(enable=True, partition_id="second")
+            TransferQueueConfig(enable=True, partition_id="second")
         )
 
     transfer.close_tq_connector()
@@ -222,7 +305,8 @@ def test_tq_connector_process_singleton_lifecycle(monkeypatch):
         transfer.get_tq_connector()
 
     replacement = transfer.init_tq_connector(
-        TqConfig(enable=True, partition_id="second")
+        TransferQueueConfig(enable=True, partition_id="second")
     )
     assert replacement is not connector
     transfer.close_tq_connector()
+    assert replacement.closed

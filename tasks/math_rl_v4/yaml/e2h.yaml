@@ -1,0 +1,31 @@
+# Drop-in `data.e2h` block for GRPO recipes such as
+# `tasks/math_rl_v4/yaml/rl_grpo_dapo17k_config.yaml`.
+# Merge under `data:`. Every train record MUST have an integer `level`
+# (0 = easiest). Eval is not curriculumed.
+#
+# Example:
+#   data:
+#     e2h:
+#       enable: true
+#       curriculum_schedule: gaussian
+#       mu_exp: 0.5
+#       mu_end: 1.0
+#       # Or replace mu_end with: hard_end_prob: 0.35
+#       sigma: 0.5
+#       min_prob: true
+#       level_key: level
+#       set_total_ppo_step_from_hard_cover: true
+#
+# One epoch lasts until expected hard unique-cover (true) or every
+# level's expected unique-cover (false). num_train_epoches repeats
+# that curriculum (new seed each epoch). Explicit
+# training.total_ppo_step overrides cover-based horizon selection.
+
+e2h:
+  enable: true
+  curriculum_schedule: gaussian
+  mu_exp: 0.5
+  sigma: 0.5
+  min_prob: true
+  level_key: level
+  set_total_ppo_step_from_hard_cover: true

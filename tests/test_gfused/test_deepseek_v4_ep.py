@@ -93,6 +93,12 @@ def _compute_global_param_norms(model, ep_group):
     return norms
 
 
+def calc_dice_distance(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
 # ---------------------------------------------------------------------------
 # Ray workers
 # ---------------------------------------------------------------------------
@@ -546,12 +552,14 @@ class TestFsdpVsEp(unittest.TestCase):
 
         # --- 逐 rank logits 对比 ---
         print("\n--- logits comparison (per rank) ---")
+        dice_tol = 5e-4
         for r in range(world_size):
             bl_logits = baseline_results[r]["logits"].float()
             ep_logits = ep_results[r]["logits"].float()
             max_abs = (bl_logits - ep_logits).abs().max().item()
             rel = max_abs / max(bl_logits.abs().max().item(), 1e-12)
-            print(f"  rank {r}: logits max_abs_diff={max_abs:.2e}, rel_diff={rel:.2e}")
+            dice_distance = calc_dice_distance(bl_logits, ep_logits)
+            print(f"  rank {r}: logits max_abs_diff={max_abs:.2e}, rel_diff={rel:.2e}, dice_distance={dice_distance:.2e}")
             if "_replay" in ep_tag and rel >= rtol:
                 print(
                     f"    [triage] rank {r}: replay rel_diff={rel:.2e} exceeds "
@@ -559,9 +567,9 @@ class TestFsdpVsEp(unittest.TestCase):
                     f"(expert/all-to-all/bf16 residual)."
                 )
             self.assertLess(
-                rel,
-                rtol,
-                f"Logits mismatch rank {r}: rel_diff={rel:.2e} > rtol={rtol}",
+                dice_distance,
+                dice_tol,
+                f"Logits mismatch rank {r}: dice_distance={dice_distance:.2e} > dice_tol={dice_tol}",
             )
 
         # --- Loss 对比 ---

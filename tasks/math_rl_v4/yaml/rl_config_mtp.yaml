@@ -21,6 +21,7 @@ training:
   metrics_report:
     - "acc_reward"
     - "fmt_reward"
+  enable_mtp: True
   online_mtp_sft: True
 
 checkpoint:

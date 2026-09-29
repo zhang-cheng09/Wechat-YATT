@@ -29,7 +29,8 @@ from gpatch_v4.core.advantage_helper import (
 )
 from gpatch_v4.core.advantage_impl import mask_single_valid_sample_groups
 from gpatch_v4.core.constants import MODEL_ARCH
-from gpatch_v4.core.parallel_state import cpu_barrier, is_mp_and_cp_head
+from gpatch_v4.core.kl_ctrl import apply_kl_in_reward, update_kl_in_reward_controller
+from gpatch_v4.core.parallel_state import cpu_barrier, cpu_group, is_mp_and_cp_head
 from gpatch_v4.core.ppo_feature_store.keys import feature_history_key
 from gpatch_v4.orches import get_actor
 from gpatch_v4.utils import (
@@ -622,6 +623,9 @@ class RlTrainerMixin:
         log('rollout generate_ppo_data', rank=0)
 
         mask_list = []
+        kl_in_reward_seq_means = []
+        kl_in_reward_sums = []
+        kl_ctrl = self.kl_ctrl
 
         for rollout_batch in rollout_batches:
             # NOTE: all items in rollout batch or out of this computation must have a leading Batch dimension
@@ -729,6 +733,29 @@ class RlTrainerMixin:
                     for _ in range(len(logprobs))
                 ]
 
+            # verl-style KL-in-reward: scalar_reward -= coef * sum_t (old_logp - ref_logp)
+            # Applied before GRPO group normalization. Prefer grpo_kl_loss_beta=0 when on.
+            if kl_ctrl is not None and rewards is not None:
+                assert "ref_logprobs" in rollout_batch, (
+                    "ppo.use_kl_in_reward=True requires ref_logprobs in rollout_batch "
+                    "(ensure policy.without_ref=False and ref model is loaded)."
+                )
+                assert not self.config.ppo.skip_prev_logps, (
+                    "ppo.use_kl_in_reward is incompatible with skip_prev_logps=True."
+                )
+                kl_result = apply_kl_in_reward(
+                    rewards=rewards,
+                    old_logprobs=logprobs,
+                    ref_logprobs=rollout_batch["ref_logprobs"],
+                    mask=mask,
+                    kl_ctrl=kl_ctrl,
+                )
+                rewards = kl_result.rewards
+                rollout_batch["rewards_before_kl"] = kl_result.rewards_before
+                rollout_batch["rewards"] = rewards
+                kl_in_reward_seq_means.extend(kl_result.seq_mean_kls)
+                kl_in_reward_sums.extend(kl_result.kl_sums)
+
             if self.require_critic_model():
                 assert values[0].shape == logprobs[
                     0
@@ -834,6 +861,24 @@ class RlTrainerMixin:
         assert check_rollout_batches(rollout_batches), f"check rbs fmt error {rollout_batches=}"
         # average across the samples for the non global metrics
         ppo_rollout_metrics = {k: v / num_samples for k, v in ppo_rollout_metrics.items()}
+
+        # Adaptive KL-in-reward: one update per generate_ppo_data call, matching
+        # verl apply_kl_penalty (mean per-token KL, n_steps = global batch size).
+        # Write coef / mean after /num_samples so they are not incorrectly averaged.
+        if kl_ctrl is not None:
+            coef_used = kl_ctrl.value
+            if kl_in_reward_sums:
+                ppo_rollout_metrics["ppo-metrics/kl_in_reward"] = (
+                    coef_used * torch.stack(kl_in_reward_sums).mean().item()
+                )
+            # NOTE(guanyouhe): 这里有一个版本不上报，所以有参数没更新
+            ppo_rollout_metrics.update(
+                update_kl_in_reward_controller(
+                    kl_ctrl,
+                    kl_in_reward_seq_means,
+                    mpu.get_data_parallel_group(),
+                )
+            )
 
         global_stats = self.compute_ppo_global_statistics(rollout_batches)
         ppo_rollout_metrics.update(global_stats)
@@ -1449,6 +1494,42 @@ class FlopsCounterMixin:
             self.mfu_count = 0
             self.flops_counter = FlopsCounter(hf_config, self.config.policy.model_arch)
 
+    @staticmethod
+    def _get_mfu_batch_seqlens(expanded_rbs, seq_length):
+        """Get logical sequence lengths from local packed metadata."""
+        batch_seqlens = []
+        for rbs in expanded_rbs:
+            cu_seqlens_padded = rbs.get("cu_seqlens_padded")
+            if cu_seqlens_padded is None:
+                batch_seqlens.append(seq_length)
+                continue
+
+            assert cu_seqlens_padded.ndim == 1, ("packed cu_seqlens_padded must be one-dimensional")
+            packed_seqlens = torch.diff(cu_seqlens_padded)
+            assert bool(torch.all(packed_seqlens > 0)
+                       ), ("packed cu_seqlens_padded must define non-empty sequences")
+            batch_seqlens.extend(packed_seqlens.tolist())
+        return batch_seqlens
+
+    @staticmethod
+    def _get_mfu_images_seqlens(expanded_rbs, image_grid_thw_name):
+        """Get local vision-token lengths from image/video grids."""
+        images_seqlens = []
+        for rbs in expanded_rbs:
+            image_grid_thw = rbs.get(image_grid_thw_name)
+            if image_grid_thw is None and image_grid_thw_name != "vision_grid_thw":
+                image_grid_thw = rbs.get("vision_grid_thw")
+            if image_grid_thw is None or image_grid_thw.ndim < 2:
+                continue
+            if image_grid_thw.shape[0] == 0:
+                continue
+            image_seqlen = torch.repeat_interleave(
+                image_grid_thw[:, 1] * image_grid_thw[:, 2],
+                image_grid_thw[:, 0],
+            )
+            images_seqlens.extend(image_seqlen.tolist())
+        return images_seqlens
+
     def flops_counter_calc(
         self,
         train_step,
@@ -1457,6 +1538,9 @@ class FlopsCounterMixin:
         seq_length,
         seqlen_sum=None,
         seqlen_sq_sum=None,
+        batch_seqlens=None,
+        images_seqlens=None,
+        audio_seqlens=None,
     ):
         """Calculate the MFU based on the FLOPS counter.
 
@@ -1471,11 +1555,23 @@ class FlopsCounterMixin:
         delta_time : float
             Seconds to process the batch.
         seq_length : int
-            Uniform sequence length assumed when exact sums are not supplied.
+            Uniform sequence length for unpacked samples when exact sums are
+            not supplied. Packed samples derive their individual lengths from
+            ``cu_seqlens_padded``.
         seqlen_sum : int | float, optional
             ``Σ S`` over the global batch.
         seqlen_sq_sum : int | float, optional
             ``Σ S²`` over the global batch.
+        batch_seqlens : list[int], optional
+            Local per-sequence lengths. Callers that move packed batches to
+            CUDA in-place should collect these from CPU batch metadata before
+            the training step.
+        images_seqlens : list[int], optional
+            Local vision-token lengths collected before an in-place device
+            transfer.
+        audio_seqlens : list[int], optional
+            Local per-audio mel-frame lengths collected before an in-place
+            device transfer.
 
         Returns
         -------
@@ -1487,23 +1583,26 @@ class FlopsCounterMixin:
         avg_mfu = None
 
         if self.flops_counter and (train_step + 1) % self.calc_mfu_freq == 0:
+            gloo_dp_group = mpu.get_data_parallel_group_gloo()
+
             uses_global_seqlen_sums = (seqlen_sum is not None and seqlen_sq_sum is not None)
-            images_seqlens = []
-            audio_seqlens = []
+            local_images_seqlens = (
+                images_seqlens if images_seqlens is not None else
+                self._get_mfu_images_seqlens(expanded_rbs, self.image_grid_thw_name)
+            )
+            local_audio_seqlens = audio_seqlens if audio_seqlens is not None else []
             for rbs in expanded_rbs:
-                if self.image_grid_thw_name in rbs and rbs[self.image_grid_thw_name] is not None:
-                    image_grid_thw = rbs[self.image_grid_thw_name]
-                    if image_grid_thw.ndim >= 2 and image_grid_thw.shape[0] > 0:
-                        image_seqlen = torch.repeat_interleave(
-                            image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
-                        )
-                        images_seqlens.extend(image_seqlen.tolist())
-                # for welm_omni_v4_5
-                if "audio_feature_lengths" in rbs and rbs["audio_feature_lengths"] is not None:
-                    audio_seqlens.extend(rbs["audio_feature_lengths"].tolist())
+                # for omni models (welm_omni_v4_5 / qwen3_omni_moe)
+                if (
+                    audio_seqlens is None and "audio_feature_lengths" in rbs and
+                    rbs["audio_feature_lengths"] is not None
+                ):
+                    local_audio_seqlens.extend(rbs["audio_feature_lengths"].tolist())
             if (
-                uses_global_seqlen_sums and
-                self.config.policy.model_arch == MODEL_ARCH.WELM_OMNI_V4_5
+                uses_global_seqlen_sums and self.config.policy.model_arch in (
+                    MODEL_ARCH.WELM_OMNI_V4_5,
+                    MODEL_ARCH.QWEN3_OMNI_MOE,
+                )
             ):
                 # Dyn-CP seqlen sums are global-batch aggregates, while
                 # ``expanded_rbs`` only holds this DP rank's share. Gather the
@@ -1511,32 +1610,45 @@ class FlopsCounterMixin:
                 # too. In the rank-local fallback below, the DP all-reduce of
                 # estimated_flops already scales them up.
                 gathered = [None] * mpu.get_data_parallel_world_size()
-                dist.all_gather_object(gathered, audio_seqlens, group=mpu.get_data_parallel_group())
-                audio_seqlens = [length for rank_lens in gathered for length in rank_lens]
+                dist.all_gather_object(
+                    gathered,
+                    (local_images_seqlens, local_audio_seqlens),
+                    group=gloo_dp_group,
+                )
+                local_images_seqlens = [
+                    length for rank_images, _ in gathered for length in rank_images
+                ]
+                local_audio_seqlens = [
+                    length for _, rank_audio in gathered for length in rank_audio
+                ]
             kwargs = {}
-            if len(images_seqlens) > 0:
-                kwargs["images_seqlens"] = images_seqlens
-            if len(audio_seqlens) > 0:
-                kwargs["audio_seqlens"] = audio_seqlens
-            delta_time = torch.tensor(delta_time, device=torch.cuda.current_device())
-            dist.all_reduce(delta_time, op=dist.ReduceOp.MAX)
+            if len(local_images_seqlens) > 0:
+                kwargs["images_seqlens"] = local_images_seqlens
+            if len(local_audio_seqlens) > 0:
+                kwargs["audio_seqlens"] = local_audio_seqlens
+
+            delta_time = torch.tensor(delta_time, device="cpu")
+            dist.all_reduce(delta_time, op=dist.ReduceOp.MAX, group=cpu_group())
             if uses_global_seqlen_sums:
                 estimated_flops, promised_flops = self.flops_counter.estimate_flops_from_sums(
                     seqlen_sum, seqlen_sq_sum, delta_time.item(), **kwargs
                 )
             else:
-                batch_seqlens = [seq_length for _ in expanded_rbs]
+                # Packed attention is block-diagonal. Treating each complete
+                # pack as one sequence would use ``pack_length ** 2`` instead
+                # of ``sum(sequence_length ** 2)`` and substantially
+                # overestimate FLOPs.
+                if batch_seqlens is None:
+                    batch_seqlens = self._get_mfu_batch_seqlens(expanded_rbs, seq_length)
                 estimated_flops, promised_flops = self.flops_counter.estimate_flops(
                     batch_seqlens, delta_time.item(), **kwargs
                 )
-            estimated_flops = torch.tensor(estimated_flops, device=torch.cuda.current_device())
+            estimated_flops = torch.tensor(estimated_flops, device="cpu")
             if not uses_global_seqlen_sums:
                 # The fallback estimates rank-local batches, so sum them over
                 # DP. Dynamic-CP sums are already global-batch aggregates and
                 # must not be multiplied by the DP size again.
-                dist.all_reduce(
-                    estimated_flops, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group()
-                )
+                dist.all_reduce(estimated_flops, op=dist.ReduceOp.SUM, group=gloo_dp_group)
             mfu = estimated_flops.item() / promised_flops / torch.distributed.get_world_size() * 100
             self.mfu_sum += mfu
             self.mfu_count += 1

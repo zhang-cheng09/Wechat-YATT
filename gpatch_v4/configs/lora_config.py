@@ -27,6 +27,8 @@ class LoRAConfig(MappingProtocol):
     a2a_experimental : bool
     dtype : str or None
         Optional adapter dtype name (reserved).
+    init_adapter_path : str or None
+        HF PEFT adapter dir to load on cold start.
     """
 
     rank: int = field(default=0, metadata={"help": "LoRA rank; 0 disables PEFT"})
@@ -59,6 +61,16 @@ class LoRAConfig(MappingProtocol):
                 (
                     "If False (default), use per-expert GroupedExpertLinearAdapter "
                     "(grouped_mm). If True, share one LoRA adapter across local MoE experts."
+                )
+        },
+    )
+    init_adapter_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help":
+                (
+                    "Optional HF PEFT adapter dir (adapter_model.safetensors) to load "
+                    "on cold start. Leave unset to keep PEFT initialized adapters."
                 )
         },
     )

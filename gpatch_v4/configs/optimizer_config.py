@@ -1,7 +1,58 @@
-from dataclasses import asdict, dataclass, field
-from typing import Any, List, Optional
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 from gpatch_v4.configs.utils import MappingProtocol
+
+
+@dataclass
+class ParamLrOverride(MappingProtocol):
+    """Per-parameter-name learning-rate override.
+
+    Attributes
+    ----------
+    pattern : str
+        Regular expression matched with ``re.search`` against
+        ``named_parameters`` names. Leading ``module.`` prefixes added by
+        DDP wrapping are stripped before matching, so ``audio_model``
+        matches both ``audio_model.x`` and ``module.audio_model.x``.
+    name : str
+        Wandb metric suffix (``policy/lr/{name}``). Required.
+    lr : float or None
+        Peak LR for matching parameters (Megatron scheduler ``max_lr``).
+    min_lr : float or None
+        Floor LR. ``None`` → inherit the optimizer-level ``min_lr``.
+    """
+    pattern: str = field(metadata={"help": "Regex matched against parameter names"})
+    name: str = field(
+        default="",
+        metadata={"help": "Wandb metric key suffix"},
+    )
+    lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Peak learning rate for matching parameters"},
+    )
+    min_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Minimum learning rate for matching parameters"},
+    )
+
+    def __post_init__(self):
+        if not self.pattern:
+            raise ValueError("missing pattern")
+        if not self.name:
+            raise ValueError("missing name")
+        try:
+            re.compile(self.pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"pattern is not valid regex: {self.pattern!r}: {exc}"
+            ) from exc
+        if self.lr is None:
+            raise ValueError(f"(pattern={self.pattern!r}) is missing lr")
+        self.lr = float(self.lr)
+        if self.min_lr is not None:
+            self.min_lr = float(self.min_lr)
 
 
 @dataclass
@@ -13,11 +64,10 @@ class OptimizerConfig(MappingProtocol):
     lr : float
     min_lr : float
         Minimum LR after decay.
-    vit_lr : float or None
-        ``None`` → use base ``lr``.
-    vit_min_lr : float or None
-    vit_proj_lr : float or None
-    vit_proj_min_lr : float or None
+    param_lr_overrides : list of ParamLrOverride
+        Regex-based per-parameter LR groups. YAML list order is the
+        match priority: first matching entry wins. Put more specific
+        patterns first (e.g. ``a.b.c.*`` before ``a.b.*``).
     lr_warmup_steps : int
     lr_warmup_step_frac : float
         Fraction of total steps for warmup (alternative to ``lr_warmup_steps``).
@@ -57,21 +107,16 @@ class OptimizerConfig(MappingProtocol):
         default=0.0,
         metadata={"help": "Minimum learning rate"},
     )
-    vit_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Vision model learning rate"},
-    )
-    vit_min_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Vision model minimum learning rate"},
-    )
-    vit_proj_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Vision projection model learning rate"},
-    )
-    vit_proj_min_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Vision projection model minimum learning rate"},
+    param_lr_overrides: List[ParamLrOverride] = field(
+        default_factory=list,
+        metadata={
+            "help":
+                "Regex-based per-parameter LR overrides. Each entry matches "
+                "named_parameters names (re.search; leading module. stripped). "
+                "YAML list order: first matching entry wins. Put more specific "
+                "patterns first. name is required. Reported to wandb as "
+                "{prefix}/lr/{name}."
+        },
     )
     und_lr_scale: float = field(
         default=1.0,
@@ -196,3 +241,12 @@ class OptimizerConfig(MappingProtocol):
                 "optimizer step."
         },
     )
+
+    def __post_init__(self):
+        seen_names = set()
+        for entry in self.param_lr_overrides:
+            if entry.name in seen_names:
+                raise ValueError(
+                    f"optimizer.param_lr_overrides has duplicate name {entry.name!r}"
+                )
+            seen_names.add(entry.name)

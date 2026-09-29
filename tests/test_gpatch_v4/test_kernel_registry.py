@@ -1,5 +1,6 @@
 """Kernel registry: per-device function registration and dispatch."""
 
+import importlib
 from unittest.mock import patch
 
 import pytest
@@ -87,27 +88,62 @@ def test_default_lookup_uses_backend_name_import_uses_kernel_name():
 def test_cuda_linear_cross_entropy_registers():
     pytest.importorskip("gpatch_v4.kernel.cuda")
     assert is_kernel_registered("linear_cross_entropy", "cuda")
+    assert is_kernel_registered("linear_full_kl", "cuda")
     assert is_kernel_registered("set_linear_ce_backend", "cuda")
 
-    from gpatch_v4.kernel.triton.linear_cross_entropy import (
+    from gpatch_v4.kernel.cuda.linear_cross_entropy import (
         linear_cross_entropy as cuda_fn,
         set_linear_ce_backend as cuda_set,
     )
+    from gpatch_v4.kernel.tilelang.linear_full_kl import (
+        linear_full_kl as cuda_full_kl,
+    )
 
     assert get_kernel("linear_cross_entropy", device="cuda") is cuda_fn
+    assert get_kernel("linear_full_kl", device="cuda") is cuda_full_kl
     assert get_kernel("set_linear_ce_backend", device="cuda") is cuda_set
 
 
 def test_public_api_dispatches_to_cuda_when_device_is_cuda():
     pytest.importorskip("gpatch_v4.kernel.cuda")
     from gpatch_v4.kernel.registry import _current_device
-    from gpatch_v4.kernel.triton.linear_cross_entropy import (
+    from gpatch_v4.kernel.cuda.linear_cross_entropy import (
         linear_cross_entropy as cuda_fn,
+    )
+    from gpatch_v4.kernel.tilelang.linear_full_kl import (
+        linear_full_kl as cuda_full_kl,
     )
 
     if _current_device() != "cuda":
         pytest.skip("current device backend is not cuda")
     assert get_kernel("linear_cross_entropy") is cuda_fn
+    assert get_kernel("linear_full_kl") is cuda_full_kl
+
+
+def test_cuda_linear_ce_selects_tilelang_backend():
+    cuda_linear_ce = importlib.import_module(
+        "gpatch_v4.kernel.cuda.linear_cross_entropy"
+    )
+
+    previous_backend = cuda_linear_ce._BACKEND
+    assert previous_backend == cuda_linear_ce._TILELANG_BACKEND
+    with patch.object(
+        cuda_linear_ce,
+        "tilelang_linear_cross_entropy",
+        return_value="tilelang",
+    ) as tilelang_fn:
+        cuda_linear_ce.set_linear_ce_backend("tilelang")
+        try:
+            result = cuda_linear_ce.linear_cross_entropy(
+                None,
+                None,
+                None,
+            )
+        finally:
+            cuda_linear_ce._BACKEND = previous_backend
+
+    assert result == "tilelang"
+    tilelang_fn.assert_called_once()
 
 
 def test_set_linear_ce_backend_noop_when_unregistered():

@@ -7,6 +7,6 @@ export PYTHONPATH="$PWD:$MCORE_PATH:$MBRIDGE_PATH:$MEGATRON_BRIDGE_PATH/src:$PYT
 source tasks/math_rl_v4/scripts/mpirun-init-ray.sh
 
 python3 -u gpatch_v4/entry/train_lm_grpo.py \
-    --config-path="../../tasks/math_rl_v4/yaml" --config-name="rl_gdpo_dead_mask_demo.yaml"
+    --config-path="../../tasks/math_rl_v4/yaml" --config-name="rl_grpo_dapo17k_e2h.yaml"
 
     # --config-path="../../tasks/math_rl_v4/yaml" --config-name="rl_gdpo_sample_bn_config.yaml"

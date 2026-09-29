@@ -10,6 +10,7 @@ test_qwen4_exp_hp.py 覆盖，这里专门验只能上卡才能验的部分：
 - `clip_grad_norm_` 能跨 mesh 工作，并把 Engram 那份局部梯度也计入总范数。
 """
 import datetime
+import importlib.util
 import os
 import pathlib
 import tempfile
@@ -19,11 +20,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
-from gpatch_v4.models.qwen4_exp import Qwen4ExpTextConfig
-from gpatch_v4.models.qwen4_exp.hp import Qwen4ExpHpForCausalLM, apply_hp
+from gpatch_v4.models.qwen4_exp import (
+    Qwen4ExpConfig,
+    Qwen4ExpHpForConditionalGeneration,
+    Qwen4ExpTextConfig,
+    apply_hp,
+)
 
 NUM_EXPERTS = 8
 
@@ -74,25 +79,42 @@ requires_two_gpus = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="需要至少 2 张 GPU",
 )
+requires_deepep = pytest.mark.skipif(
+    importlib.util.find_spec("deep_ep") is None,
+    reason="需要安装普通 DeepEP Buffer backend",
+)
 
 
-def _config() -> Qwen4ExpTextConfig:
-    return Qwen4ExpTextConfig(**TINY_KWARGS)
+def _config() -> Qwen4ExpConfig:
+    return Qwen4ExpConfig(
+        text_config=Qwen4ExpTextConfig(**TINY_KWARGS),
+        vision_config=dict(
+            depth=1, hidden_size=32, intermediate_size=64, num_heads=4,
+            patch_size=2, spatial_merge_size=2, temporal_patch_size=1,
+            out_hidden_size=TINY_KWARGS["hidden_size"], num_position_embeddings=16,
+        ),
+    )
 
 
-def _build_reference_model(seed: int = 0) -> Qwen4ExpHpForCausalLM:
+def _build_reference_model(seed: int = 0) -> Qwen4ExpHpForConditionalGeneration:
     """在 CPU 上用 fp32 建一份带真实权重的模型（所有 rank 结果一致）。"""
     prev_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.float32)
     try:
         torch.manual_seed(seed)
-        model = Qwen4ExpHpForCausalLM(_config())
+        model = Qwen4ExpHpForConditionalGeneration(_config())
     finally:
         torch.set_default_dtype(prev_dtype)
     return model
 
 
-def _apply_hp_worker(rank: int, world_size: int, init_file: str, ep_size: int) -> None:
+def _apply_hp_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    ep_size: int,
+    ep_backend: str,
+) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="nccl",
@@ -110,12 +132,20 @@ def _apply_hp_worker(rank: int, world_size: int, init_file: str, ep_size: int) -
             mesh_dim_names=("ep_fsdp", "ep"),
         )
 
-        model = apply_hp(model, mesh, attn_backend="flex", ep_backend="eager")
+        model = apply_hp(
+            model,
+            mesh,
+            attn_backend="flex",
+            ep_backend=ep_backend,
+        )
 
         assert model._ep_size == ep_size
         assert hasattr(model, "clip_grad_norm_")
+        # 与 DSV4 一样：词表和 lm_head 单独成 FSDP unit，不跟 root residual 绑在一起。
+        assert isinstance(model.model.language_model.embed_tokens, FSDPModule)
+        assert isinstance(model.lm_head, FSDPModule)
 
-        engram_module = model.model.layers[1].ple.ple_embedding.ngram_embedding
+        engram_module = model.model.language_model.layers[1].ple.ple_embedding.ngram_embedding
         engram_weight = engram_module.weight
         # 表被 FSDP 的 ignored_params 排除（按行 ownership 已经分好了），但仍要包成
         # DTensor：否则优化器一组里混 DTensor 和 plain tensor，AdamW 的 foreach 路径会报
@@ -134,7 +164,7 @@ def _apply_hp_worker(rank: int, world_size: int, init_file: str, ep_size: int) -
 
         model.train()
         torch.manual_seed(100 + rank)
-        input_ids = torch.randint(0, config.vocab_size, (1, 24), device="cuda")
+        input_ids = torch.randint(0, config.text_config.vocab_size, (1, 24), device="cuda")
 
         output = model(input_ids=input_ids)
         assert torch.isfinite(output.logits).all(), "logits 出现 NaN/Inf"
@@ -147,7 +177,8 @@ def _apply_hp_worker(rank: int, world_size: int, init_file: str, ep_size: int) -
             if param.requires_grad and param.grad is None
         ]
         # indexer 是冻结的（requires_grad=False），不该出现在这里
-        assert not missing, f"这些可训练参数没有梯度: {missing[:8]}"
+        assert all(name.startswith("model.visual.") for name in missing), missing
+        assert all(param.grad is None for param in model.model.visual.parameters())
         assert engram_module.weight.grad is not None, "Engram 表没有梯度"
 
         total_norm = model.clip_grad_norm_(max_norm=1.0)
@@ -168,7 +199,7 @@ def test_apply_hp_forward_backward_and_clip(ep_size: int) -> None:
             init_file = str(pathlib.Path(tmpdir) / "pg_init")
             mp.start_processes(
                 _apply_hp_worker,
-                args=(world_size, init_file, ep_size),
+                args=(world_size, init_file, ep_size, "eager"),
                 nprocs=world_size,
                 join=True,
                 start_method="spawn",
@@ -177,13 +208,28 @@ def test_apply_hp_forward_backward_and_clip(ep_size: int) -> None:
         torch.set_num_threads(previous_threads)
 
 
-def _ep_equivalence_worker(rank: int, world_size: int, init_file: str) -> None:
-    """EP 是**精确**的：EP2 下的 logits 必须等于单卡稠密结果。
+@requires_two_gpus
+@requires_deepep
+def test_apply_hp_deepep_forward_backward_and_clip() -> None:
+    world_size = 2
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = str(pathlib.Path(tmpdir) / "pg_init")
+        mp.start_processes(
+            _apply_hp_worker,
+            args=(world_size, init_file, 2, "deepep"),
+            nprocs=world_size,
+            join=True,
+            start_method="spawn",
+        )
 
-    这里刻意用 fp32 的 mp_policy 和 dense 注意力后端，把 bf16 和 flex 的数值噪声排除掉，
-    只留下"EP 切分 + all-to-all 是否等价"这一个变量，容差才有意义。
-    bf16 + flex 的路径由 test_apply_hp_forward_backward_and_clip 覆盖。
-    """
+
+def _ep_equivalence_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    ep_backend: str,
+) -> None:
+    """EP2 logits 对照 dense；eager 用 fp32，DeepEP 用其支持的 bf16。"""
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="nccl",
@@ -195,8 +241,10 @@ def _ep_equivalence_worker(rank: int, world_size: int, init_file: str) -> None:
     try:
         config = _config()
         reference = _build_reference_model().to("cuda").eval()
+        if ep_backend == "deepep":
+            reference = reference.to(torch.bfloat16)
         torch.manual_seed(7)
-        input_ids = torch.randint(0, config.vocab_size, (1, 24), device="cuda")
+        input_ids = torch.randint(0, config.text_config.vocab_size, (1, 24), device="cuda")
         with torch.no_grad():
             expected = reference(input_ids=input_ids).logits.float()
 
@@ -204,20 +252,27 @@ def _ep_equivalence_worker(rank: int, world_size: int, init_file: str) -> None:
         mesh = init_device_mesh(
             "cuda", mesh_shape=(world_size // 2, 2), mesh_dim_names=("ep_fsdp", "ep")
         )
+        apply_kwargs = {}
+        if ep_backend == "eager":
+            apply_kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+            )
         model = apply_hp(
             model,
             mesh,
-            mp_policy=MixedPrecisionPolicy(
-                param_dtype=torch.float32, reduce_dtype=torch.float32
-            ),
             attn_backend="dense",
-            ep_backend="eager",
+            ep_backend=ep_backend,
+            **apply_kwargs,
         )
         model.eval()
         with torch.no_grad():
             got = model(input_ids=input_ids).logits.float()
 
-        torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
+        if ep_backend == "eager":
+            torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
+        else:
+            torch.testing.assert_close(got, expected, rtol=0.06, atol=0.06)
     finally:
         dist.destroy_process_group()
 
@@ -229,7 +284,22 @@ def test_ep_wrapped_forward_matches_dense_reference() -> None:
         init_file = str(pathlib.Path(tmpdir) / "pg_init")
         mp.start_processes(
             _ep_equivalence_worker,
-            args=(world_size, init_file),
+            args=(world_size, init_file, "eager"),
+            nprocs=world_size,
+            join=True,
+            start_method="spawn",
+        )
+
+
+@requires_two_gpus
+@requires_deepep
+def test_deepep_wrapped_forward_matches_dense_reference() -> None:
+    world_size = 2
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = str(pathlib.Path(tmpdir) / "pg_init")
+        mp.start_processes(
+            _ep_equivalence_worker,
+            args=(world_size, init_file, "deepep"),
             nprocs=world_size,
             join=True,
             start_method="spawn",

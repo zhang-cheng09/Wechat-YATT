@@ -8,12 +8,11 @@
 # Deviations from upstream (kept deliberately minimal so this stays diffable):
 #   1. `...`-relative imports -> `transformers.*` absolute imports
 #      (intra-package `.configuration_qwen4_exp` stays relative)
-#   2. vision + multimodal tail dropped (everything from
-#      `Qwen4ExpVisionRotaryEmbedding` onward). gcore trains the
-#      language-only path; `Qwen4ExpForCausalLM` is the entry point.
+#   2. vision + multimodal tail dropped; vl.py provides the training entry point.
 #   3. imports unused by the text path removed
 #   4. contiguous-CP branches added to Decoder / GatedDeltaNet / PLE
 #   5. `__all__` narrowed to the text classes
+#   6. TopKRouter supports rollout routing replay for GRPO
 
 # yapf: disable
 # fmt: off
@@ -44,6 +43,7 @@ import math
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -608,7 +608,7 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        boundaries = cp_context.global_segment_boundaries.to(hidden_states.device)
+        boundaries = cp_context.global_segment_boundaries
         if cp_context.size > 1:
             fla_cp_context = build_cp_context(
                 cu_seqlens=boundaries,
@@ -1010,12 +1010,26 @@ class Qwen4ExpTextTopKRouter(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+        self.router_replay: "RouterReplay | None" = None  # noqa: F821
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
         router_probs = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)  # (seq_len, top_k)
+        if self.router_replay is None:
+            router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        else:
+            router_top_value, router_indices = self.router_replay.get_replay_topk(router_probs)
+            expected_shape = (router_probs.shape[0], self.top_k)
+            if router_indices.shape != expected_shape:
+                raise ValueError(
+                    f"replay indices shape {tuple(router_indices.shape)} != "
+                    f"expected {expected_shape}"
+                )
+            if router_indices.dtype != torch.int64:
+                raise TypeError(
+                    f"replay indices dtype must be torch.int64, got {router_indices.dtype}"
+                )
         if self.norm_topk_prob:
             router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
         router_top_value = router_top_value.to(router_logits.dtype)
@@ -1024,6 +1038,9 @@ class Qwen4ExpTextTopKRouter(nn.Module):
 
 
 class Qwen4ExpTextSparseMoeBlock(nn.Module):
+    selective_gradient_checkpointing = False
+    _gradient_checkpointing_func = None
+
     def __init__(self, config):
         super().__init__()
         self.gate = Qwen4ExpTextTopKRouter(config)
@@ -1031,10 +1048,19 @@ class Qwen4ExpTextSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen4ExpTextMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
+    def _forward_shared_expert(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            self.selective_gradient_checkpointing
+            and self.training
+            and self._gradient_checkpointing_func is not None
+        ):
+            return self._gradient_checkpointing_func(self.shared_expert, hidden_states)
+        return self.shared_expert(hidden_states)
+
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        shared_expert_output = self.shared_expert(hidden_states_reshaped)
+        shared_expert_output = self._forward_shared_expert(hidden_states_reshaped)
         _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
         expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
@@ -1358,7 +1384,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
         output = torch.empty_like(hidden_states)
         local_start = cp_context.local_sequence_start
         local_end = cp_context.local_sequence_end
-        boundaries = cp_context.global_segment_boundaries.tolist()
+        boundaries = cp_context.global_segment_boundary_values
         for segment_start, segment_end in zip(boundaries, boundaries[1:]):
             overlap_start = max(segment_start, local_start)
             overlap_end = min(segment_end, local_end)
@@ -1387,6 +1413,8 @@ class Qwen4ExpTextPLELayer(nn.Module):
 
 
 class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
+    selective_gradient_checkpointing = False
+
     def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
         super().__init__()
         self.cp_size = 1
@@ -1401,6 +1429,40 @@ class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
         self.ple = Qwen4ExpTextPLELayer(config, layer_idx, ple_layer_index) if ple_layer_index is not None else None
         self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
         self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
+
+    def _forward_attention(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        conv_mask: torch.Tensor | None,
+        past_key_values: Cache | None,
+        cp_context: Qwen4ExpCPContext | None,
+        attention_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(
+                hidden_states,
+                cache_params=past_key_values,
+                attention_mask=conv_mask,
+                cp_context=cp_context,
+                **attention_kwargs,
+            )
+        else:
+            if cp_context is not None:
+                attention_kwargs = dict(attention_kwargs)
+                attention_kwargs["cp_context"] = cp_context
+            hidden_states, _ = self.self_attn(
+                hidden_states,
+                position_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                **attention_kwargs,
+            )
+
+        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+        return hyper_input + injection.flatten(-2)
 
     def forward(
         self,
@@ -1435,28 +1497,30 @@ class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
                 cp_context=cp_context,
             )
 
-        hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
-        if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn(
+        attention_kwargs = dict(kwargs)
+        if self.selective_gradient_checkpointing and self.training:
+            hidden_states = self._gradient_checkpointing_func(
+                partial(
+                    self._forward_attention,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                    conv_mask=conv_mask,
+                    past_key_values=past_key_values,
+                    cp_context=cp_context,
+                    attention_kwargs=attention_kwargs,
+                ),
                 hidden_states,
-                cache_params=past_key_values,
-                attention_mask=conv_mask,
-                cp_context=cp_context,
-                **kwargs,
             )
         else:
-            if cp_context is not None:
-                kwargs["cp_context"] = cp_context
-            hidden_states, _ = self.self_attn(
+            hidden_states = self._forward_attention(
                 hidden_states,
                 position_embeddings,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                **kwargs,
+                attention_mask,
+                conv_mask,
+                past_key_values,
+                cp_context,
+                attention_kwargs,
             )
-
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
 
         hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -1761,6 +1825,10 @@ class Qwen4ExpForCausalLM(Qwen4ExpPreTrainedModel, GenerationMixin):
         self.model = Qwen4ExpTextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.mtp = None
+        if config.mtp_num_hidden_layers > 0:
+            from .mtp import Qwen4ExpMTPModule
+            self.mtp = Qwen4ExpMTPModule(config)
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok

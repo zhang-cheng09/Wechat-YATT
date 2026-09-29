@@ -22,6 +22,9 @@ from gpatch_v4.models.deepseek_v4.deepep_a2a import (
 _DEEPEP_AVAILABLE = importlib.util.find_spec("deep_ep") is not None
 requires_deepep = unittest.skipUnless(_DEEPEP_AVAILABLE, "deep_ep not installed")
 
+_HIDDEN_DIM = 4096
+_NUM_TOKENS = 6
+
 
 @ray.remote(num_cpus=0, num_gpus=0)
 def _get_node_ip():
@@ -34,16 +37,28 @@ def _get_node_info():
     return {"node_id": ctx.get_node_id(), "ip": ray.util.get_node_ip_address()}
 
 
+# @ray.remote(num_cpus=0, num_gpus=0)
+# def _set_hostname_to_pod_name() -> str:
+#     # NVSHMEM treats identical hostnames as intra-node Unix IPC; POD_NAME is unique and in /etc/hosts.
+#     name = os.environ.get("POD_NAME")
+#     if name is not None:
+#         with open("/proc/sys/kernel/hostname", "w", encoding="ascii") as f:
+#             f.write(name)
+#     return name
+
+
 @ray.remote(num_gpus=1)
 def _deepep_worker(rank: int, world_size: int, master_addr: str, master_port: int):
+    os.environ["NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME"] = "bond1"
+    os.environ["NCCL_SOCKET_IFNAME"] = "bond1"
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
     torch.cuda.set_device(0)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     set_deepep_num_sms(24)
 
-    hidden_dim = 8
-    num_tokens = 6
+    hidden_dim = _HIDDEN_DIM
+    num_tokens = _NUM_TOKENS
     num_experts = world_size * 2
     top_k = 2
     tokens = (
@@ -121,6 +136,14 @@ class TestDeepEPHelper(unittest.TestCase):
                 )
             ).remote()
         )
+        # ray.get(
+        #     _set_hostname_to_pod_name.options(
+        #         scheduling_strategy=PlacementGroupSchedulingStrategy(
+        #             placement_group=pg,
+        #             placement_group_bundle_index=0,
+        #         )
+        #     ).remote()
+        # )
         futures = [
             _deepep_worker.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
@@ -134,7 +157,7 @@ class TestDeepEPHelper(unittest.TestCase):
         remove_placement_group(pg)
 
         for res in results:
-            self.assertEqual(res["combined_shape"], [6, 8])
+            self.assertEqual(res["combined_shape"], [_NUM_TOKENS, _HIDDEN_DIM])
             self.assertTrue(res["combined_finite"])
             self.assertTrue(res["tokens_grad_finite"])
             self.assertGreater(res["tokens_grad_norm"], 0.0)
@@ -167,6 +190,18 @@ class TestDeepEPHelper(unittest.TestCase):
         if len(nodes) < 2:
             raise unittest.SkipTest(f"need >= 2 nodes with 8 GPUs, got {len(nodes)}")
 
+        # ray.get(
+        #     [
+        #         _set_hostname_to_pod_name.options(
+        #             scheduling_strategy=NodeAffinitySchedulingStrategy(
+        #                 node_id=nodes[i]["node_id"],
+        #                 soft=False,
+        #             )
+        #         ).remote()
+        #         for i in range(2)
+        #     ]
+        # )
+
         world_size = 16
         futures = [
             _deepep_worker.options(
@@ -179,7 +214,7 @@ class TestDeepEPHelper(unittest.TestCase):
         ]
         results = ray.get(futures)
         for res in results:
-            self.assertEqual(res["combined_shape"], [6, 8])
+            self.assertEqual(res["combined_shape"], [_NUM_TOKENS, _HIDDEN_DIM])
             self.assertTrue(res["combined_finite"])
             self.assertTrue(res["tokens_grad_finite"])
             self.assertGreater(res["tokens_grad_norm"], 0.0)

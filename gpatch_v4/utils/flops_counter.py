@@ -860,14 +860,16 @@ def _audio_feat_extract_output_lengths(input_lengths, n_window):
     return output_lengths
 
 
-def _estimate_welm_omni_audio_flop(audio_seqlens, config):
-    """Estimate the FLOPs of the WeLM-Omni-V4.5 audio tower.
+def _estimate_qwen3_omni_audio_flop(audio_seqlens, config):
+    """Estimate the FLOPs of the Qwen3-Omni audio tower.
 
     The tower is Qwen3-Omni's Whisper-like audio encoder: three stride-2
     Conv2d layers (channels ``downsample_hidden_size``), a ``conv_out``
     projection to ``d_model``, ``encoder_layers`` bidirectional transformer
     layers (MHA + GELU MLP) with attention windowed to ``n_window_infer``
-    mel frames, and a two-layer projector to ``output_dim``.
+    mel frames, and a two-layer projector to ``output_dim``. WeLM-Omni-V4.5
+    reuses the same encoder, so this helper is shared between the two
+    estimators.
 
     Args:
         audio_seqlens: per-audio mel frame counts in the batch.
@@ -937,8 +939,98 @@ def _estimate_welm_omni_v4_5_flops(config, tokens_sum, batch_seqlens, delta_time
     total_flops = _welm_v4_total_flops(config.text_config, tokens_sum, batch_seqlens)
     audio_seqlens = kargs.get("audio_seqlens", None)
     if audio_seqlens:
-        total_flops += _estimate_welm_omni_audio_flop(audio_seqlens, config.audio_config)
+        total_flops += _estimate_qwen3_omni_audio_flop(audio_seqlens, config.audio_config)
     return total_flops / delta_time / 1e12
+
+
+def _estimate_qwen3_omni_moe_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    """Estimate Qwen3-Omni-MoE Megatron training TFLOPs/s.
+
+    The Qwen3-Omni HF config nests the multimodal thinker under
+    ``config.thinker_config``, which itself exposes:
+
+      * ``text_config`` -- ``qwen3_omni_moe_text`` MoE decoder (48 layers,
+        128 experts, top-k 8, GQA 32/4, head_dim 128, hidden 2048,
+        moe_intermediate_size 768, optional shared expert whose
+        ``shared_expert_intermediate_size`` may be 0). All decoder layers
+        are MoE when ``mlp_only_layers == []`` and ``decoder_sparse_step``
+        is 1, but the layout is still driven by those fields for
+        robustness against reduced checkpoints.
+      * ``vision_config`` -- ``qwen3_omni_moe_vision_encoder`` (a Qwen3-VL
+        ViT with deep-stack mergers, no GLU in the MLP). Field layout is
+        the same as Qwen3-VL so ``_estimate_qwen3_vit_flop`` is reused.
+      * ``audio_config`` -- ``qwen3_omni_moe_audio_encoder``, computed by
+        ``_estimate_qwen3_omni_audio_flop`` (the same helper is shared
+        with WeLM-Omni-V4.5 because that estimator reuses the identical
+        Qwen3-Omni audio encoder).
+
+    ``kargs["images_seqlens"]`` (per-image patch-token counts) drives the
+    ViT term; ``kargs["audio_seqlens"]`` (per-audio mel frame counts)
+    drives the audio-tower term. Both are optional.
+
+    Notes
+    -----
+    * Follows Megatron's ``transformer_flops()`` convention: only GEMMs
+      are counted (fwd + wgrad + dgrad = 6 * N * tokens_sum for weight
+      matrices, plus attention core ``6 * S^2 * head_dim * num_heads``).
+      QK-Norm / RMSNorm / router-softmax / rope are ignored.
+    * Text attention is full causal (``sliding_window: None`` in this
+      checkpoint), so we always use the ``Σ S^2`` core-attention term.
+    """
+    # Omni nests the multimodal thinker one level deeper than Qwen3-VL.
+    thinker = getattr(config, "thinker_config", config)
+    text_config = thinker.text_config
+    vision_config = getattr(thinker, "vision_config", None)
+    audio_config = getattr(thinker, "audio_config", None)
+
+    # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
+    hidden_size = text_config.hidden_size
+    vocab_size = text_config.vocab_size
+    num_hidden_layers = text_config.num_hidden_layers
+    num_key_value_heads = text_config.num_key_value_heads
+    num_attention_heads = text_config.num_attention_heads
+    moe_intermediate_size = text_config.moe_intermediate_size
+    moe_num_expert = text_config.num_experts
+    moe_topk = text_config.num_experts_per_tok
+
+    head_dim = getattr(
+        text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads
+    )
+    q_size = num_attention_heads * head_dim
+    k_size = num_key_value_heads * head_dim
+    v_size = num_key_value_heads * head_dim
+
+    # non-attn per layer parm
+    moe_gata_N = hidden_size * moe_num_expert
+    # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
+    moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
+    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    # non-attn all_layer parm
+    moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + emd_and_lm_head_N
+    # non-attn all_layer & all_token fwd & bwd flops
+    dense_N_flops = 6 * moe_N * tokens_sum
+
+    # attn all_layer & all_token fwd & bwd flops
+    seqlen_square_sum = 0
+    for seqlen in batch_seqlens:
+        seqlen_square_sum += seqlen * seqlen
+    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+    # vit flops
+    vit_flops = 0
+    images_seqlens = kargs.get("images_seqlens", None)
+    if images_seqlens is not None and vision_config is not None:
+        vit_flops = _estimate_qwen3_vit_flop(images_seqlens, vision_config)
+
+    # ---- Audio tower (only when audio_seqlens are provided) ----
+    audio_flops = 0
+    audio_seqlens = kargs.get("audio_seqlens", None)
+    if audio_seqlens and audio_config is not None:
+        audio_flops = _estimate_qwen3_omni_audio_flop(audio_seqlens, audio_config)
+
+    flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops + audio_flops
+    return flops_all_token / delta_time / 1e12
 
 
 def _estimate_unknown_flops(config, tokens_sum, batch_seqlens, delta_time):
@@ -955,6 +1047,7 @@ ESTIMATE_FUNC = {
     MODEL_ARCH.QWEN3_MOE: _estimate_qwen2_moe_flops,
     MODEL_ARCH.QWEN3_VL: _estimate_qwen3_vl_flops,
     MODEL_ARCH.QWEN3_VL_MOE: _estimate_qwen3_vl_moe_flops,
+    MODEL_ARCH.QWEN3_OMNI_MOE: _estimate_qwen3_omni_moe_flops,
     MODEL_ARCH.DEEPSEEK_V3: _estimate_deepseek_v3_flops,
     MODEL_ARCH.DEEPSEEK_V4: _estimate_deepseek_v4_flops,
     MODEL_ARCH.WELMV4_MOE: _estimate_welm_v4_flops,

@@ -335,6 +335,25 @@ class RolloutDataSourceInjectionTest(unittest.TestCase):
             with self.assertRaisesRegex(TypeError, "subclass of DataSourceBase"):
                 get_data_source(config, object())
 
+    def test_eval_iterator_is_independent_from_train_iterator(self):
+        source = object.__new__(RolloutDataSource)
+        source.eval_dataset = object()
+        source.eval_dataloader = [{
+            "prompt": [1]
+        }, {
+            "prompt": [2]
+        }]
+        source._eval_iter = None
+        train_iter = object()
+        source._train_iter = train_iter
+
+        source.reset_eval()
+        self.assertEqual(source.get_eval_batch(1), [{
+            "prompt": [1]
+        }])
+        self.assertIs(source._train_iter, train_iter)
+        self.assertEqual(source.eval_dataloader_length, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

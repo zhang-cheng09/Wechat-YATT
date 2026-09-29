@@ -3,6 +3,10 @@ from gpatch_v4.actor.distill_student_actor import DistillStudentActor
 from gpatch_v4.actor.distill_teacher_actor import DistillTeacherActor
 from gpatch_v4.actor.dpo_actor import DpoActor
 from gpatch_v4.actor.embedding_actor import EmbeddingActor
+from gpatch_v4.actor.embedding_distill_teacher_actor import EmbeddingDistillTeacherActor
+from gpatch_v4.actor.embedding_off_policy_distill_student_actor import (
+    EmbeddingOffPolicyDistillStudentActor,
+)
 from gpatch_v4.actor.evaluate_actor import EvaluateActor
 from gpatch_v4.actor.finetune_actor import FinetuneActor
 from gpatch_v4.actor.grpo_async_dynamic_batch_actor import DynBatchGrpoAsyncTrainActor

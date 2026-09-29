@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from contextlib import nullcontext
 from typing import Any, Dict, List, Tuple
@@ -13,6 +14,7 @@ from megatron.core import mpu, parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams as McorePackedSeqParams
 
 from gpatch_v4.configs.config import FinetuneConfig, RlConfig
+from gpatch_v4.core.constants import PrepareDataRole
 from gpatch_v4.extended_model.base import (
     CheckpointContextFn,
     PostInitModel,
@@ -30,7 +32,8 @@ from gpatch_v4.models.deepseek_v4.freeze_update_router import (
     reset_router_correction_bias_accum,
     update_router_correction_bias,
 )
-from gpatch_v4.models.deepseek_v4.thd import pack_sequences
+from gpatch_v4.models.deepseek_v4.thd import PackedSeqParams as HpPackedSeqParams
+from gpatch_v4.models.deepseek_v4.thd import make_packed_seq_layout, pack_sequences
 from gpatch_v4.utils import pad_or_truncate_last_dim
 
 
@@ -54,11 +57,13 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
     single ``[1, T]`` sequence via :func:`pack_sequences`, builds the
     HpModule :class:`PackedSeqParams`, and CP-slices the layout.
     """
-    def __init__(self, config):
-        super().__init__(config)
+    cp_partition_mode = "contiguous"
+
+    def __init__(self, config, role: PrepareDataRole = PrepareDataRole.POLICY):
+        super().__init__(config, role=role)
         # Dynamic CP and mcore contiguous THD also need sliding-window and
         # compression metadata when ppo_pack_seq=False.
-        self._model_config = DeepseekV4Config.from_pretrained(config.policy.hf_model_path)
+        self._model_config = DeepseekV4Config.from_pretrained(self.role_config.hf_model_path)
         if config.debug.debug_truncate_num_hidden_layers is not None:
             nl = config.debug.debug_truncate_num_hidden_layers
             self._model_config.num_hidden_layers = nl
@@ -230,7 +235,7 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
         if is_mcore and cp_size > 1:
             return self._model_forward_only_mcore_thd(batches, seqlen, pad_token_id)
 
-        if not self.config.policy.ppo_pack_seq:
+        if not self.role_config.ppo_pack_seq:
             return super().model_forward_only(
                 batches,
                 seqlen,
@@ -276,7 +281,7 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
             # correctly over DP×CP. Fail fast instead of silently mis-normalizing.
             if getattr(self.config, "ppo", None) is not None \
                     and self.config.ppo.loss_func == "grpo":
-                otc = self.config.policy.override_transformer_config or {}
+                otc = self.role_config.override_transformer_config or {}
                 assert otc.get("calculate_per_token_loss", False), (
                     "DSv4 mcore CP>1 RL with loss_func='grpo' (seq-mean per-sample) "
                     "requires calculate_per_token_loss=True; per-sample loss "
@@ -295,7 +300,7 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
                 pad_with_random_token=pad_with_random_token,
                 **kwargs,
             )
-        assert self.config.policy.ppo_pack_seq
+        assert self.role_config.ppo_pack_seq
         return self._grpo_fsdp2_train_thd(
             batches,
             seqlen,
@@ -320,9 +325,9 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
         is_mcore = getattr(self.config.training, "training_backend", "") == "mcore"
 
         if is_mcore and cp_size > 1:
-            assert self.config.policy.ppo_pack_seq, ("dsv4 mcore cp require thd format")
+            assert self.role_config.ppo_pack_seq, ("dsv4 mcore cp require thd format")
 
-        if not self.config.policy.ppo_pack_seq:
+        if not self.role_config.ppo_pack_seq:
             return super().sft_train(
                 batches,
                 seq_len,
@@ -806,29 +811,44 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
         cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
+        is_fsdp2 = self.config.training.training_backend == "fsdp2"
 
         if rl:
-            token_keys = [
-                key for key in (
-                    "tokens",
-                    "labels",
-                    "advantages",
-                    "prev_log_probs",
-                    "ref_log_probs",
-                    "rollout_log_probs",
-                    "teacher_log_probs",
-                    "sample_mask",
-                ) if key in batch
-            ]
-            if "loss_mask" in batch:
-                token_keys.append("loss_mask")
+            if is_fsdp2:
+                token_keys = ["tokens", "labels", "position_ids"]
+            else:
+                token_keys = [
+                    key for key in (
+                        "tokens",
+                        "labels",
+                        "advantages",
+                        "prev_log_probs",
+                        "ref_log_probs",
+                        "rollout_log_probs",
+                        "teacher_log_probs",
+                        "sample_mask",
+                    ) if key in batch
+                ]
+                if "loss_mask" in batch:
+                    token_keys.append("loss_mask")
         else:
             token_keys = ["tokens", "labels", "loss_mask"]
+            if is_fsdp2:
+                token_keys.append("position_ids")
             if "loss_weights" in batch:
                 token_keys.append("loss_weights")
 
         total_tokens = int(batch["cu_seqlens_padded"][-1].item())
-        if not rl:
+        if rl and "routed_experts" in batch:
+            route_shapes = batch.pop("routed_experts_shape").view(-1, 2)
+            assert torch.equal(route_shapes, route_shapes[:1].expand_as(route_shapes))
+            num_route_layers, route_topk = map(int, route_shapes[0].tolist())
+            batch["routed_experts"] = batch["routed_experts"].view(
+                total_tokens,
+                num_route_layers,
+                route_topk,
+            )
+        if not rl or is_fsdp2:
             tp_size = parallel_state.get_tensor_model_parallel_group().size()
             configured_pad = int(self.config.training.pad_to_mulitiple_of)
             if configured_pad <= 0:
@@ -845,26 +865,66 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
             padded_total = ((padded_total + alignment - 1) // alignment * alignment)
             padding = padded_total - total_tokens
             if padding:
-                # Pad only the end of the packed microbatch instead of every
-                # sample. -100/zero keep these synthetic rows out of SFT loss.
                 pad_values = {
                     "tokens": pad_token_id,
-                    "labels": -100,
+                    "labels": 0 if rl else -100,
                     "loss_mask": 0,
                     "loss_weights": 0,
+                    "advantages": 0,
+                    "prev_log_probs": 0,
+                    "ref_log_probs": 0,
+                    "rollout_log_probs": 0,
+                    "teacher_log_probs": 0,
+                    "prev_per_token_entropy": 0,
+                    "sample_mask": 0,
+                    "token_weights": 0,
                 }
-                for key in token_keys:
+                pad_keys = list(token_keys)
+                if rl:
+                    pad_keys.extend(
+                        key for key in (
+                            "loss_mask",
+                            "advantages",
+                            "prev_log_probs",
+                            "ref_log_probs",
+                            "rollout_log_probs",
+                            "teacher_log_probs",
+                            "prev_per_token_entropy",
+                            "sample_mask",
+                            "token_weights",
+                        ) if key in batch
+                    )
+                for key in pad_keys:
                     value = batch[key].reshape(-1)
-                    batch[key] = torch.cat(
-                        (
-                            value,
-                            torch.full(
-                                (padding, ),
-                                pad_values[key],
-                                dtype=value.dtype,
-                                device=value.device,
-                            ),
+                    if key == "position_ids":
+                        pad_value = torch.arange(
+                            int(value[-1].item()) + 1,
+                            int(value[-1].item()) + padding + 1,
+                            dtype=value.dtype,
+                            device=value.device,
                         )
+                    else:
+                        pad_value = torch.full(
+                            (padding, ),
+                            pad_values[key],
+                            dtype=value.dtype,
+                            device=value.device,
+                        )
+                    batch[key] = torch.cat((
+                        value,
+                        pad_value,
+                    ))
+                if rl and "routed_experts" in batch:
+                    route_index = torch.arange(
+                        padding,
+                        device=batch["routed_experts"].device,
+                    ) % total_tokens
+                    batch["routed_experts"] = torch.cat(
+                        (
+                            batch["routed_experts"],
+                            batch["routed_experts"][route_index],
+                        ),
+                        dim=0,
                     )
                 # Extend only the padded boundary of the final segment. Keep
                 # cu_seqlens unchanged so attention can identify real tokens
@@ -878,9 +938,8 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
                     batch["max_seqlen"].new_tensor(padded_total - last_start),
                 )
                 total_tokens = padded_total
-            # THD contiguous CP derives RoPE positions from packed sequence
-            # metadata, as in _sft_train_mcore_thd.
-            batch.pop("position_ids", None)
+            if not rl and not is_fsdp2:
+                batch.pop("position_ids", None)
 
         assert batch["tokens"].numel() == total_tokens
         assert total_tokens % cp_size == 0, (
@@ -901,12 +960,29 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
                 full_input_ids = batch["tokens"].reshape(1, total_tokens)
             full_labels = batch["labels"].reshape(1, total_tokens)
             full_loss_mask = (full_labels != -100).float()
+        hp_packed_seq_params = None
+        if is_fsdp2:
+            cu_seqlens = batch["cu_seqlens"].to(dtype=torch.int64)
+            cu_seqlens_padded = batch["cu_seqlens_padded"].to(dtype=torch.int64)
+            hp_packed_seq_params = HpPackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                max_seqlen_q=int(batch["max_seqlen"].item()),
+                total_seqlen=total_tokens,
+            )
+            hp_packed_seq_params = dataclasses.replace(
+                hp_packed_seq_params,
+                layout=make_packed_seq_layout(hp_packed_seq_params, self._model_config),
+            )
+
         for key in token_keys:
             assert batch[key].numel() == total_tokens, (
                 f"DSv4 dynamic CP field {key} has {batch[key].numel()} rows, "
                 f"expected {total_tokens}"
             )
             batch[key] = batch[key][row_slice].view(1, local_tokens).contiguous()
+        if rl and "routed_experts" in batch:
+            batch["routed_experts"] = batch["routed_experts"][row_slice].contiguous()
         if not rl:
             # Keep labels as the source of truth for ignored/padded tokens,
             # matching _sft_train_mcore_thd.
@@ -919,25 +995,47 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
 
         cu_seqlens = batch["cu_seqlens"]
         cu_seqlens_padded = batch["cu_seqlens_padded"]
-        # Megatron consumes real and padded boundaries separately: real
-        # boundaries define valid attention rows, while padded boundaries
-        # describe physical THD offsets after post-pack padding.
-        packed_seq_params = McorePackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=int(batch["max_seqlen"].item()),
-            max_seqlen_kv=int(batch["max_seqlen"].item()),
-            local_cp_size=local_cp_size,
-            cp_group=cp_group,
-            cp_partition_mode="contiguous",
-        )
+        if is_fsdp2:
+            assert hp_packed_seq_params is not None
+            _, _, _, _, packed_seq_params = cp_chunk_data(
+                cp_rank,
+                cp_size,
+                tokens=batch["tokens"].new_empty((1, total_tokens)),
+                packed_seq_params=hp_packed_seq_params,
+            )
+            assert packed_seq_params is not None
+        else:
+            packed_seq_params = McorePackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+                max_seqlen_q=int(batch["max_seqlen"].item()),
+                max_seqlen_kv=int(batch["max_seqlen"].item()),
+                local_cp_size=local_cp_size,
+                cp_group=cp_group,
+                cp_partition_mode="contiguous",
+            )
 
         if rl:
             if "loss_mask" in batch:
                 batch["mask"] = batch.pop("loss_mask")
+            if is_fsdp2:
+                for key in (
+                    "mask",
+                    "advantages",
+                    "prev_log_probs",
+                    "ref_log_probs",
+                    "rollout_log_probs",
+                    "teacher_log_probs",
+                    "prev_per_token_entropy",
+                    "sample_mask",
+                    "token_weights",
+                ):
+                    if key in batch:
+                        assert batch[key].numel() == total_tokens
+                        batch[key] = batch[key].view(1, total_tokens).contiguous()
             batch["target"] = batch.pop("labels")
             if batch.get("global_retention_ratio") is not None:
                 batch["global_retention_ratio"] = batch["global_retention_ratio"].to(dev)
@@ -953,12 +1051,44 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
 
         fwd_kwargs = {
             "input_ids": batch["tokens"],
-            "position_ids": None,
+            "position_ids": batch["position_ids"] if is_fsdp2 else None,
             "attention_mask": None,
             "labels": None,
             "packed_seq_params": packed_seq_params,
         }
         return batch, fwd_kwargs
+
+    @override
+    def sft_reroute_data_for_dynamic_cp(
+        self,
+        gbs_batches: List[Dict[str, Any]],
+        pad_token_id: int,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ):
+        kwargs["pad_to_multiple_of"] = self._pad_each_doc_to_multi_of
+        return super().sft_reroute_data_for_dynamic_cp(
+            gbs_batches,
+            pad_token_id,
+            pad_with_random_token=pad_with_random_token,
+            **kwargs,
+        )
+
+    @override
+    def rl_reroute_data_for_dynamic_cp(
+        self,
+        gbs_batches: List[Dict[str, Any]],
+        pad_token_id: int,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ):
+        kwargs["pad_to_multiple_of"] = self._pad_each_doc_to_multi_of
+        return super().rl_reroute_data_for_dynamic_cp(
+            gbs_batches,
+            pad_token_id,
+            pad_with_random_token=pad_with_random_token,
+            **kwargs,
+        )
 
     @override
     def sft_train_with_dynamic_cp(
@@ -988,7 +1118,11 @@ class DeepseekV4PrepareDataForwardLLM(PrepareDataForwardLLM):
         **kwargs,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Use contiguous THD slicing required by DSv4 dynamic CP."""
-        return self._train_with_dynamic_cp_contiguous(batches, rl=True)
+        return self._train_with_dynamic_cp_contiguous(
+            batches,
+            rl=True,
+            pad_token_id=pad_token_id,
+        )
 
     @override
     def _sft_train_cp_chunk_data(
@@ -1064,13 +1198,15 @@ class DeepseekV4DpoPrepareDataForwardLLM(DpoPrepareDataForwardLLM, DeepseekV4Pre
     ``DeepseekV4PrepareDataForwardLLM`` (BSHD/THD dispatch + contiguous CP).
     CP chunk overrides come from ``DeepseekV4PrepareDataForwardLLM``.
     """
-    def __init__(self, config):
-        super().__init__(config)
+    cp_partition_mode = "contiguous"
+
+    def __init__(self, config, role: PrepareDataRole = PrepareDataRole.POLICY):
+        super().__init__(config, role=role)
         is_mcore = config.training.training_backend == "mcore"
         if not is_mcore:
-            assert not config.policy.ppo_pack_seq, "DPO + THD pack_seq not supported for DSV4"
-        elif config.policy.dist_config.context_parallel_size > 1:
-            assert getattr(config.policy, "forward_only_mbs", 1) == 1, (
+            assert not self.role_config.ppo_pack_seq, "DPO + THD pack_seq not supported for DSV4"
+        elif self.role_config.dist_config.context_parallel_size > 1:
+            assert getattr(self.role_config, "forward_only_mbs", 1) == 1, (
                 "DSv4 mcore THD DPO requires policy.forward_only_mbs=1 for "
                 "reference log-prob computation"
             )
@@ -1120,11 +1256,15 @@ class DeepseekV4PostInitModel(PostInitModel):
         model : torch.nn.Module
         """
         # freeze MoE TopKRouter weight
-        if self.config.training.freeze_router_weight:
+        if self.config.training.freeze_moe_router:
             freeze_router_weights(model)
         # freeze CSA Lightning Indexer (default): no KL / top-k grad, avoid WD shrink
         if self.config.training.freeze_csa_indexer:
             freeze_csa_indexer_params(model)
+        if self.config.training.enable_mtp:
+            assert model.mtp is not None
+            model._mtp_training_enabled = self.config.training.online_mtp_sft
+            model.mtp.requires_grad_(self.config.training.online_mtp_sft)
         # Load-only DSpark: keep mtp.* in ckpt but out of the optimizer.
         if (self.config.training.enable_dspark and not self.config.training.online_train_dspark):
             # 避免 wegiht decay 对 mtp 的影响。

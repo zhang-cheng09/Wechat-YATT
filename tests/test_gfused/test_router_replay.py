@@ -331,7 +331,7 @@ def test_router_replay_ctx_mismatched_layers_raises(_):
 @contextmanager
 def _mock_mpu(cp_size=1, cp_rank=0, dp_rank=0):
     """Mock megatron.core.mpu 并行度函数。"""
-    with patch("gpatch_v4.training_backend.fsdp2_backend.mixin.mpu") as mock:
+    with patch("gpatch_v4.training_backend.fsdp2_backend.mixin.router_replay.mpu") as mock:
         mock.get_context_parallel_world_size.return_value = cp_size
         mock.get_context_parallel_rank.return_value = cp_rank
         mock.get_data_parallel_rank.return_value = dp_rank
@@ -346,6 +346,7 @@ def _make_mixin(mlp_layer_types):
         pass
 
     stub = _Stub()
+    stub.policy_config = SimpleNamespace(model_arch="deepseek_v4")
     stub.hf_config = SimpleNamespace(mlp_layer_types=mlp_layer_types)
     stub.config = SimpleNamespace(
         training=SimpleNamespace(moe_router_replay=True)

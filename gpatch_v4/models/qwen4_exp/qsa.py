@@ -51,6 +51,7 @@ __all__ = [
 ]
 
 QSA_ATTN_BACKENDS = ("flex", "dense")
+_SELECT_QSA_BLOCKS_CHUNK_COMPILED = None
 
 
 def _visible_prefix_lengths(visible: torch.Tensor) -> torch.Tensor:
@@ -71,6 +72,34 @@ def _visible_prefix_lengths(visible: torch.Tensor) -> torch.Tensor:
     return prefix_len
 
 
+def _select_qsa_blocks_chunk(
+    query_states: torch.Tensor,
+    pooled_keys: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    block_ids: torch.Tensor,
+    k_max: int,
+    scale: float,
+) -> torch.Tensor:
+    scores = torch.einsum("bqhd,bnd->bqhn", query_states, pooled_keys)
+    scores = torch.relu(scores).sum(dim=2) * scale
+    block_is_visible = block_ids < visible_blocks.unsqueeze(-1)
+    scores = scores.masked_fill(~block_is_visible, float("-inf"))
+    topk_blocks = torch.topk(scores, k_max, dim=-1, sorted=False).indices
+    selected = block_is_visible.gather(-1, topk_blocks)
+    return torch.zeros_like(block_is_visible).scatter(-1, topk_blocks, selected)
+
+
+#TODO(xiaotaoliu) compile 之后反而比不 compile 的慢了，需要排查原因
+def _compiled_select_qsa_blocks_chunk():
+    global _SELECT_QSA_BLOCKS_CHUNK_COMPILED
+    if _SELECT_QSA_BLOCKS_CHUNK_COMPILED is None:
+        _SELECT_QSA_BLOCKS_CHUNK_COMPILED = torch.compile(
+            _select_qsa_blocks_chunk,
+            dynamic=True,
+        )
+    return _SELECT_QSA_BLOCKS_CHUNK_COMPILED
+
+
 @torch.no_grad()
 def select_qsa_membership(
     index_query_states: torch.Tensor,
@@ -81,6 +110,8 @@ def select_qsa_membership(
     k_layernorm: nn.Module,
     compress_ratio: int,
     block_topk: int,
+    score_query_chunk_size: Optional[int] = None,
+    compile_score: bool = False,
 ) -> torch.Tensor:
     """Batched equivalent of the upstream per-query QSA selection.
 
@@ -102,6 +133,11 @@ def select_qsa_membership(
         Keys per index block.
     block_topk : int
         ``indexer_budget // compress_ratio``.
+    score_query_chunk_size : int, optional
+        Maximum number of query rows in one fp32 score tensor. ``None`` materializes
+        the full query dimension.
+    compile_score : bool, default False
+        Compile the score, mask, top-k, and scatter operations.
 
     Returns
     -------
@@ -110,17 +146,21 @@ def select_qsa_membership(
 
     Notes
     -----
-    Peak transient is the score tensor ``[B, S_q, H_idx, S_kv / compress_ratio]`` in
-    fp32 (≈67 MB at B=1, S=4096, H_idx=4, ratio=4). Sequences far beyond the validated
-    4096 would want query chunking here.
+    With chunking enabled, the fp32 score transient is bounded to
+    ``[B, score_query_chunk_size, H_idx, S_kv / compress_ratio]``. Otherwise its query
+    dimension is ``S_q``.
     """
     batch_size, q_len, _, head_dim = index_query_states.shape
     kv_len = raw_key_states.shape[1]
+    if score_query_chunk_size is not None and score_query_chunk_size <= 0:
+        raise ValueError(f"score_query_chunk_size must be positive, got {score_query_chunk_size}")
     prefix_len = _visible_prefix_lengths(visible)
 
     num_blocks = kv_len // compress_ratio
     if num_blocks == 0:
         # Shorter than one block: everything is tail, i.e. the plain causal mask.
+        return visible.clone()
+    if (score_query_chunk_size is not None or compile_score) and num_blocks <= block_topk:
         return visible.clone()
 
     # --- Pool keys into blocks. Query-independent, so this is computed once per block
@@ -139,30 +179,57 @@ def select_qsa_membership(
         unsqueeze_dim=2,
     ).squeeze(2)
 
-    # --- Score every (query, block) pair: relu then sum over index heads.
-    scores = torch.einsum("bqhd,bnd->bqhn", index_query_states.float(), pooled.float())
-    scores = torch.relu(scores).sum(dim=2) / math.sqrt(head_dim)
-
     # A block is visible to a query iff the block is entirely within its prefix.
     visible_blocks = prefix_len // compress_ratio
-    block_ids = torch.arange(num_blocks, device=scores.device)
-    block_is_visible = block_ids < visible_blocks.unsqueeze(-1)
-    scores = scores.masked_fill(~block_is_visible, float("-inf"))
-
-    # `topk` needs a static k; ranks beyond a query's visible blocks are discarded below.
+    block_ids = torch.arange(num_blocks, device=pooled.device)
     k_max = min(block_topk, num_blocks)
-    topk_blocks = torch.topk(scores, k_max, dim=-1, sorted=False).indices
-    selected = block_is_visible.gather(-1, topk_blocks)
-
-    block_member = scores.new_zeros((batch_size, q_len, num_blocks), dtype=torch.bool)
-    block_member.scatter_(-1, topk_blocks, selected)
+    if score_query_chunk_size is None and not compile_score:
+        scores = torch.einsum(
+            "bqhd,bnd->bqhn",
+            index_query_states.float(),
+            pooled.float(),
+        )
+        scores = torch.relu(scores).sum(dim=2) / math.sqrt(head_dim)
+        block_is_visible = block_ids < visible_blocks.unsqueeze(-1)
+        scores = scores.masked_fill(~block_is_visible, float("-inf"))
+        topk_blocks = torch.topk(scores, k_max, dim=-1, sorted=False).indices
+        selected = block_is_visible.gather(-1, topk_blocks)
+        block_member = scores.new_zeros(
+            (batch_size, q_len, num_blocks),
+            dtype=torch.bool,
+        )
+        block_member.scatter_(-1, topk_blocks, selected)
+    else:
+        scale = 1.0 / math.sqrt(head_dim)
+        pooled_fp32 = pooled.float()
+        select_blocks_chunk = (
+            _compiled_select_qsa_blocks_chunk() if compile_score else _select_qsa_blocks_chunk
+        )
+        query_chunk_size = q_len if score_query_chunk_size is None else score_query_chunk_size
+        block_member = torch.zeros(
+            batch_size,
+            q_len,
+            num_blocks,
+            dtype=torch.bool,
+            device=pooled.device,
+        )
+        for query_start in range(0, q_len, query_chunk_size):
+            query_end = min(query_start + query_chunk_size, q_len)
+            block_member[:, query_start:query_end] = select_blocks_chunk(
+                index_query_states[:, query_start:query_end].float(),
+                pooled_fp32,
+                visible_blocks[:, query_start:query_end],
+                block_ids,
+                k_max,
+                scale,
+            )
     membership = block_member.repeat_interleave(compress_ratio, dim=-1)
     if membership.shape[-1] < kv_len:
         membership = torch.nn.functional.pad(membership, (0, kv_len - membership.shape[-1]))
 
     # --- The incomplete causal tail is always attended: keys in
     # [visible_blocks * compress_ratio, prefix_len).
-    key_ids = torch.arange(kv_len, device=scores.device)
+    key_ids = torch.arange(kv_len, device=pooled.device)
     tail_start = (visible_blocks * compress_ratio).unsqueeze(-1)
     tail = (key_ids >= tail_start) & (key_ids < prefix_len.unsqueeze(-1))
 
@@ -175,6 +242,22 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
     Returns the membership table instead of upstream's 4-D additive/boolean mask; the
     caller decides whether to turn it into a dense mask or a FlexAttention ``BlockMask``.
     """
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        score_query_chunk_size: Optional[int] = None,
+        compile_score: bool = False,
+    ) -> None:
+        super().__init__(config, layer_idx)
+        if score_query_chunk_size is not None and score_query_chunk_size <= 0:
+            raise ValueError(
+                "score_query_chunk_size must be positive, "
+                f"got {score_query_chunk_size}"
+            )
+        self.score_query_chunk_size = score_query_chunk_size
+        self.compile_score = compile_score
+
     @override
     def forward(
         self,
@@ -252,9 +335,9 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
                 cp_context.global_sequence_length, device=hidden_states.device
             )
             causal = key_positions.view(1, 1, -1) <= query_positions.view(1, -1, 1)
-            valid_keys = key_positions.view(1, 1, -1) < (
-                cp_context.global_sequence_lengths.to(hidden_states.device).view(-1, 1, 1)
-            )
+            valid_keys = key_positions.view(
+                1, 1, -1
+            ) < (cp_context.global_sequence_lengths.to(hidden_states.device).view(-1, 1, 1))
             visible = causal & valid_keys
         return select_qsa_membership(
             query_states,
@@ -265,6 +348,8 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
             self.k_layernorm,
             self.compress_ratio,
             self.block_topk,
+            self.score_query_chunk_size,
+            self.compile_score,
         )
 
     def _packed_membership(
@@ -281,6 +366,7 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
         boundaries = cp_context.global_cu_seqlens
         if boundaries is None:
             raise RuntimeError("packed QSA context is missing document boundaries")
+        boundary_values = cp_context.global_document_boundaries
         if cp_context.size == 1:
             return self._packed_membership_single_rank(
                 query_states,
@@ -288,6 +374,7 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
                 key_cos,
                 key_sin,
                 boundaries,
+                boundary_values,
                 cp_context.global_sequence_length,
             )
 
@@ -301,16 +388,15 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
         local_start = cp_context.local_sequence_start
         local_end = cp_context.local_sequence_end
         for document_start, document_end in zip(
-            boundaries.tolist(), boundaries[1:].tolist()
+            boundary_values,
+            boundary_values[1:],
         ):
             overlap_start = max(document_start, local_start)
             overlap_end = min(document_end, local_end)
             if overlap_start >= overlap_end:
                 continue
             document_length = document_end - document_start
-            query_slice = query_states[
-                :, overlap_start - local_start : overlap_end - local_start
-            ]
+            query_slice = query_states[:, overlap_start - local_start:overlap_end - local_start]
             query_positions = torch.arange(
                 overlap_start - document_start,
                 overlap_end - document_start,
@@ -327,10 +413,12 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
                 self.k_layernorm,
                 self.compress_ratio,
                 self.block_topk,
+                self.score_query_chunk_size,
+                self.compile_score,
             )
             membership[
                 :,
-                overlap_start - local_start : overlap_end - local_start,
+                overlap_start - local_start:overlap_end - local_start,
                 document_start:document_end,
             ] = document_membership
         return membership
@@ -342,24 +430,28 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
         key_cos: torch.Tensor,
         key_sin: torch.Tensor,
         boundaries: torch.Tensor,
+        boundary_values: tuple[int, ...],
         global_sequence_length: int,
     ) -> torch.Tensor:
         """Batch all documents together on the CP-size-one path."""
         document_starts = boundaries[:-1]
         document_lengths = boundaries.diff()
-        max_length = int(document_lengths.max())
+        max_length = max(end - start for start, end in zip(
+            boundary_values,
+            boundary_values[1:],
+        ))
         local_positions = torch.arange(max_length, device=query_states.device)
         row_positions = document_starts[:, None] + local_positions[None, :]
         row_valid = local_positions[None, :] < document_lengths[:, None]
-        safe_positions = row_positions.clamp(max=int(boundaries[-1]) - 1)
+        safe_positions = row_positions.clamp(max=boundary_values[-1] - 1)
 
         query_rows = query_states[0, safe_positions]
         key_rows = raw_keys[0, safe_positions]
         cos_rows = key_cos[0, safe_positions]
         sin_rows = key_sin[0, safe_positions]
-        visible = (
-            local_positions.view(1, -1, 1) >= local_positions.view(1, 1, -1)
-        ) & row_valid.unsqueeze(-1) & row_valid.unsqueeze(1)
+        visible = (local_positions.view(1, -1, 1)
+                   >= local_positions.view(1, 1,
+                                           -1)) & row_valid.unsqueeze(-1) & row_valid.unsqueeze(1)
         document_membership = select_qsa_membership(
             query_rows,
             key_rows,
@@ -369,6 +461,8 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
             self.k_layernorm,
             self.compress_ratio,
             self.block_topk,
+            self.score_query_chunk_size,
+            self.compile_score,
         )
 
         membership = torch.zeros(
@@ -379,12 +473,15 @@ class Qwen4ExpQSAIndexer(Qwen4ExpTextQSAIndexer):
             device=query_states.device,
         )
         for row, (document_start, document_end) in enumerate(
-            zip(boundaries.tolist(), boundaries[1:].tolist())
+            zip(
+                boundary_values,
+                boundary_values[1:],
+            )
         ):
             document_length = document_end - document_start
-            membership[
-                0, document_start:document_end, document_start:document_end
-            ] = document_membership[row, :document_length, :document_length]
+            membership[0, document_start:document_end,
+                       document_start:document_end] = document_membership[
+                           row, :document_length, :document_length]
         return membership
 
 
@@ -432,6 +529,18 @@ def dense_sparse_gqa_attention(
     return attn_output * has_routes[:, None, :, None]
 
 
+def _membership_flat_offset(
+    batch_idx: torch.Tensor,
+    query_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+    query_length: int,
+    kv_length: int,
+) -> torch.Tensor:
+    # FlexAttention lowers mask indices to int32, so widen before multiplying.
+    flat_query = batch_idx.to(torch.int64) * query_length + query_idx.to(torch.int64)
+    return flat_query * kv_length + kv_idx.to(torch.int64)
+
+
 def flex_sparse_gqa_attention(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -459,9 +568,11 @@ def flex_sparse_gqa_attention(
     has_routes = membership.any(dim=-1)
     routes = membership.clone()
     routes[..., 0] |= ~has_routes
+    routes_flat = routes.reshape(-1)
 
     def mask_mod(batch_idx, _head_idx, q_idx, kv_idx):
-        return routes[batch_idx, q_idx, kv_idx]
+        offset = _membership_flat_offset(batch_idx, q_idx, kv_idx, routes.shape[1], routes.shape[2])
+        return routes_flat[offset]
 
     block_mask = create_block_mask(
         mask_mod,
@@ -471,6 +582,8 @@ def flex_sparse_gqa_attention(
         KV_LEN=key_states.shape[2],
         device=query_states.device,
     )
+    # dynamic=True: THD pack varies KV/Q length every step; static compile thrashs
+    # recompiles (see enable_torch_compile + dynamic=False regression).
     attn_output = _compiled_flex_attention()(
         query_states,
         key_states,
@@ -491,7 +604,7 @@ def _compiled_flex_attention():
     if _FLEX_ATTENTION_COMPILED is None:
         from torch.nn.attention.flex_attention import flex_attention
 
-        _FLEX_ATTENTION_COMPILED = torch.compile(flex_attention, dynamic=False)
+        _FLEX_ATTENTION_COMPILED = torch.compile(flex_attention, dynamic=True)
     return _FLEX_ATTENTION_COMPILED
 
 
@@ -503,14 +616,26 @@ class Qwen4ExpQSAAttention(Qwen4ExpTextAttention):
     into FlexAttention, instead of an additive mask that would force a dense
     ``[B, H, S_q, S_kv]`` score matrix.
     """
-    def __init__(self, config, layer_idx: int, attn_backend: str = "flex"):
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        attn_backend: str = "flex",
+        score_query_chunk_size: Optional[int] = None,
+        compile_score: bool = False,
+    ) -> None:
         super().__init__(config, layer_idx)
         if attn_backend not in QSA_ATTN_BACKENDS:
             raise ValueError(
                 f"attn_backend must be one of {QSA_ATTN_BACKENDS}, got {attn_backend!r}."
             )
         self.attn_backend = attn_backend
-        self.indexer = Qwen4ExpQSAIndexer(config, layer_idx)
+        self.indexer = Qwen4ExpQSAIndexer(
+            config,
+            layer_idx,
+            score_query_chunk_size=score_query_chunk_size,
+            compile_score=compile_score,
+        )
         # No auxiliary loss and no straight-through estimator exist for the discrete
         # top-k, so the indexer cannot be trained; freeze it explicitly.
         self.indexer.requires_grad_(False)

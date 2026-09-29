@@ -1,12 +1,12 @@
 """Public TransferQueue adapter API and process-local connector lifecycle."""
 
-from gpatch_v4.configs.tq_config import TqConfig
+from gpatch_v4.configs.tq_config import TransferQueueConfig
 from gpatch_v4.transfer.tq_connector import TqConnector
 
 _TQ_CONNECTOR: TqConnector | None = None
 
 
-def init_tq_connector(tq_config: TqConfig) -> TqConnector:
+def init_tq_connector(tq_config: TransferQueueConfig) -> TqConnector:
     """Initialize and return this process's connector."""
     global _TQ_CONNECTOR
     if _TQ_CONNECTOR is None:
@@ -25,7 +25,7 @@ def get_tq_connector() -> TqConnector:
 
 
 def close_tq_connector() -> None:
-    """Close and clear this process's connector."""
+    """Close the driver-owned TQ runtime and shared services."""
     global _TQ_CONNECTOR
     if _TQ_CONNECTOR is None:
         return

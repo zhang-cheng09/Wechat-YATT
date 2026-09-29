@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 
+from gpatch_v4.core.constants import PrepareDataRole
+
 
 class ApplySamplingRolloutAttrBase(ABC):
     """Abstract base for rollout attribute manipulation during sampling."""
@@ -131,12 +133,32 @@ class SamplerGenerateFunc(ABC):
 class PrepareDataForward(ABC):
     """Abstract base for data preparation before model forward passes.
 
+    Attributes
+    ----------
+    cp_partition_mode : str
+        CP token layout. Standard models use ``"zigzag"`` by default.
+
     Parameters
     ----------
     config : object
+        Top-level training config. Shared fields such as ``training`` stay here.
+    role : PrepareDataRole, optional
+        Selects :attr:`role_config`. Default: ``PrepareDataRole.POLICY``.
     """
-    def __init__(self, config):
+    cp_partition_mode = "zigzag"
+
+    def __init__(self, config, role: PrepareDataRole = PrepareDataRole.POLICY):
         self.config = config
+        self.role = role
+
+    @property
+    def role_config(self):
+        """Policy config for ``role``: ``config.policy`` or ``config.teacher``."""
+        if self.role == PrepareDataRole.TEACHER:
+            assert self.config.teacher is not None
+            return self.config.teacher
+        assert self.role == PrepareDataRole.POLICY, f"{self.role=}"
+        return self.config.policy
 
     @abstractmethod
     def model_forward_only(
@@ -193,11 +215,9 @@ class PrepareDataForward(ABC):
     ):
         """Pack a finetune step batch into mlite ``PackedBatch`` + ``LossContext`` pairs.
 
-        Used by ``training_backend=mlite``. 
+        Used by ``training_backend=mlite``.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement sft_to_mlite_packed"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not implement sft_to_mlite_packed")
 
     def sft_train_with_dynamic_cp(
         self,

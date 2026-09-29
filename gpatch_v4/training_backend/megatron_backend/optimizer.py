@@ -1,4 +1,5 @@
-import copy
+import re
+from collections import Counter, defaultdict
 
 import torch
 from packaging import version
@@ -7,47 +8,38 @@ from megatron.core.optimizer import OptimizerConfig as McoreOptimizerConfig
 from megatron.core.optimizer import get_megatron_optimizer as mcore_get_megatron_optimizer
 
 try:
-    from megatron.core.optimizer import ParamKey
-except:
-    pass
+    from megatron.core.optimizer import get_standard_config_overrides
+except ImportError:
+    get_standard_config_overrides = None
 from megatron.core import __version__
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
+from gpatch_v4.utils.param_lr import (
+    DEFAULT_LR_GROUP_NAME,
+    GCORE_LR_GROUP_KEY,
+    build_param_lr_config_overrides,
+    lr_group_name_for_param_name,
+    warn_unmatched_param_lr_overrides,
+)
+from gpatch_v4.utils.common_utils import log
+
 
 def get_megatron_optimizer_config_overrides(model, config, optimizer_config):
+    """Build Megatron per-parameter optimizer overrides from ``param_lr_overrides``.
 
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    config_overrides = {}
-    vit_lr = optimizer_config.get('vit_lr', None)
-    vit_min_lr = optimizer_config.get('vit_min_lr', None)
-    vit_proj_lr = optimizer_config.get('vit_proj_lr', None)
-    vit_proj_min_lr = optimizer_config.get('vit_proj_min_lr', None)
-
-    if vit_lr is not None:
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = vit_lr
-        if vit_min_lr is not None:
-            decoupled_optimizer_config.min_lr = vit_min_lr
-
-        for name, param in model[0].named_parameters():
-            if name.startswith(f'module.module.vision_model'):
-                if vit_proj_lr is None or not name.startswith(f'module.module.vision_model.merger'):
-                    decoupled_param_key = ParamKey(name=name)
-                    config_overrides[decoupled_param_key] = decoupled_optimizer_config
-
-    if vit_proj_lr is not None:
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = vit_proj_lr
-        if vit_proj_min_lr is not None:
-            decoupled_optimizer_config.min_lr = vit_proj_min_lr
-
-        for name, param in model[0].named_parameters():
-            if name.startswith(f'module.module.vision_model.merger'):
-                decoupled_param_key = ParamKey(name=name)
-                config_overrides[decoupled_param_key] = decoupled_optimizer_config
-
-    return config_overrides if config_overrides else None
+    Custom overrides are merged on top of Megatron's standard wd-skip rules
+    so that passing a non-empty dict does not drop bias / 1-D weight-decay
+    handling.
+    """
+    del model
+    config_overrides = build_param_lr_config_overrides(optimizer_config.param_lr_overrides)
+    if not config_overrides:
+        return None
+    if get_standard_config_overrides is not None:
+        merged = dict(get_standard_config_overrides(config))
+        merged.update(config_overrides)
+        return merged
+    return config_overrides
 
 
 def should_use_distributed_optimizer(optimizer_config) -> bool:
@@ -84,10 +76,9 @@ def setup_megatron_optim_config(model, optimizer_config) -> McoreOptimizerConfig
 
     if version.parse(__version__) <= version.parse('0.15.0'):
         config_overrides = None
-        assert optimizer_config.get("vit_lr", None) == None
-        assert optimizer_config.get("vit_min_lr", None) == None
-        assert optimizer_config.get("vit_proj_lr", None) == None
-        assert optimizer_config.get("vit_proj_min_lr", None) == None
+        assert not optimizer_config.param_lr_overrides, (
+            "optimizer.param_lr_overrides requires Megatron > 0.15"
+        )
     else:
         config_overrides = get_megatron_optimizer_config_overrides(model, config, optimizer_config)
     return config, config_overrides
@@ -169,12 +160,109 @@ def get_megatron_optimizer_param_scheduler(
     return opt_param_scheduler
 
 
+def _iter_named_parameters(model):
+    if model is None:
+        return
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        yield from chunk.named_parameters()
+
+
+def _inner_optimizers(optimizer):
+    if hasattr(optimizer, "chained_optimizers"):
+        return list(optimizer.chained_optimizers)
+    return [optimizer]
+
+
+def _param_name_to_pattern(name: str) -> str:
+    """Collapse numeric indices so repeated layers share one pattern.
+
+    Same idea as LoRA coverage: ``layers.47.mlp`` → ``layers.*.mlp``.
+    Trailing expert-shard suffixes (``weight15``) become ``weight*``.
+    """
+    name = re.sub(r"\.(\d+)\.", ".*.", name)
+    return re.sub(r"(\d+)$", "*", name)
+
+
+def _dedup_param_names(names):
+    """Deduplicate parameter names into ``pattern (xN)`` lines."""
+    counts = Counter(_param_name_to_pattern(n) for n in names)
+    return [f"{pat} (x{cnt})" if cnt > 1 else pat for pat, cnt in counts.items()]
+
+
+def log_optimizer_param_group_lrs(optimizer, model=None, param_lr_overrides=None) -> None:
+    """Log which local model parameters belong to each named LR group.
+
+    DistributedOptimizer shards ``param_groups`` across DP ranks, so names
+    are taken from ``model.named_parameters`` (first yaml override wins).
+    Every tensor- / pipeline-parallel rank with data-parallel rank 0 prints.
+
+    Each group is one log line: regex-collapsed ``patterns`` first
+    (layer / expert indices folded like LoRA coverage), then the original
+    ``params`` list. A single ``log`` call avoids multiprocess interleaving.
+    """
+    from megatron.core import mpu
+
+    if mpu.is_initialized() and mpu.get_data_parallel_rank() != 0:
+        return
+
+    lr_info = {}
+    for inner in _inner_optimizers(optimizer):
+        groups = inner.param_groups if hasattr(inner, "param_groups") else []
+        for group in groups:
+            if group.get(GCORE_LR_GROUP_KEY):
+                base = group[GCORE_LR_GROUP_KEY]
+            elif group.get("default_config", True):
+                base = DEFAULT_LR_GROUP_NAME
+            else:
+                continue
+            if base in lr_info:
+                continue
+            lr_info[base] = {
+                "lr": group.get("lr"),
+                "max_lr": group.get("max_lr"),
+                "min_lr": group.get("min_lr"),
+            }
+
+    names_by_group = defaultdict(list)
+    for pname, param in _iter_named_parameters(model):
+        if not param.requires_grad:
+            continue
+        group_name = lr_group_name_for_param_name(pname, param_lr_overrides)
+        names_by_group[group_name].append(pname)
+
+    reported = []
+    if param_lr_overrides:
+        for entry in param_lr_overrides:
+            if entry.name not in reported:
+                reported.append(entry.name)
+    if DEFAULT_LR_GROUP_NAME not in reported:
+        reported.append(DEFAULT_LR_GROUP_NAME)
+    for base in names_by_group:
+        if base not in reported:
+            reported.append(base)
+
+    for base in reported:
+        names = names_by_group.get(base, [])
+        info = lr_info.get(base, {})
+        header = (
+            f"OPTIM PARAM GROUP name={base} n_params={len(names)} "
+            f"lr={info.get('lr')} max_lr={info.get('max_lr')} "
+            f"min_lr={info.get('min_lr')}"
+        )
+        patterns = _dedup_param_names(names)
+        log(f"{header} param_names_patterns={patterns}", rank=None)
+
+
 def get_optimizer_and_scheduler(config, model):
     optimizer = get_megatron_optimizer(model, config.optimizer)
     optimizer_scheduler = get_megatron_optimizer_param_scheduler(optimizer=optimizer, config=config)
+    log_optimizer_param_group_lrs(
+        optimizer,
+        model,
+        config.optimizer.param_lr_overrides,
+    )
+    warn_unmatched_param_lr_overrides(
+        optimizer, config.optimizer.param_lr_overrides
+    )
     return optimizer, optimizer_scheduler
-
-
-def get_megatron_last_lr(optimizer):
-    """Last lr from the optimizer."""
-    return optimizer.param_groups[0]["lr"]

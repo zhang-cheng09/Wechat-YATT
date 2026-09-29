@@ -75,7 +75,9 @@ class TestLossBackendSmoke(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(config.checkpoint.save_ckpt_path, ignore_errors=True)
             shutil.rmtree(config.checkpoint.load_ckpt_path, ignore_errors=True)
 
-    def _make_grpo_config(self, backend: str) -> RlConfig:
+    def _make_grpo_config(
+        self, backend: str, use_legacy_loss: bool | None = None
+    ) -> RlConfig:
         config = load_config("test_math_rl", RlConfig)
         config.training.training_backend = backend
         config.training.exit_step = 2
@@ -89,7 +91,10 @@ class TestLossBackendSmoke(unittest.IsolatedAsyncioTestCase):
         config.training.seq_length = 1024
         config.training.rollout_mbs = 1
         config.training.train_mbs = 1
-        config.ppo.use_legacy_loss = backend != "mcore"
+        if use_legacy_loss is None:
+            config.training.use_legacy_loss = backend != "mcore"
+        else:
+            config.training.use_legacy_loss = use_legacy_loss
         self._set_checkpoint_paths(config, f"{backend}_grpo")
         self._set_small_model(config)
 
@@ -99,12 +104,27 @@ class TestLossBackendSmoke(unittest.IsolatedAsyncioTestCase):
         config.sampler.infer_engine_configs[0].dist_config.nnodes = 1
         config.sampler.infer_engine_configs[0].dist_config.tensor_model_parallel_size = 1
         config.sampler.infer_engine_configs[0].generate_max_tokens = 128
+        # breakable prefill CUDA graph 与 memory saver 不兼容
+        config.sampler.infer_engine_configs[0].override_infer_engine_config[
+            "cuda_graph_backend_prefill"
+        ] = "full"
         config.bt_rm.infer_engine_configs[0].dist_config.nnodes = 1
         return config
 
-    async def _run_grpo(self, backend: str) -> None:
-        config = self._make_grpo_config(backend)
-        data_dir = self._prepare_grpo_data(backend)
+    async def _run_grpo(
+        self,
+        backend: str,
+        *,
+        use_legacy_loss: bool | None = None,
+        name: str | None = None,
+        exit_step: int | None = None,
+    ):
+        config = self._make_grpo_config(backend, use_legacy_loss=use_legacy_loss)
+        if name is not None:
+            self._set_checkpoint_paths(config, name)
+        if exit_step is not None:
+            config.training.exit_step = exit_step
+        data_dir = self._prepare_grpo_data(name or backend)
         config.data.data_pathes = [data_dir]
         shutil.rmtree(config.checkpoint.load_ckpt_path, ignore_errors=True)
         try:
@@ -113,6 +133,7 @@ class TestLossBackendSmoke(unittest.IsolatedAsyncioTestCase):
                 metrics,
                 ("policy/loss", "policy/grad_norm", "policy/ppo_ratio"),
             )
+            return metrics
         finally:
             shutil.rmtree(config.checkpoint.save_ckpt_path, ignore_errors=True)
             shutil.rmtree(config.checkpoint.load_ckpt_path, ignore_errors=True)
@@ -131,3 +152,14 @@ class TestLossBackendSmoke(unittest.IsolatedAsyncioTestCase):
     @requires_sglang
     async def test_fsdp2_grpo(self):
         await self._run_grpo("fsdp2")
+
+    @requires_sglang
+    async def test_fsdp2_grpo_new_loss(self):
+        metrics = await self._run_grpo(
+            "fsdp2",
+            use_legacy_loss=False,
+            name="fsdp2_grpo_new_loss",
+        )
+        for dp_metrics in metrics:
+            for step_metrics in dp_metrics:
+                self.assertGreater(step_metrics["policy/grad_norm"], 0.0)

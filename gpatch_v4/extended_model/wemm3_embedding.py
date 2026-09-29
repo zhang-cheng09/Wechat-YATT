@@ -43,9 +43,11 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
 
         # not support padding image now
         hw_factor = 4
-        if self.config.policy.model_arch in (
+        if self.role_config.model_arch in (
             MODEL_ARCH.WEMM3_5_EMBEDDING,
             MODEL_ARCH.WEMM3_5_MOE_EMBEDDING,
+            MODEL_ARCH.WEMM3_5_VIDEO_EMBEDDING,
+            MODEL_ARCH.WEMM3_5_MOE_VIDEO_EMBEDDING,
         ):
             cp_size = mpu.get_tensor_and_context_parallel_world_size()
         else:
@@ -186,8 +188,13 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
             vision_grid_thw = vision_grid_thw.cuda(non_blocking=non_blocking)
 
         is_source = sample.get("is_source").cuda(non_blocking=non_blocking)
+        # WeMM3.5-Video (omni) 才有 audio_feature；纯文本/图像的 embedding 样本没有该 key。
+        # 定长 collator 下它与 vision_data 一样是 CPU tensor，必须先搬到 GPU。
+        audio_feature = sample.get("audio_feature")
+        if audio_feature is not None:
+            audio_feature = audio_feature.cuda(non_blocking=non_blocking)
 
-        # GradCache 阶段2 (use_gbs_embedding_in_loss) 写入 sample 的回放数据:
+        # GradCache 阶段2 (use_grad_cache) 写入 sample 的回放数据:
         # embedding 梯度切片 / logit_scale 梯度 / 阶段2 真实指标。
         embeddings_grad = sample.get("embeddings_grad")
         logit_scale_grad = sample.get("logit_scale_grad")
@@ -200,6 +207,14 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
         teacher_scores = sample.get("teacher_scores")
         if teacher_scores is not None:
             teacher_scores = teacher_scores.cuda(non_blocking=non_blocking)
+
+        teacher_eos_embeddings = sample.get("teacher_eos_embeddings")
+        if teacher_eos_embeddings is not None:
+            teacher_eos_embeddings = teacher_eos_embeddings.cuda(non_blocking=non_blocking)
+        dataset_name = sample.get("dataset_name")
+        is_mixed_batch = sample.get("is_mixed_batch")
+        if is_mixed_batch is not None and torch.is_tensor(is_mixed_batch):
+            is_mixed_batch = is_mixed_batch.cuda(non_blocking=non_blocking)
 
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
@@ -226,7 +241,7 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
             "input_features": None,
             "feature_attention_mask": None,
             "video_second_per_grid": None,
-            "audio_feature": None,
+            "audio_feature": audio_feature,
             "is_source": is_source,
             "embeddings_grad": embeddings_grad,
             "logit_scale_grad": logit_scale_grad,
@@ -237,6 +252,9 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
             "packed_seq_params": packed_seq_params,
             "relevant_score": relevant_score,
             "teacher_scores": teacher_scores,
+            "teacher_eos_embeddings": teacher_eos_embeddings,
+            "dataset_name": dataset_name,
+            "is_mixed_batch": is_mixed_batch,
         }
 
         fwd_kwargs = dict(
@@ -251,4 +269,6 @@ class Wemm3EmbeddingPrepareDataForward(PrepareDataForward):
             cp_img_num=batch["cp_img_num"],
             packed_seq_params=packed_seq_params,
         )
+        if audio_feature is not None:
+            fwd_kwargs['audio_feature'] = audio_feature
         return batch, fwd_kwargs

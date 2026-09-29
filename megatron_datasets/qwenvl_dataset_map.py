@@ -973,7 +973,8 @@ class DataCollatorForQwenVl(object):
             )
             if self.model_arch in [
                 "qwen3_vl_moe", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe",
-                "wemm3_embedding", "wemm3_5_embedding", "wemm3_5_moe_embedding"
+                "wemm3_embedding", "wemm3_5_embedding", "wemm3_5_moe_embedding",
+                "wemm3_5_video_embedding", "wemm3_5_moe_video_embedding"
             ]:
                 for image_padded in images_padded:
                     assert not image_padded, "not support image padded now"
@@ -1474,7 +1475,8 @@ def get_processor(args, model_arch=None):
         model_arch = args.model_arch
     if model_arch in [
         "qwen3_vl_moe", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe", "wemm3_embedding",
-        "wemm3_5_embedding", "wemm3_5_moe_embedding"
+        "wemm3_5_embedding", "wemm3_5_moe_embedding",
+        "wemm3_5_video_embedding", "wemm3_5_moe_video_embedding"
     ]:
         # set the user param
         if args.min_pixels_num is not None:
@@ -1624,7 +1626,8 @@ def build_train_valid_test_data_iter(
     # grpo数据先不pad
     if args.use_grpo or args.model_arch in [
         "qwen3_vl_moe", "qwen3_vl", "qwen3_5", "qwen3_5_moe", "qwen3_omni_moe", "wemm3_embedding",
-        "wemm3_5_embedding", "wemm3_5_moe_embedding"
+        "wemm3_5_embedding", "wemm3_5_moe_embedding",
+        "wemm3_5_video_embedding", "wemm3_5_moe_video_embedding"
     ]:
         hw_factor = 1
 

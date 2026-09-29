@@ -159,6 +159,39 @@ def extend_value_to_dict(data: dict, new_data: dict, prefix: str = ""):
         data[new_key].extend(val)
 
 
+def record_engine_lrs(metrics: dict, engine: Any, prefix: str) -> Any:
+    """Step the engine LR scheduler and record canonical + per-group LRs.
+
+    Writes ``{prefix}/lr`` as the default-schedule lr (or the scalar
+    returned by FSDP / mlite backends). Named groups are written as
+    ``{prefix}/lr/{name}`` except the canonical ``default`` key.
+
+    Parameters
+    ----------
+    metrics : dict
+        Destination metric dict.
+    engine
+        Training engine exposing ``step_and_get_lr``.
+    prefix : str
+        Metric prefix, e.g. ``"policy"`` or ``"value"``.
+
+    Returns
+    -------
+    float
+        Canonical learning rate stored at ``{prefix}/lr``.
+    """
+    from gpatch_v4.utils.param_lr import record_named_lrs
+
+    lrs = engine.step_and_get_lr()
+    if isinstance(lrs, dict):
+        return record_named_lrs(metrics, prefix, lrs)
+    group_lrs = None
+    getter = getattr(engine, "get_param_group_lrs", None)
+    if getter is not None:
+        group_lrs = getter()
+    return record_named_lrs(metrics, prefix, lrs, group_lrs)
+
+
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """Reduce each list in ``metrics`` by mean / max / min based on the key suffix.
 
@@ -262,6 +295,7 @@ def expand_rollout_batch(rollout_batch: Dict[str, Union[int, List[Any]]], ) -> L
     Parameters
     ----------
     rollout_batch : dict[str, list]
+
         A dict whose values are equal-length lists, e.g.
 
         .. code-block:: python
@@ -305,6 +339,17 @@ def expand_rollout_batches(
     return ex_rollout_batches
 
 
+def is_flat_sample_list(batches: List[Dict[str, Any]]) -> bool:
+    """Return whether ``batches`` is a per-sample list rather than collated rollout batches.
+
+    Collated rollout batches store ``tokens`` as a list of sequences. Flat samples
+    used by dynamic-batch actors store ``tokens`` as a tensor.
+    """
+    if not batches:
+        raise ValueError("logprob batches must be non-empty")
+    return not isinstance(batches[0]["tokens"], list)
+
+
 def get_max_seqlen_within_ep(seqlen: int):
     t_seqlen = torch.tensor([seqlen], dtype=torch.int, device=torch.cuda.current_device())
     torch.distributed.all_reduce(
@@ -319,6 +364,7 @@ def get_max_seqlen_within_dp(seqlen: int):
         t_seqlen, op=torch.distributed.ReduceOp.MAX, group=mpu.get_data_parallel_group()
     )
     return t_seqlen.item()
+
 
 def get_batches_max_seqlen(batches: List[Dict[str, Any]], pad_to_multi_of: int) -> int:
     max_token_len = max([e['tokens'].shape[-1] for e in batches])
@@ -344,10 +390,7 @@ def update_square_averaging_token_len(batches: List[Dict[str, Any]], max_seq_len
 
 
 def get_iterator_k_split_list(
-    batches: List[Dict[str, Any]],
-    num_microbatches: int,
-    *,
-    vpp_size: Optional[int] = None
+    batches: List[Dict[str, Any]], num_microbatches: int, *, vpp_size: Optional[int] = None
 ):
     """Split ``batches`` into ``num_microbatches`` microbatch lists.
     """
@@ -1472,9 +1515,7 @@ def logprobs_from_compact_ce(
     weight = linear_ce_output["weight"]
     if weight is None:
         weight = output_layer.weight
-    assert output_layer.bias is None, (
-        "CE compaction requires an output projection without bias"
-    )
+    assert output_layer.bias is None, ("CE compaction requires an output projection without bias")
     assert not output_layer.gather_output
     assert not linear_ce_output["runtime_gather_output"]
 
@@ -1521,22 +1562,25 @@ def logprobs_from_compact_ce(
             compact_target.unsqueeze(1),
         ).reshape(-1)
         if return_entropy:
-            from gpatch_v4.training_backend.vocab_parallel_entropy import vocab_parallel_entropy
+            from gpatch_v4.training_backend.vocab_parallel_entropy import (
+                vocab_parallel_entropy,
+            )
+
             # Compact logits are already [K, 1, V/TP]; skip the outer CP/shift protocol.
             _, compact_entropy = vocab_parallel_entropy(
                 compact_logits.float(),
                 ignore_cp=True,
                 pre_shifted=True,
             )
-            curr_entropy = compact_entropy.new_zeros(local_target.numel()).scatter(
-                0, keep_indices, compact_entropy.reshape(-1)
-            ).view_as(local_target)
+            curr_entropy = compact_entropy.new_zeros(
+                local_target.numel()
+            ).scatter(0, keep_indices, compact_entropy.reshape(-1)).view_as(local_target)
         else:
             curr_entropy = None
         # Downstream GRPO consumers still expect tensors in the original token layout.
-        curr_log_probs = compact_log_probs.new_zeros(local_target.numel()).scatter(
-            0, keep_indices, compact_log_probs
-        ).view_as(local_target)
+        curr_log_probs = compact_log_probs.new_zeros(
+            local_target.numel()
+        ).scatter(0, keep_indices, compact_log_probs).view_as(local_target)
 
     curr_log_probs = -1 * curr_log_probs
     curr_log_probs = curr_log_probs.transpose(0, 1).contiguous()
@@ -1577,17 +1621,17 @@ def from_parallel_logits_to_topk_logprobs(
         vocab_parallel_logits: 单 TP 卡的 logits 切片，shape=[B, S//CP, V_p]
         topk: 全局 Top-K
         eps: 避免 log(0)
-        temperature: must be 1.0; temperature scaling is not implemented.
+        temperature: Softmax temperature applied before global-vocabulary normalization.
     Returns:
         global_topk_logprobs: shape=[B, S, k]
         global_topk_token_ids: shape=[B, S, k]
     """
     if temperature is None:
         temperature = 1.0
-    assert float(temperature) == 1.0, (
-        f"from_parallel_logits_to_topk_logprobs does not support temperature != 1.0, "
-        f"got {temperature}"
-    )
+    temperature = float(temperature)
+    assert temperature > 0, f"temperature must be positive, got {temperature}"
+    if temperature != 1.0:
+        vocab_parallel_logits = vocab_parallel_logits / temperature
     cp_size = mpu.get_context_parallel_world_size() if not ignore_cp else 1
     tp_group = mpu.get_tensor_model_parallel_group()
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -1735,17 +1779,17 @@ def from_parallel_logits_to_opd_topk_logprobs(
             predict-next 位移和 response 截取。
         eps: log 内的数值稳定常数。
         ignore_cp: 跳过 CP 切分（如 ``ppo_pack_seq`` 已拼接序列时设为 True）。
-        temperature: must be 1.0; temperature scaling is not implemented.
+        temperature: Softmax temperature applied before global-vocabulary normalization.
 
     Returns:
         ``[B, S, K]`` log-probs，所有 TP rank 一致，连接 autograd。
     """
     if temperature is None:
         temperature = 1.0
-    assert float(temperature) == 1.0, (
-        f"from_parallel_logits_to_opd_topk_logprobs does not support temperature != 1.0, "
-        f"got {temperature}"
-    )
+    temperature = float(temperature)
+    assert temperature > 0, f"temperature must be positive, got {temperature}"
+    if temperature != 1.0:
+        vocab_parallel_logits = vocab_parallel_logits / temperature
     cp_size = 1 if ignore_cp else mpu.get_context_parallel_world_size()
     cp_rank = 0 if ignore_cp else mpu.get_context_parallel_rank()
     tp_group = mpu.get_tensor_model_parallel_group()

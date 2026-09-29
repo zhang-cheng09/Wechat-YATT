@@ -13,8 +13,8 @@ from gpatch_v4.training_backend.fsdp2_backend.dspark_loss import (
     calculate_dspark_loss,
 )
 from gpatch_v4.training_backend.fsdp2_backend.mtp_loss import calculate_mtp_loss
+from gpatch_v4.training_backend.loss.dpo_loss import compute_dpo_loss_core
 from gpatch_v4.training_backend.loss.registry import register_loss
-from gpatch_v4.training_backend.loss_factory import compute_dpo_loss_core
 from gpatch_v4.utils.training_utils import selective_log_softmax_raw
 
 

@@ -26,7 +26,9 @@ G-Core is a scalable, simple, efficient, and production ready RL training librar
    dump_metrics_v4.md
    metrics.md
    ce_token_compaction.md
+   fsdp2_grpo_linear_ce.md
    dynamic_sampling.md
+   e2h.md
    logging.md
    lora-peft.md
    reproducibility.md
@@ -60,6 +62,7 @@ G-Core is a scalable, simple, efficient, and production ready RL training librar
 
    conf_align_priv.md
    dynamic_batch_data_pipeline_design.md
+   transfer_queue.md
    newbie_priv.md
    throughput.md
    estimate_resource_priv.md

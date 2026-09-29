@@ -4,8 +4,10 @@ import torch
 from tensordict import TensorDict
 
 from gpatch_v4.transfer.tensordict_utils import (
-    dict_to_tensordict,
-    tensordict_to_dict,
+    dict_to_flatten_tensordict,
+    flatten_tensordict_to_dict,
+    list_dict_to_tensordict,
+    tensordict_to_list_dict,
 )
 
 
@@ -19,8 +21,8 @@ def test_dict_of_lists_tensordict_round_trip():
         "optional": [None, None],
     }
 
-    tensor_dict, fallback = dict_to_tensordict(data)
-    restored = tensordict_to_dict(tensor_dict, fallback)
+    tensor_dict, fallback = dict_to_flatten_tensordict(data)
+    restored = flatten_tensordict_to_dict(tensor_dict, fallback)
 
     assert tensor_dict.batch_size == torch.Size([1])
     assert tensor_dict["dense"].shape == (1, 6)
@@ -52,8 +54,8 @@ def test_dict_tensordict_round_trip_preserves_list_value():
         "metadata": ["single", "dict", "value"],
     }
 
-    tensor_dict, fallback = dict_to_tensordict(data)
-    restored = tensordict_to_dict(
+    tensor_dict, fallback = dict_to_flatten_tensordict(data)
+    restored = flatten_tensordict_to_dict(
         tensor_dict,
         fallback,
     )
@@ -63,18 +65,18 @@ def test_dict_tensordict_round_trip_preserves_list_value():
     assert restored["metadata"] == data["metadata"]
 
 
-def test_dict_to_tensordict_keeps_non_array_fallback():
+def test_dict_to_flatten_tensordict_keeps_non_array_fallback():
     data = {
         "tokens": [torch.arange(2), torch.arange(2)],
         "excluded": [torch.arange(3), torch.arange(3)],
         "metadata": ["first", "second"],
     }
 
-    tensor_dict, fallback = dict_to_tensordict(
+    tensor_dict, fallback = dict_to_flatten_tensordict(
         data,
         fields=["tokens"],
     )
-    restored = tensordict_to_dict(tensor_dict, fallback)
+    restored = flatten_tensordict_to_dict(tensor_dict, fallback)
 
     assert list(tensor_dict.keys()) == ["tokens"]
     assert tensor_dict.batch_size == torch.Size([1])
@@ -95,8 +97,8 @@ def test_dict_tensordict_round_trip_empty_values():
         "numpy": [np.arange(3), np.empty((0, 2), dtype=np.int64)],
     }
 
-    tensor_dict, fallback = dict_to_tensordict(data)
-    restored = tensordict_to_dict(tensor_dict, fallback)
+    tensor_dict, fallback = dict_to_flatten_tensordict(data)
+    restored = flatten_tensordict_to_dict(tensor_dict, fallback)
 
     assert tensor_dict.batch_size == torch.Size([1])
     assert tensor_dict["tensor"].shape == (1, 4)
@@ -109,14 +111,14 @@ def test_dict_tensordict_round_trip_empty_values():
         assert actual.shape == expected.shape
 
 
-def test_tensordict_to_dict_accepts_nested_single_blob():
+def test_flatten_tensordict_to_dict_accepts_nested_single_blob():
     data = {
         "vision_data": [
             torch.arange(4).reshape(2, 2),
             torch.arange(3),
         ],
     }
-    tensor_dict, fallback = dict_to_tensordict(data)
+    tensor_dict, fallback = dict_to_flatten_tensordict(data)
     nested_blob = torch.nested.as_nested_tensor(
         [tensor_dict["vision_data"].reshape(-1)],
         layout=torch.jagged,
@@ -126,7 +128,7 @@ def test_tensordict_to_dict_accepts_nested_single_blob():
         batch_size=[1],
     )
 
-    restored = tensordict_to_dict(
+    restored = flatten_tensordict_to_dict(
         mooncake_tensor_dict,
         fallback,
     )
@@ -135,30 +137,60 @@ def test_tensordict_to_dict_accepts_nested_single_blob():
         torch.testing.assert_close(actual, expected)
 
 
-def test_dict_to_tensordict_rejects_inconsistent_lengths():
+def test_dict_to_flatten_tensordict_rejects_inconsistent_lengths():
     data = {
         "tokens": [torch.arange(2), torch.arange(2)],
         "metadata": ["first"],
     }
 
     with pytest.raises(AssertionError, match="has length 1, expected 2"):
-        dict_to_tensordict(data)
+        dict_to_flatten_tensordict(data)
 
 
-def test_dict_to_tensordict_mixed_none_vision():
+def test_dict_to_flatten_tensordict_mixed_none_vision():
     data = {
         "vision_data": [torch.arange(4).reshape(2, 2), None, torch.arange(3)],
         "tokens": [torch.arange(2), torch.arange(2), torch.arange(2)],
     }
-    tensor_dict, fallback = dict_to_tensordict(data)
-    restored = tensordict_to_dict(tensor_dict, fallback)
+    tensor_dict, fallback = dict_to_flatten_tensordict(data)
+    restored = flatten_tensordict_to_dict(tensor_dict, fallback)
     assert restored["vision_data"][1] is None
     torch.testing.assert_close(restored["vision_data"][0], data["vision_data"][0])
     torch.testing.assert_close(restored["vision_data"][2], data["vision_data"][2])
 
 
 def test_empty_dict_of_lists_batch_size():
-    tensor_dict, fallback = dict_to_tensordict({"x": []})
-    restored = tensordict_to_dict(tensor_dict, fallback)
+    tensor_dict, fallback = dict_to_flatten_tensordict({"x": []})
+    restored = flatten_tensordict_to_dict(tensor_dict, fallback)
     assert tensor_dict.batch_size == torch.Size([0])
     assert restored == {"x": []}
+
+
+def test_list_dict_tensordict_round_trip():
+    samples = [
+        {"tokens": torch.arange(3), "sample_id": "a"},
+        {"tokens": torch.arange(5), "sample_id": "b"},
+    ]
+    tensor_dict, fallback = list_dict_to_tensordict(samples)
+    restored = tensordict_to_list_dict(tensor_dict, fallback)
+
+    assert tensor_dict.batch_size == torch.Size([2])
+    assert [sample["sample_id"] for sample in restored] == ["a", "b"]
+    for expected, actual in zip(samples, restored, strict=True):
+        torch.testing.assert_close(actual["tokens"], expected["tokens"])
+
+
+def test_list_dict_tensordict_rejects_non_flatten_codec():
+    samples = [{"tokens": torch.arange(3)}]
+    with pytest.raises(NotImplementedError, match="flatten_per_key=False"):
+        list_dict_to_tensordict(
+            samples,
+            flatten_per_key=False,
+        )
+    tensor_dict, fallback = list_dict_to_tensordict(samples)
+    with pytest.raises(NotImplementedError, match="flatten_per_key=False"):
+        tensordict_to_list_dict(
+            tensor_dict,
+            fallback,
+            flatten_per_key=False,
+        )

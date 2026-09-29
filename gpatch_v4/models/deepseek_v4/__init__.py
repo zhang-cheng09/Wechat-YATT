@@ -26,7 +26,7 @@ except ImportError:
     DeepseekV4Config = None
 
 from .freeze_csa_indexer import freeze_csa_indexer_params
-from .hp import apply_hp
+from .hp import apply_hp, bind_dynamic_cp
 from .modeling_deepseek_v4 import DeepseekV4ForCausalLM
 from .router_replay import (
     RouterReplay,
@@ -43,6 +43,7 @@ __all__ = [
     "DeepseekV4ForCausalLM",
     "RouterReplay",
     "apply_hp",
+    "bind_dynamic_cp",
     "capture_routing_decisions",
     "disable_router_replay",
     "enable_router_replay",

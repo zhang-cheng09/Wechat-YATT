@@ -5,6 +5,7 @@ from typing_extensions import override
 
 from gpatch_v4.extended_model.base import SamplerGenerateFunc
 from gpatch_v4.generation_backend.routed_experts_utils import process_routed_experts
+from gpatch_v4.utils import log
 
 
 class SamplerGenerateFuncAgentic(SamplerGenerateFunc):
@@ -74,6 +75,15 @@ class SamplerGenerateFuncAgentic(SamplerGenerateFunc):
                 min(getattr(tmp_sampling_params, _max_tokens_field), override)
             )
 
+        if is_eval:
+            log(
+                f"[GRPO EVAL SAMPLING] infer_engine_idx={idx} is_eval={is_eval} "
+                f"eval_generate_params={config.sampler.infer_engine_configs[idx].eval_generate_params} "
+                f"eval_sampling_repeat_n={config.training.eval_sampling_repeat_n} "
+                f"sampling_repeat_n={sampling_repeat_n} "
+                f"effective_sampling_params={tmp_sampling_params}"
+            )
+
         llm_input = dict(prompt_token_ids=prompt_token_ids)
         if images is not None:
             llm_input.update({
@@ -128,9 +138,7 @@ class SamplerGenerateFuncAgentic(SamplerGenerateFunc):
             num_layers = int(num_layers)
             moe_router_topk = int(moe_router_topk)
 
-            routed_experts = process_routed_experts(
-                gen_out.outputs[0], num_layers, moe_router_topk
-            )
+            routed_experts = process_routed_experts(gen_out.outputs[0], num_layers, moe_router_topk)
             assert routed_experts is not None, (
                 "moe_router_replay is enabled, but the sampler did not return "
                 "routed_experts; check the vLLM/SGLang version and sampler startup flags"

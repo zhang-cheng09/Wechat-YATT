@@ -115,6 +115,15 @@ class DistConfig(MappingProtocol):
                 "requires smart padding enabled in the dataset."
         },
     )
+    dynamic_cp_reroute_a2a_chunk_gb: Optional[float] = field(
+        default=None,
+        metadata={
+            "help":
+                "If set, dynamic CP reroute stages send/recv buffers on CPU and splits the "
+                "all-to-all into rounds of at most this many GB (send + recv) on GPU. "
+                "None: a single all-to-all with GPU buffers."
+        },
+    )
 
     # megatron args
     tensor_model_parallel_size: int = field(
@@ -190,6 +199,11 @@ class DistConfig(MappingProtocol):
             f"dynamic_cp_scheduler_type must be one of {_valid_dcp_types}, "
             f"got '{self.dynamic_cp_scheduler_type}'"
         )
+        assert self.dynamic_cp_reroute_a2a_chunk_gb is None or \
+            self.dynamic_cp_reroute_a2a_chunk_gb > 0, (
+                f"dynamic_cp_reroute_a2a_chunk_gb must be > 0, "
+                f"got {self.dynamic_cp_reroute_a2a_chunk_gb}"
+            )
 
     def assert_vpp_compatible(
         self,

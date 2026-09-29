@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -11,17 +11,19 @@ from tensordict import TensorDict
 
 __all__ = [
     "TqPayloadType",
+    "list_dict_to_tensordict",
+    "tensordict_to_list_dict",
+    "dict_to_flatten_tensordict",
+    "flatten_tensordict_to_dict",
     "data_to_tensordict",
-    "dict_to_tensordict",
     "tensordict_to_data",
-    "tensordict_to_dict",
 ]
 
 
 class TqPayloadType(str, Enum):
     """Payload shapes supported by the TransferQueue codec."""
 
-    DICT = "dict"
+    ONE_KEY_PER_DICT = "one_key_per_dict"
 
 
 def _numel_of_shape(shape: Tuple[int, ...]) -> int:
@@ -32,13 +34,12 @@ def _numel_of_shape(shape: Tuple[int, ...]) -> int:
 
 
 def _encode_array_value(value: Any, ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
-    # Text-only samples use None for vision fields; keep them in metadata and
-    # skip their contribution to the cat blob (image / text mix).
     if value is None:
         return None, {
             "shape": None,
             "is_numpy": False,
             "is_none": True,
+            "encoded_numel": 0,
         }
 
     if isinstance(value, torch.Tensor):
@@ -87,6 +88,37 @@ def _encode_array_field(values: List[Any], ) -> Tuple[torch.Tensor, List[Dict[st
     return encoded, metadata
 
 
+def _encode_sample_array_field(
+    values: Sequence[Any],
+) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+    flattened = []
+    metadata = []
+    reference = None
+    for value in values:
+        flat, value_metadata = _encode_array_value(value)
+        flattened.append(flat)
+        metadata.append(value_metadata)
+        if flat is not None and reference is None:
+            reference = flat
+
+    assert reference is not None
+    rows = []
+    for flat, value_metadata in zip(flattened, metadata, strict=True):
+        if flat is None:
+            # Mooncake rejects zero-byte values, so None rows need a stored sentinel.
+            rows.append(reference.new_zeros(1))
+            value_metadata["encoded_numel"] = 1
+            continue
+        assert flat.dtype == reference.dtype
+        assert flat.device == reference.device
+        rows.append(flat)
+
+    row_lengths = {row.numel() for row in rows}
+    if len(row_lengths) == 1:
+        return torch.stack(rows), metadata
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged), metadata
+
+
 def _flatten_encoded_field(
     value: torch.Tensor,
     field: str,
@@ -116,7 +148,7 @@ def _decode_array_value(
     offset: int,
 ) -> Tuple[Any, int]:
     if value_metadata.get("is_none", False):
-        return None, offset
+        return None, offset + value_metadata["encoded_numel"]
 
     shape = tuple(value_metadata["shape"])
     numel = _numel_of_shape(shape)
@@ -162,7 +194,7 @@ def _can_encode_array_values(values: List[Any]) -> bool:
     return any(isinstance(value, (torch.Tensor, np.ndarray)) for value in values)
 
 
-def dict_to_tensordict(
+def dict_to_flatten_tensordict(
     data: Dict[str, Any],
     fields: Optional[List[str]] = None,
 ) -> Tuple[TensorDict, Dict[str, Any]]:
@@ -232,7 +264,7 @@ def dict_to_tensordict(
     return TensorDict(encoded, batch_size=[tensor_batch_size]), fallback
 
 
-def tensordict_to_dict(
+def flatten_tensordict_to_dict(
     tensor_dict: TensorDict,
     fallback: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -249,10 +281,11 @@ def tensordict_to_dict(
         "tensor_dict must have exactly one batch dimension, "
         f"got batch_size={tensor_dict.batch_size}"
     )
-    assert int(tensor_dict.batch_size[0]) in (0, 1), (
-        "tensor_dict batch size must be 0 or 1, "
-        f"got batch_size={tensor_dict.batch_size}"
-    )
+    assert int(
+        tensor_dict.batch_size[0]
+    ) in (0, 1
+         ), ("tensor_dict batch size must be 0 or 1, "
+             f"got batch_size={tensor_dict.batch_size}")
 
     data: Dict[str, Any] = {} if fallback is None else dict(fallback)
     if not data:
@@ -265,9 +298,7 @@ def tensordict_to_dict(
 
     # When fallback is dict-of-lists style, non-encoded fields are lists of equal
     # length; encoded fields store list metadata of that same length.
-    list_lengths = [
-        len(values) for values in data.values() if isinstance(values, list)
-    ]
+    list_lengths = [len(values) for values in data.values() if isinstance(values, list)]
     sample_count = list_lengths[0] if list_lengths else None
     if sample_count is not None:
         for field, values in data.items():
@@ -309,23 +340,136 @@ def tensordict_to_dict(
     return data
 
 
+def list_dict_to_tensordict(
+    samples: List[Dict[str, Any]],
+    fields: Optional[Sequence[str]] = None,
+    *,
+    flatten_per_key: bool = True,
+) -> Tuple[TensorDict, List[Dict[str, Any]]]:
+    """Encode aligned samples as independently addressable TensorDict rows.
+
+    Parameters
+    ----------
+    samples : list[dict[str, Any]]
+        Tensor values may have arbitrary shapes because each is flattened before
+        constructing a dense or jagged batch field.
+    fields : Sequence[str], optional
+        Restricts encoded fields; every selected field must exist on every row.
+    flatten_per_key : bool
+        Must be ``True``; each logical row is flattened before TQ storage.
+
+    Returns
+    -------
+    TensorDict
+        Batch dimension equals ``len(samples)`` and therefore aligns with TQ keys.
+    list[dict[str, Any]]
+        Per-row shape/NumPy metadata plus fields that remain in the control plane.
+    """
+    if not flatten_per_key:
+        raise NotImplementedError("flatten_per_key=False is not implemented")
+    assert samples
+    fallback = [dict(sample) for sample in samples]
+    common_fields = set(samples[0])
+    for sample in samples[1:]:
+        common_fields.intersection_update(sample)
+    selected_fields = common_fields if fields is None else set(fields)
+    assert selected_fields.issubset(common_fields), (
+        f"selected fields are not present in every sample: "
+        f"{sorted(selected_fields - common_fields)}"
+    )
+
+    encoded: Dict[str, torch.Tensor] = {}
+    for field in sorted(selected_fields):
+        values = [sample[field] for sample in samples]
+        if not _can_encode_array_values(values):
+            continue
+        encoded[field], field_metadata = _encode_sample_array_field(values)
+        for sample_fallback, value_metadata in zip(
+            fallback,
+            field_metadata,
+            strict=True,
+        ):
+            sample_fallback[field] = value_metadata
+
+    return TensorDict(encoded, batch_size=[len(samples)]), fallback
+
+
+def tensordict_to_list_dict(
+    tensor_dict: TensorDict,
+    fallback: Sequence[Dict[str, Any]],
+    *,
+    flatten_per_key: bool = True,
+) -> List[Dict[str, Any]]:
+    """Decode dense or jagged TensorDict rows using aligned shape metadata.
+
+    Parameters
+    ----------
+    tensor_dict : TensorDict
+        Exactly one batch dimension aligned with ``fallback``.
+    fallback : Sequence[dict[str, Any]]
+        Contains the original shape and NumPy ownership contract for each field.
+    flatten_per_key : bool
+        Must be ``True`` to decode the per-row flattened representation.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        NumPy fields require CPU-backed TQ rows; tensor fields retain TQ device.
+    """
+    if not flatten_per_key:
+        raise NotImplementedError("flatten_per_key=False is not implemented")
+    assert tensor_dict.batch_dims == 1
+    assert int(tensor_dict.batch_size[0]) == len(fallback)
+    samples = [dict(sample) for sample in fallback]
+
+    for field, value in tensor_dict.items():
+        rows = list(value.unbind())
+        assert len(rows) == len(samples)
+        for sample, row in zip(samples, rows, strict=True):
+            field_metadata = sample.pop(field, None)
+            assert isinstance(
+                field_metadata, dict
+            ), (f"fallback metadata for {field!r} must be a dict, "
+                f"got {type(field_metadata)}")
+            restored, offset = _decode_array_value(
+                row.reshape(-1),
+                field_metadata,
+                field,
+                0,
+            )
+            assert offset == row.numel(), (
+                f"TensorDict field {field!r} row length {row.numel()} "
+                f"does not match metadata numels {offset}"
+            )
+            sample[field] = restored
+    return samples
+
+
 def data_to_tensordict(
-    data: Dict[str, Any],
+    data: Any,
     payload_type: TqPayloadType,
     fields: Optional[List[str]] = None,
-) -> Tuple[TensorDict, Dict[str, Any]]:
-    """Encode a supported payload into a TensorDict and inline fallback."""
-    if payload_type is TqPayloadType.DICT:
-        return dict_to_tensordict(data, fields)
+) -> Tuple[TensorDict, Any]:
+    """Encode a supported payload into a TensorDict and a fallback.
+
+    For ``ONE_KEY_PER_DICT``, *data* is a plain dict (or dict-of-lists) and
+    the fallback is a ``Dict[str, Any]`` with metadata / unselected fields.
+    """
+    if payload_type is TqPayloadType.ONE_KEY_PER_DICT:
+        return dict_to_flatten_tensordict(data, fields)
     raise ValueError(f"Unsupported TQ payload type: {payload_type!r}")
 
 
 def tensordict_to_data(
     tensor_dict: TensorDict,
-    fallback: Optional[Dict[str, Any]],
+    fallback: Any,
     payload_type: TqPayloadType,
-) -> Dict[str, Any]:
-    """Decode a TensorDict using its recorded payload shape."""
-    if payload_type is TqPayloadType.DICT:
-        return tensordict_to_dict(tensor_dict, fallback)
+) -> Any:
+    """Decode a TensorDict using its recorded payload shape.
+
+    For ``ONE_KEY_PER_DICT``, *fallback* is ``Dict[str, Any]``; returns
+    a single ``Dict[str, Any]``.
+    """
+    if payload_type is TqPayloadType.ONE_KEY_PER_DICT:
+        return flatten_tensordict_to_dict(tensor_dict, fallback)
     raise ValueError(f"Unsupported TQ payload type: {payload_type!r}")

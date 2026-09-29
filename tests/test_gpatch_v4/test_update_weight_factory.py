@@ -8,6 +8,7 @@ from gpatch_v4.client.mixin import UpdateWeightMixin
 from gpatch_v4.client.update_weight_factory import (
     DeepSeekV4SglangUpdateWeightFactory,
     DeepSeekV4VllmUpdateWeightFactory,
+    Qwen4ExpSglangUpdateWeightFactory,
     SglangUpdateWeightFactory,
     UpdateWeightContext,
     VllmUpdateWeightFactory,
@@ -74,6 +75,75 @@ class UpdateWeightFactoryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(factory, DeepSeekV4SglangUpdateWeightFactory)
         self.assertIsInstance(factory, SglangUpdateWeightFactory)
+
+    def test_selects_qwen4_exp_sglang_subclass(self):
+        factory = get_update_weight_factory(
+            context=self.context,
+            model_arch=MODEL_ARCH.QWEN4_EXP,
+        )
+
+        self.assertIsInstance(factory, Qwen4ExpSglangUpdateWeightFactory)
+        self.assertIsInstance(factory, SglangUpdateWeightFactory)
+
+    def test_qwen4_exp_packed_experts_use_custom_loader(self):
+        from gpatch_v4.generation_backend.sglang_model_specific.sglang_weight_update_qwen4_exp import (  # noqa: E501
+            QWEN4_EXP_PACKED_WEIGHT_LOADER,
+        )
+
+        factory = get_update_weight_factory(
+            context=self.context,
+            model_arch=MODEL_ARCH.QWEN4_EXP,
+        )
+        with patch.object(
+            factory,
+            "named_tensors_and_get_ipc_handle",
+            return_value="packed-payload",
+        ) as serialize:
+            payload, load_format = factory.serialize_ipc_bucket(
+                [("model.layers.0.mlp.experts.gate_up_proj", object())]
+            )
+
+        self.assertEqual(payload, "packed-payload")
+        self.assertEqual(load_format, QWEN4_EXP_PACKED_WEIGHT_LOADER)
+        serialize.assert_called_once()
+
+    def test_qwen4_exp_non_expert_weights_keep_flattened_format(self):
+        factory = get_update_weight_factory(
+            context=self.context,
+            model_arch=MODEL_ARCH.QWEN4_EXP,
+        )
+        with patch.object(
+            factory,
+            "flattened_and_get_ipc_handle",
+            return_value="flat-payload",
+        ) as serialize:
+            payload, load_format = factory.serialize_ipc_bucket(
+                [("model.layers.0.self_attn.q_proj.weight", object())]
+            )
+
+        self.assertEqual(payload, "flat-payload")
+        self.assertEqual(load_format, "flattened_bucket")
+        serialize.assert_called_once()
+
+    def test_qwen4_exp_ple_shard_uses_custom_loader(self):
+        from gpatch_v4.generation_backend.sglang_model_specific.sglang_weight_update_qwen4_exp import (  # noqa: E501
+            QWEN4_EXP_PACKED_WEIGHT_LOADER,
+        )
+
+        factory = get_update_weight_factory(
+            context=self.context,
+            model_arch=MODEL_ARCH.QWEN4_EXP,
+        )
+        with patch.object(
+            factory, "named_tensors_and_get_ipc_handle", return_value="ple-payload"
+        ) as serialize:
+            payload, load_format = factory.serialize_ipc_bucket(
+                [("model.ple.ngram_embedding.shard_0.weight", object())]
+            )
+
+        self.assertEqual(payload, "ple-payload")
+        self.assertEqual(load_format, QWEN4_EXP_PACKED_WEIGHT_LOADER)
+        serialize.assert_called_once()
 
     def test_selects_standard_and_dsv4_vllm_factories(self):
         context = _make_sglang_context(

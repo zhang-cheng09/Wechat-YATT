@@ -86,6 +86,7 @@ class _FakeAttrHook:
 
 def _make_controller(ratio=1.5, rb_multiplier=1, reuse=True, num_agents=2):
     ctrl = object.__new__(RolloutController)
+    ctrl.config = SimpleNamespace()
     ctrl.apply_sampling_rollout_attr = _FakeAttrHook()
     ctrl.training_config = SimpleNamespace(
         rollout_over_dispatch_ratio=ratio,
@@ -422,14 +423,35 @@ class _StubTwoTurnActor(TwoTurnReflectAgentLoopActor):
         self.worker_id = 0
         self.reflect_top_k = 1
         self.turn2_started = False
+        self.external_reward = object()
+        self.eval_flags = []
 
-    async def generate_batches(self, cleaned_batches, ppo_step, sample_indices, use_colocate):
+    async def generate_batches(
+        self,
+        cleaned_batches,
+        ppo_step,
+        sample_indices,
+        use_colocate,
+        is_eval=False,
+    ):
+        self.eval_flags.append(is_eval)
         if self.turn1_done:
             self.turn2_started = True
         return [{"rewards": [0.0], "tokens": [[]], "unique_id": ["uid"]} for _ in cleaned_batches]
 
-    async def score_rollout_batches(self, rbs, ppo_step, sample_indices, use_colocate):
+    async def score_rollout_batches(
+        self,
+        rbs,
+        ppo_step,
+        sample_indices,
+        use_colocate,
+        is_eval=False,
+    ):
+        self.eval_flags.append(is_eval)
         self.turn1_done = True
+        return rbs
+
+    async def score_gen_rm_batches(self, rbs, ppo_step, sample_indices, use_colocate):
         return rbs
 
     def _select_topk_bottomk(self, rewards, k):
@@ -452,3 +474,15 @@ def test_pause_between_turns_raises_instead_of_returning_short_list():
     else:
         raise AssertionError("expected GenerationAborted")
     assert actor.turn2_started is False
+
+
+def test_two_turn_eval_defers_only_final_turn_reward():
+    actor = _StubTwoTurnActor()
+    result = asyncio.run(
+        actor._batch_loop([{
+            "prompt": [1]
+        }], 3, [0], False, is_eval=True)
+    )
+
+    assert result.deferred_external_reward_indices == [1, 2]
+    assert actor.eval_flags == [True, True, True]

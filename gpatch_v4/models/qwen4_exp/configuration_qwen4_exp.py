@@ -176,6 +176,9 @@ class Qwen4ExpTextConfig(PreTrainedConfig):
     indexer_compress_ratio: int | None = None
     norm_topk_prob: bool = True
     output_gate_type: str | None = None
+    mtp: dict | None = None
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
 
     def __post_init__(self, **kwargs):
         self.ple_layer_ids = [] if self.ple_layer_ids is None else sorted(set(self.ple_layer_ids))

@@ -8,6 +8,7 @@ import torch
 
 from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.utils import import_fn_from_path, log
+from gpatch_v4.utils.e2h_sampler import E2HTaskSampler
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 
 
@@ -57,6 +58,22 @@ class DataSourceBase(ABC):
         step : int
         """
 
+    def reset_eval(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support single-controller evaluation"
+        )
+
+    def get_eval_batch(self, num_microbatches: int) -> List[Dict[str, Any]]:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support single-controller evaluation"
+        )
+
+    @property
+    def eval_dataloader_length(self) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support single-controller evaluation"
+        )
+
 
 class RolloutDataSource(DataSourceBase):
     """Read-only data source for rollout prompts (no buffer).
@@ -75,6 +92,7 @@ class RolloutDataSource(DataSourceBase):
         self.tokenizer = tokenizer
         self._current_epoch = -1
         self._train_iter = None
+        self._eval_iter = None
 
         self._build_dataset_and_dataloader()
 
@@ -106,6 +124,9 @@ class RolloutDataSource(DataSourceBase):
         self.train_dataset = fn_ret.get('train_dataset')
         self.train_dataloader = fn_ret.get('train_dataloader')
         self.train_sampler = fn_ret.get('train_sampler', None)
+        self.eval_dataset = fn_ret.get('eval_dataset')
+        self.eval_dataloader = fn_ret.get('eval_dataloader')
+        self.eval_sampler = fn_ret.get('eval_sampler', None)
 
         log(
             f"[RolloutDataSource] dataset len={len(self.train_dataset)}, "
@@ -122,6 +143,8 @@ class RolloutDataSource(DataSourceBase):
         if self._current_epoch != epoch:
             if self.train_sampler is not None:
                 self.train_sampler.set_epoch(epoch)
+                if (isinstance(self.train_sampler, E2HTaskSampler) and self._current_epoch != -1):
+                    self.train_sampler.start_index = 0
             self._train_iter = iter(self.train_dataloader)
             self._current_epoch = epoch
 
@@ -156,10 +179,24 @@ class RolloutDataSource(DataSourceBase):
         """No-op: base data source has no extra state to restore."""
         pass
 
+    def reset_eval(self) -> None:
+        assert self.eval_dataset is not None, "evaluation requires eval_dataset"
+        assert self.eval_dataloader is not None, "evaluation requires eval_dataloader"
+        self._eval_iter = iter(self.eval_dataloader)
+
+    def get_eval_batch(self, num_microbatches: int) -> List[Dict[str, Any]]:
+        assert self._eval_iter is not None, "Call reset_eval() before get_eval_batch()"
+        return [next(self._eval_iter) for _ in range(num_microbatches)]
+
     @property
     def dataloader_length(self) -> int:
         """Length of the underlying dataloader."""
         return len(self.train_dataloader)
+
+    @property
+    def eval_dataloader_length(self) -> int:
+        assert self.eval_dataloader is not None, "evaluation requires eval_dataloader"
+        return len(self.eval_dataloader)
 
 
 class BufferedDataSource(RolloutDataSource):
@@ -254,10 +291,7 @@ def resolve_rollout_data_source_cls(config: RlConfig) -> Type[DataSourceBase]:
             )
 
         data_source_cls = import_fn_from_path(py_path, cls_name)
-        if not (
-            isinstance(data_source_cls, type)
-            and issubclass(data_source_cls, DataSourceBase)
-        ):
+        if not (isinstance(data_source_cls, type) and issubclass(data_source_cls, DataSourceBase)):
             raise TypeError(
                 f"custom rollout data source '{py_path}:{cls_name}' must be a "
                 f"subclass of DataSourceBase, got {data_source_cls}"
@@ -265,10 +299,7 @@ def resolve_rollout_data_source_cls(config: RlConfig) -> Type[DataSourceBase]:
         return data_source_cls
 
     training_config = getattr(config, "training", None)
-    if (
-        training_config is not None
-        and training_config.rollout_over_dispatch_ratio > 1.0
-    ):
+    if (training_config is not None and training_config.rollout_over_dispatch_ratio > 1.0):
         return TailBatchingDataSource
 
     return RolloutDataSource
@@ -338,7 +369,9 @@ class TailBatchingDataSource(RolloutDataSource):
                 self._current_epoch += 1
                 if self.train_sampler is not None:
                     self.train_sampler.set_epoch(self._current_epoch)
-                    if isinstance(self.train_sampler, ResumableDistributedSampler):
+                    if isinstance(
+                        self.train_sampler, (ResumableDistributedSampler, E2HTaskSampler)
+                    ):
                         self.train_sampler.start_index = 0
                 self._train_iter = iter(self.train_dataloader)
                 assert len(self.train_dataloader) > 0, "train dataloader is empty"

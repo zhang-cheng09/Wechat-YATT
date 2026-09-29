@@ -1,4 +1,4 @@
-"""Tests for SAPO on the ``ppo.use_legacy_loss=False`` loss path.
+"""Tests for SAPO on the ``training.use_legacy_loss=False`` loss path.
 
 New loss is ``[B, S]`` only: THD / dyn-CP packs must be response-padded before
 entering ``sapo_loss``. Packed-THD semantics remain covered by the legacy

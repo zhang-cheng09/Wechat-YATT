@@ -31,9 +31,10 @@ training:
   exit_step: 1000                   # full-43L smoke: 1 step + 1 save, kill after
   recompute: True
   enable_mtp: True               # enable DeepSeek-V4 MTP training path
+  online_mtp_sft: True
   mtp_loss_scaling_factor: 0.1
   # For FSDP2 DeepSeek-V4 TopKRouter
-  freeze_router_weight: False
+  freeze_moe_router: False
   freeze_router_correction_bias: True
   router_correction_bias_update_speed: 1e-3
   router_correction_bias_use_abs_update: True

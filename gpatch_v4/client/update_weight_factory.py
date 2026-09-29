@@ -15,6 +15,7 @@ from typing import Any
 import ray
 import torch
 import torch.distributed as dist
+from typing_extensions import override
 
 from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.core.parallel_state import cpu_barrier
@@ -312,18 +313,19 @@ class SglangUpdateWeightFactory(UpdateWeightFactory):
                             named_tensors = converted_named_tensors_by_dtypes[dtype]
                             bucket_bytes = converted_buffer_size_by_dtypes[dtype]
                             if participates_in_ipc:
-                                serialized_named_tensors = self.flattened_and_get_ipc_handle(
-                                    named_tensors
+                                serialized_named_tensors, load_format = (
+                                    self.serialize_ipc_bucket(named_tensors)
                                 )
                             else:
                                 serialized_named_tensors = None
+                                load_format = "flattened_bucket"
 
                             count_packed_bucket_num += 1
                             if participates_in_ipc and dist.get_rank(
                             ) == self.context.ipc_gather_dst_rank:
                                 update_data = {
                                     "serialized_named_tensors": serialized_named_tensors,
-                                    "load_format": "flattened_bucket",
+                                    "load_format": load_format,
                                 }
                                 resp = await self.update_co(sampler_idx, update_data)
                                 log(f"update_weights response: {resp}", rank=0)
@@ -340,22 +342,21 @@ class SglangUpdateWeightFactory(UpdateWeightFactory):
                                 if weight_tensor is not None:
                                     del weight_tensor
                                 del param
-                                clear_memory()
-                                torch.cuda.ipc_collect()
+                                self._cleanup_large_ipc_bucket()
 
                     last_update_weight_co = []
                     for dtype, named_tensors in converted_named_tensors_by_dtypes.items():
                         if len(named_tensors) > 0:
                             torch.cuda.synchronize()
-                            serialized_named_tensors = self.flattened_and_get_ipc_handle(
-                                named_tensors
+                            serialized_named_tensors, load_format = (
+                                self.serialize_ipc_bucket(named_tensors)
                             )
 
                             count_packed_bucket_num += 1
                             if dist.get_rank() == self.context.ipc_gather_dst_rank:
                                 update_data = {
                                     "serialized_named_tensors": serialized_named_tensors,
-                                    "load_format": "flattened_bucket",
+                                    "load_format": load_format,
                                 }
                                 last_update_weight_co.append(
                                     self.update_co(sampler_idx, update_data)
@@ -461,6 +462,14 @@ class SglangUpdateWeightFactory(UpdateWeightFactory):
             data,
             output_str=True,
         )
+        return self._gather_ipc_payload(serialized)
+
+    def named_tensors_and_get_ipc_handle(self, named_tensors):
+        assert SglSerializer is not None, "sglang IPC is unavailable"
+        serialized = SglSerializer.serialize(named_tensors, output_str=True)
+        return self._gather_ipc_payload(serialized)
+
+    def _gather_ipc_payload(self, serialized):
         gathered = (
             [None] * dist.get_world_size(self.context.ipc_gather_group)
             if self.context.ipc_gather_dst_rank == dist.get_rank() else None
@@ -472,6 +481,13 @@ class SglangUpdateWeightFactory(UpdateWeightFactory):
             group=self.context.ipc_gather_group
         )
         return gathered
+
+    def serialize_ipc_bucket(self, named_tensors):
+        return self.flattened_and_get_ipc_handle(named_tensors), "flattened_bucket"
+
+    def _cleanup_large_ipc_bucket(self) -> None:
+        clear_memory()
+        torch.cuda.ipc_collect()
 
     def submit_cache_flush(self, sampler_idx, bucket_bytes):
         log(
@@ -515,6 +531,36 @@ class SglangUpdateWeightFactory(UpdateWeightFactory):
         for h in handles:
             h.wait()
         self._ensure_sglang_weight_update_ok(ray.get(obj_refs), context="distributed_broadcast")
+
+
+class Qwen4ExpSglangUpdateWeightFactory(SglangUpdateWeightFactory):
+    """Qwen4-Exp transport for bulk expert and pinned PLE loading."""
+    @override
+    def serialize_ipc_bucket(self, named_tensors: list[tuple[str,
+                                                             torch.Tensor]]) -> tuple[Any, str]:
+        packed_expert_names = (
+            ".mlp.experts.gate_up_proj",
+            ".mlp.experts.down_proj",
+        )
+        if any(
+            packed_name in name for name, _ in named_tensors for packed_name in packed_expert_names
+        ) or any(".ngram_embedding.shard_" in name for name, _ in named_tensors):
+            from gpatch_v4.generation_backend.sglang_model_specific import (
+                sglang_weight_update_qwen4_exp,
+            )
+
+            return (
+                self.named_tensors_and_get_ipc_handle(named_tensors),
+                sglang_weight_update_qwen4_exp.QWEN4_EXP_PACKED_WEIGHT_LOADER,
+            )
+        return super().serialize_ipc_bucket(named_tensors)
+
+    @override
+    def _cleanup_large_ipc_bucket(self) -> None:
+        # The final clear_memory() collects Python cycles once after all IPC buckets.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 class DeepSeekV4SglangUpdateWeightFactory(SglangUpdateWeightFactory):
@@ -943,6 +989,8 @@ def get_update_weight_factory(
     if context.infer_backend == "sglang":
         if model_arch == MODEL_ARCH.DEEPSEEK_V4:
             return DeepSeekV4SglangUpdateWeightFactory(context)
+        if model_arch == MODEL_ARCH.QWEN4_EXP:
+            return Qwen4ExpSglangUpdateWeightFactory(context)
         return SglangUpdateWeightFactory(context)
     if context.infer_backend == "vllm":
         if model_arch == MODEL_ARCH.DEEPSEEK_V4:

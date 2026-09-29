@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import traceback
 from contextlib import nullcontext
 from typing import Any, Dict, List
@@ -9,9 +10,12 @@ from transformers import AutoTokenizer
 from gpatch_v4.client import GenRmClient, SamplerClient
 from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.rollout_generator.async_rollout.agent_loop_actor import (
+    AgentLoopEvalResult,
     BaseAgentLoopActor,
 )
+from gpatch_v4.transfer.tq_connector import KVBatchMeta
 from gpatch_v4.utils import GenerationAborted, import_fn_from_path, log
+from gpatch_v4.utils.data_manipulate_utils import ensure_sample_hierarchical_id
 
 _DEFAULT_REFLECT_PROMPT = "请重新审视你的回答，仔细检查一下你的推理过程和最终答案。"
 
@@ -135,10 +139,14 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
         ppo_step: int,
         sample_indices: List[int],
         use_colocate: bool,
+        is_eval: bool = False,
     ) -> List[Dict[str, List[Any]]]:
         """Generate rollouts by firing all requests, then awaiting all results."""
         sampler_idx = 0
-        repeat_n = self.training_config.sampling_repeat_n
+        repeat_n = (
+            self.training_config.eval_sampling_repeat_n
+            if is_eval else self.training_config.sampling_repeat_n
+        )
         if not cleaned_batches:
             return []
         ctx = self.sampler_phase(ppo_step) if use_colocate else nullcontext()
@@ -152,6 +160,7 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
                         cd,
                         repeat_n,
                         load_aware=self.training_config.load_aware_sampler_routing,
+                        is_eval=is_eval,
                     ) for cd, sidx in zip(cleaned_batches, sample_indices)
                 ]
             )
@@ -206,12 +215,16 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
         self,
         rbs: List[Dict[str, List[Any]]],
         ppo_step: int,
+        is_eval: bool = False,
     ) -> List[Dict[str, List[Any]]]:
         """Apply CPU external rewards for all rollout batches."""
         if self.external_reward is None:
             return rbs
         all_updates = await asyncio.gather(
-            *[self.external_reward.calc_external_reward([rb], ppo_step) for rb in rbs]
+            *[
+                self.external_reward.calc_external_reward([rb], ppo_step, is_eval=is_eval)
+                for rb in rbs
+            ]
         )
         for rb, updates in zip(rbs, all_updates):
             assert len(updates) == 1, (
@@ -226,6 +239,7 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
         ppo_step: int,
         sample_indices: List[int],
         use_colocate: bool,
+        is_eval: bool = False,
     ) -> List[Dict[str, List[Any]]]:
         """Shared reward pipeline: gen_rm + external reward."""
         rbs = await self.score_gen_rm_batches(
@@ -234,7 +248,7 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
             sample_indices,
             use_colocate=use_colocate,
         )
-        return await self.score_external_reward_batches(rbs, ppo_step)
+        return await self.score_external_reward_batches(rbs, ppo_step, is_eval=is_eval)
 
     # -------------------------------------------------------------- #
     #  Main entry point
@@ -247,7 +261,8 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
         microbatch_idx: int | List[int],
         sample_idx: int | List[int],
         use_colocate: bool = False,
-    ) -> List[Dict[str, List[Any]]]:
+        is_eval: bool = False,
+    ) -> List[Dict[str, List[Any]] | KVBatchMeta] | AgentLoopEvalResult:
         """Two-turn entry for both disaggregated and colocate modes.
 
         Disaggregated callers pass one microbatch. Colocate callers pass
@@ -267,6 +282,7 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
                 ppo_step,
                 sample_indices,
                 use_colocate=use_colocate,
+                is_eval=is_eval,
             )
         except Exception as e:
             traceback.print_exc()
@@ -278,7 +294,8 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
         ppo_step: int,
         sample_indices: List[int],
         use_colocate: bool,
-    ) -> List[Dict[str, List[Any]]]:
+        is_eval: bool = False,
+    ) -> List[Dict[str, List[Any]] | KVBatchMeta] | AgentLoopEvalResult:
         """Two-turn pipeline unified for both disaggregated and colocate.
 
         Turn 1: [sampler] → [gen_rm] → [external_reward] → CPU select
@@ -286,6 +303,19 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
         Merge:  return turn1 + turn2 rbs interleaved per microbatch.
         """
         k = self.reflect_top_k
+        eval_kwargs = {}
+        if is_eval:
+            for method_name in ("generate_batches", "score_rollout_batches"):
+                params = inspect.signature(getattr(self, method_name)).parameters
+                if (
+                    "is_eval" not in params and
+                    not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+                ):
+                    raise TypeError(
+                        f"{type(self).__name__}.{method_name} must accept is_eval "
+                        "for single-controller evaluation"
+                    )
+            eval_kwargs["is_eval"] = True
 
         # ---- Turn 1: generate ----
         rbs_t1 = await self.generate_batches(
@@ -293,6 +323,7 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
             ppo_step,
             sample_indices,
             use_colocate,
+            **eval_kwargs,
         )
         if self.worker_id == 0:
             log(
@@ -307,6 +338,7 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
             ppo_step,
             sample_indices,
             use_colocate,
+            **eval_kwargs,
         )
 
         # Turn 2 issues brand-new sampler requests, which a hard abort can no
@@ -346,18 +378,27 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
             ppo_step,
             all_reflect_indices,
             use_colocate,
+            **eval_kwargs,
         )
         if self.worker_id == 0:
             log(f"[TwoTurnReflect-{self.worker_id}] turn2 sampler done: "
                 f"{len(rbs_t2)} rbs")
 
         # ---- Turn 2: score ----
-        rbs_t2 = await self.score_rollout_batches(
-            rbs_t2,
-            ppo_step,
-            all_reflect_indices,
-            use_colocate,
-        )
+        if is_eval:
+            rbs_t2 = await self.score_gen_rm_batches(
+                rbs_t2,
+                ppo_step,
+                all_reflect_indices,
+                use_colocate,
+            )
+        else:
+            rbs_t2 = await self.score_rollout_batches(
+                rbs_t2,
+                ppo_step,
+                all_reflect_indices,
+                use_colocate,
+            )
 
         # ---- Tag parent unique_id on turn2 rbs ----
         t2_offset = 0
@@ -370,10 +411,12 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
 
         # ---- Merge: interleave turn1 rb + its turn2 rbs ----
         all_rbs: List[Dict[str, List[Any]]] = []
+        deferred_external_reward_indices = []
         t2_offset = 0
         for rbi, (rb_t1, selected) in enumerate(zip(rbs_t1, selected_per_mb)):
             all_rbs.append(rb_t1)
             for _ in selected:
+                deferred_external_reward_indices.append(len(all_rbs))
                 all_rbs.append(rbs_t2[t2_offset])
                 t2_offset += 1
 
@@ -383,7 +426,13 @@ class TwoTurnReflectAgentLoopActor(BaseAgentLoopActor):
                 f"[TwoTurnReflect-{self.worker_id}] done: "
                 f"{len(all_rbs)} batches, total_samples={total}"
             )
-        return all_rbs
+        for rb in all_rbs:
+            ensure_sample_hierarchical_id(rb)
+        if is_eval:
+            if self.external_reward is None:
+                deferred_external_reward_indices = []
+            return AgentLoopEvalResult(all_rbs, deferred_external_reward_indices)
+        return await self._maybe_put_rollout_batches_to_tq(all_rbs, ppo_step)
 
     # -------------------------------------------------------------- #
     #  Helpers

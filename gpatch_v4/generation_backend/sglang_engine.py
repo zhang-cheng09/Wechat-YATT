@@ -4,6 +4,7 @@
 import asyncio
 import copy
 import io
+import os
 
 import numpy as np
 
@@ -16,6 +17,7 @@ import types
 from typing import Dict, List, Optional
 
 import sglang as sgl
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -54,7 +56,10 @@ def cuda_graph_max_bs_args(value):
     into ``cuda_graph_max_bs_decode`` and ``cuda_graph_max_bs_prefill``.
     """
     import dataclasses
-    fields = {f.name for f in dataclasses.fields(sgl.ServerArgs)}
+    if dataclasses.is_dataclass(sgl.ServerArgs):
+        fields = {f.name for f in dataclasses.fields(sgl.ServerArgs)}
+    else:
+        fields = set(sgl.ServerArgs.__annotations__)
     if "cuda_graph_max_bs_decode" in fields:
         return {"cuda_graph_max_bs_decode": value, "cuda_graph_max_bs_prefill": value}
     return {"cuda_graph_max_bs": value}
@@ -63,7 +68,10 @@ def cuda_graph_max_bs_args(value):
 def filter_server_args_kwargs(kwargs: Dict) -> Dict:
     """Drop keys that the installed ``sgl.ServerArgs`` does not accept."""
     import dataclasses
-    fields = {f.name for f in dataclasses.fields(sgl.ServerArgs)}
+    if dataclasses.is_dataclass(sgl.ServerArgs):
+        fields = {f.name for f in dataclasses.fields(sgl.ServerArgs)}
+    else:
+        fields = set(sgl.ServerArgs.__annotations__)
     return {k: v for k, v in kwargs.items() if k in fields}
 
 
@@ -112,10 +120,23 @@ class SglangEngine(InferEngine):
 
     def __init__(self, infer_engine, model_path, infer_engine_role, placement_type):
         super().__init__(infer_engine, model_path, infer_engine_role, placement_type)
+        self.cuda_graph_offload_enabled = os.environ.get("SGLANG_MEMORY_SAVER_CUDA_GRAPH",
+                                                         "").lower() in ("1", "true")
+        if self.cuda_graph_offload_enabled:
+            self.wake_up_tag[GPU_MEMORY_TYPE_CUDA_GRAPH] = True
+            self.all_supported_tags.append(GPU_MEMORY_TYPE_CUDA_GRAPH)
         self.sglang_version = sgl.__version__
         # tokenizer_manager.get_loads() is not safe to call concurrently; all
         # callers must go through this lock.
         self.get_load_lock = asyncio.Lock()
+
+    def _with_cuda_graph(self, tags: List[str]) -> List[str]:
+        if (
+            self.cuda_graph_offload_enabled and GPU_MEMORY_TYPE_KV_CACHE in tags and
+            GPU_MEMORY_TYPE_CUDA_GRAPH not in tags
+        ):
+            return [*tags, GPU_MEMORY_TYPE_CUDA_GRAPH]
+        return tags
 
     @override
     def shutdown(self) -> None:
@@ -298,6 +319,11 @@ class SglangEngine(InferEngine):
     @override
     async def flush_cache(self):
         """Flush the KV cache of the sglang engine."""
+        # Sleeping KV cache is already cleared; flushing again would touch unmapped GPU memory.
+        if not self.wake_up_tag[GPU_MEMORY_TYPE_KV_CACHE]:
+            log("Skip flush_cache: KV cache was cleared before sleep", rank=0)
+            return
+
         await self.infer_engine.tokenizer_manager.flush_cache()
 
     @override
@@ -355,7 +381,7 @@ class SglangEngine(InferEngine):
     async def wake_up(self, *args, **kwargs):
         """Resume memory occupation for specified tag groups."""
         assert self.placement_type != "disaggregated"
-        want_to_wake_up_tags: List[str] = kwargs.get("tags", self.all_supported_tags)
+        want_to_wake_up_tags = self._with_cuda_graph(kwargs.get("tags", self.all_supported_tags))
 
         # check if the tags are already awake
         should_wake_up_tags: List[str] = [
@@ -390,39 +416,50 @@ class SglangEngine(InferEngine):
     async def sleep(self, *args, **kwargs):
         """Release memory occupation for specified tag groups."""
         assert self.placement_type != "disaggregated"
-        want_to_sleep_tags = kwargs.get("tags", self.all_supported_tags)
+        want_to_sleep_tags = self._with_cuda_graph(kwargs.get("tags", self.all_supported_tags))
 
         # check if the tags are already asleep
         should_sleep_tags: List[str] = [tag for tag in want_to_sleep_tags if self.wake_up_tag[tag]]
         if len(should_sleep_tags) == 0:
             return
 
+        log(
+            f"SglangEngine sleep tags={should_sleep_tags}, "
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH="
+            f"{os.environ.get('SGLANG_MEMORY_SAVER_CUDA_GRAPH')}",
+            rank=0,
+        )
         kwargs["tags"] = should_sleep_tags
+        # The release RPC checks idleness; flushing an offloaded KV pool can access unmapped memory.
+        if self.wake_up_tag[GPU_MEMORY_TYPE_KV_CACHE]:
+            await self._wait_for_idle()
+        obj = ReleaseMemoryOccupationReqInput(*args, **kwargs)
+        await self.infer_engine.tokenizer_manager.release_memory_occupation(obj, None)
         for tag in should_sleep_tags:
             self.wake_up_tag[tag] = False
 
-        await self._wait_for_idle()
-        obj = ReleaseMemoryOccupationReqInput(*args, **kwargs)
-        await self.infer_engine.tokenizer_manager.release_memory_occupation(obj, None)
-
     async def release_kv_cache_for_weight_update(self):
         """Release KV cache only before distributed weight update."""
-        if not self.wake_up_tag["kv_cache"]:
+        if not self.wake_up_tag[GPU_MEMORY_TYPE_KV_CACHE]:
             log("release_kv_cache_for_weight_update: kv_cache already released", rank=0)
             return
-        self.wake_up_tag["kv_cache"] = False
+        tags = self._with_cuda_graph([GPU_MEMORY_TYPE_KV_CACHE])
+        for tag in tags:
+            self.wake_up_tag[tag] = False
         await self._wait_for_idle()
-        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+        obj = ReleaseMemoryOccupationReqInput(tags=tags)
         await self.infer_engine.tokenizer_manager.release_memory_occupation(obj, None)
         log("SglangEngine release_kv_cache_for_weight_update done", rank=0)
 
     async def resume_kv_cache_after_weight_update(self):
         """Resume KV cache after distributed weight update."""
-        if self.wake_up_tag["kv_cache"]:
+        if self.wake_up_tag[GPU_MEMORY_TYPE_KV_CACHE]:
             log("resume_kv_cache_after_weight_update: kv_cache already active", rank=0)
             return
-        self.wake_up_tag["kv_cache"] = True
-        obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+        tags = self._with_cuda_graph([GPU_MEMORY_TYPE_KV_CACHE])
+        for tag in tags:
+            self.wake_up_tag[tag] = True
+        obj = ResumeMemoryOccupationReqInput(tags=tags)
         await self.infer_engine.tokenizer_manager.resume_memory_occupation(obj, None)
         log("SglangEngine resume_kv_cache_after_weight_update done", rank=0)
 

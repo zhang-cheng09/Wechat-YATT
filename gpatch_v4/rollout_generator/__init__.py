@@ -1,5 +1,9 @@
+from gpatch_v4.configs.config import EmbeddingOffPolicyDistillConfig
 from gpatch_v4.rollout_generator.base_generator import BaseRolloutGenerator
 from gpatch_v4.rollout_generator.ds_generator import DynamicSamplingRolloutGenerator
+from gpatch_v4.rollout_generator.embedding_off_policy_distill_generator import (
+    EmbeddingOffPolicyDistillRolloutGenerator,
+)
 from gpatch_v4.rollout_generator.off_policy_distill_generator import (
     OffPolicyDistillRolloutGenerator,
 )
@@ -34,7 +38,9 @@ class RolloutGeneratorFactory:
         BaseRolloutGenerator
         """
         rollout_generator_cls = None
-        if config.policy.rollout_gen_type == "base":
+        if isinstance(config, EmbeddingOffPolicyDistillConfig):
+            rollout_generator_cls = EmbeddingOffPolicyDistillRolloutGenerator
+        elif config.policy.rollout_gen_type == "base":
             rollout_generator_cls = BaseRolloutGenerator
         elif config.policy.rollout_gen_type == "replay":
             rollout_generator_cls = ReplayRolloutGenerator

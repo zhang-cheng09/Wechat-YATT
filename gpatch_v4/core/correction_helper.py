@@ -1,9 +1,14 @@
-from typing import Any, Dict, Optional, Tuple
+import math
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
 from gpatch_v4.configs.config import RlConfig
+from gpatch_v4.configs.ppo_config import SUPPORTED_ROLLOUT_RS_OPTIONS
 from gpatch_v4.utils import logging_rank0, masked_mean, masked_statistic, masked_sum
+
+# Match verl/verl/trainer/ppo/rollout_corr_helper.py
+SAFETY_BOUND = 20.0
 
 
 def masked_sum_expand(x: torch.Tensor, mask: torch.Tensor, expand: bool = False) -> torch.Tensor:
@@ -235,6 +240,186 @@ def icepop_mode(
     return weights
 
 
+def _parse_rollout_rs_thresholds(
+    options: list[str],
+    threshold_spec: Union[str, float],
+) -> dict[str, dict[str, Optional[float]]]:
+    """Parse verl-style ``rollout_rs_threshold`` for the given options."""
+    if isinstance(threshold_spec, (int, float)):
+        raw_specs = [str(threshold_spec)]
+    elif isinstance(threshold_spec, str):
+        raw_specs = [part.strip() for part in threshold_spec.split(",") if part.strip()]
+    else:
+        raise TypeError("off_policy_correction_rs_threshold must be str or numeric")
+
+    if not raw_specs:
+        raise ValueError("off_policy_correction_rs_threshold must be non-empty")
+    if len(raw_specs) not in (1, len(options)):
+        raise ValueError(
+            "off_policy_correction_rs_threshold expects one shared threshold or "
+            f"exactly {len(options)} comma-separated entries, got {len(raw_specs)}"
+        )
+    if len(raw_specs) == 1 and len(options) > 1:
+        raw_specs = raw_specs * len(options)
+
+    thresholds: dict[str, dict[str, Optional[float]]] = {}
+    for option, spec in zip(options, raw_specs):
+        if option.endswith("k1"):
+            if "_" in spec:
+                lower_str, upper_str = spec.split("_", 1)
+            else:
+                upper_str = spec
+                lower_str = str(1.0 / float(upper_str))
+            lower = float(lower_str)
+            upper = float(upper_str)
+            if lower <= 0 or upper <= 0:
+                raise ValueError(f"RS thresholds for {option} must be positive, got {spec}")
+            thresholds[option] = {"lower": lower, "upper": upper}
+        else:
+            if "_" in spec:
+                raise ValueError(f"RS option {option} expects a single upper bound, got {spec}")
+            upper = float(spec)
+            if upper <= 0:
+                raise ValueError(f"RS threshold for {option} must be positive, got {spec}")
+            thresholds[option] = {"lower": None, "upper": upper}
+    return thresholds
+
+
+def compute_rollout_rejection_mask(
+    log_ratio: torch.Tensor,
+    mask: torch.Tensor,
+    rollout_rs: str,
+    rollout_rs_threshold: Union[str, float],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """verl-aligned rejection sampling on ``log_ratio = log π_actor - log π_sampler``.
+
+    For ``token_k1`` with threshold ``0.5_5.0``:
+      token_k1 = -log_ratio = log(π_sampler / π_actor)
+      keep when token_k1 ∈ [log(0.5), log(5)]
+      ⇔ IS weight π_actor/π_sampler ∈ [0.2, 2]
+
+    Parameters
+    ----------
+    log_ratio : torch.Tensor
+        ``prev_log_probs - rollout_log_probs`` (same shape as ``mask``).
+    mask : torch.Tensor
+        Float response mask (1=valid).
+    rollout_rs : str
+        Comma-separated options (currently ``token_k1/k2/k3``).
+    rollout_rs_threshold : str or float
+        Threshold spec, e.g. ``"0.5_5.0"``.
+
+    Returns
+    -------
+    modified_mask : torch.Tensor
+        ``mask`` with rejected tokens zeroed.
+    metrics : dict
+        RS diagnostic tensors (unprefixed).
+    """
+    option_modes = [opt.strip() for opt in rollout_rs.split(",") if opt.strip()]
+    if not option_modes:
+        raise ValueError("off_policy_correction_rs must contain at least one option")
+
+    normalized_options: list[str] = []
+    seen: set[str] = set()
+    for opt in option_modes:
+        if opt not in SUPPORTED_ROLLOUT_RS_OPTIONS:
+            raise ValueError(
+                f"Unsupported RS option {opt}; supported={sorted(SUPPORTED_ROLLOUT_RS_OPTIONS)}"
+            )
+        if opt not in seen:
+            normalized_options.append(opt)
+            seen.add(opt)
+
+    threshold_specs = _parse_rollout_rs_thresholds(normalized_options, rollout_rs_threshold)
+    log_ratio_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+    # Match verl: k1 = -log(π_train/π_rollout) = log(π_rollout/π_train)
+    token_k1 = -log_ratio_safe
+    token_k2 = 0.5 * log_ratio_safe**2
+    token_k3 = torch.exp(log_ratio_safe) - 1.0 - log_ratio_safe
+
+    mask_bool = mask.bool()
+    combined = torch.ones_like(mask)
+    metrics: Dict[str, torch.Tensor] = {}
+    mask_sum = torch.clamp_min(mask.sum().float(), 1)
+
+    for option_name in normalized_options:
+        info = threshold_specs[option_name]
+        if option_name == "token_k1":
+            lower_log = math.log(info["lower"])
+            upper_log = math.log(info["upper"])
+            keep = (token_k1 >= lower_log) & (token_k1 <= upper_log)
+            stat = token_k1
+            metrics[f"rollout_rs_{option_name}_mean"] = masked_mean(stat, mask)
+            metrics[f"rollout_rs_{option_name}_fraction_high"] = (
+                ((stat > upper_log) & mask_bool).sum().float() / mask_sum
+            )
+            metrics[f"rollout_rs_{option_name}_fraction_low"] = (
+                ((stat < lower_log) & mask_bool).sum().float() / mask_sum
+            )
+        elif option_name == "token_k2":
+            upper = info["upper"]
+            keep = token_k2 <= upper
+            stat = token_k2
+            metrics[f"rollout_rs_{option_name}_mean"] = masked_mean(stat, mask)
+            metrics[f"rollout_rs_{option_name}_fraction_high"] = (
+                ((stat > upper) & mask_bool).sum().float() / mask_sum
+            )
+        elif option_name == "token_k3":
+            upper = info["upper"]
+            keep = token_k3 <= upper
+            stat = token_k3
+            metrics[f"rollout_rs_{option_name}_mean"] = masked_mean(stat, mask)
+            metrics[f"rollout_rs_{option_name}_fraction_high"] = (
+                ((stat > upper) & mask_bool).sum().float() / mask_sum
+            )
+        else:
+            raise ValueError(f"Unsupported RS option: {option_name}")
+
+        keep_f = keep.to(dtype=mask.dtype)
+        combined = combined * keep_f
+        metrics[f"rollout_rs_{option_name}_masked_fraction"] = (
+            ((1.0 - keep_f) * mask).sum().float() / mask_sum
+        )
+
+    modified_mask = mask * combined
+    metrics["rollout_rs_masked_fraction"] = ((mask - modified_mask).sum().float() / mask_sum)
+    # Sequence has any rejected valid token (BSHD [B,S] or flat THD).
+    if mask.dim() >= 2:
+        seq_masked = ((combined < 0.5) & mask_bool).any(dim=-1).float().mean()
+    else:
+        seq_masked = ((combined < 0.5) & mask_bool).any().float()
+    metrics["rollout_rs_seq_masked_fraction"] = seq_masked
+    return modified_mask, metrics
+
+
+def _apply_rollout_rs(
+    config: RlConfig,
+    raw_log_ratio_diff: torch.Tensor,
+    mask: torch.Tensor,
+    modified_mask: torch.Tensor,
+    metrics: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """AND verl rollout-RS into ``modified_mask``. No-op when RS is unset."""
+    rs = config.ppo.off_policy_correction_rs
+    if rs is None:
+        return modified_mask
+    rs_threshold = config.ppo.off_policy_correction_rs_threshold
+    if rs_threshold is None:
+        raise ValueError(
+            "off_policy_correction_rs_threshold must be set when "
+            "off_policy_correction_rs is enabled"
+        )
+    rs_mask, rs_metrics = compute_rollout_rejection_mask(
+        raw_log_ratio_diff,
+        mask,
+        rs,
+        rs_threshold,
+    )
+    metrics.update(rs_metrics)
+    return modified_mask * (rs_mask > 0).to(dtype=mask.dtype)
+
+
 def compute_off_policy_correction_weights(
     enable_off_policy_correction: bool,
     config: RlConfig,
@@ -247,13 +432,15 @@ def compute_off_policy_correction_weights(
     """
     Compute the importance sampling (IS) weights and metrics between the inference and training engine.
     Args:
-        enable_off_policy_correction: if False, only retrun metric
+        enable_off_policy_correction: if False, skip IS weights; RS still applies when set.
         config:
             off_policy_correction_level: str = "token"
             off_policy_correction_mode: str = "truncate"
             off_policy_correction_upper_bound: float = 2.0
             off_policy_correction_lower_bound: float = None
             off_policy_correction_veto_threshold: float = None
+            off_policy_correction_rs: str = None  # verl rollout_rs
+            off_policy_correction_rs_threshold: str = None
         prev_log_probs: log probs from training backend. 1D tensor each. Lengths can be different.
         rollout_log_probs: log probs from inference backend. 1D tensor each.
         mask: masks. 1D tensor each.
@@ -269,6 +456,11 @@ def compute_off_policy_correction_weights(
         metrics: The metrics for the importance sampling
     """
     if rollout_log_probs is None:
+        if config.ppo.off_policy_correction_rs is not None:
+            raise ValueError(
+                "off_policy_correction_rs requires rollout_log_probs; "
+                "the sampler must return log probabilities"
+            )
         return None, mask, {}
 
     assert not prev_log_probs.requires_grad
@@ -282,8 +474,10 @@ def compute_off_policy_correction_weights(
         rollout_log_probs,
         mask,
     )
+    raw_log_ratio_diff = prev_log_probs - rollout_log_probs
     if not enable_off_policy_correction:
-        return None, mask, convert_metrics(metrics)
+        modified_mask = _apply_rollout_rs(config, raw_log_ratio_diff, mask, mask, metrics)
+        return None, modified_mask.detach(), convert_metrics(metrics)
 
     level = config.ppo.off_policy_correction_level
     mode = config.ppo.off_policy_correction_mode
@@ -292,9 +486,7 @@ def compute_off_policy_correction_weights(
     if lower_bound is None:
         lower_bound = 1.0 / upper_bound
 
-    SAFETY_BOUND = 20.0  # Add a safety bound to avoid exp overflow
     # handle each sequence independently
-    raw_log_ratio_diff = prev_log_probs - rollout_log_probs
 
     # level: The aggregation level for the importance sampling weights.
     if level == "token":
@@ -409,6 +601,9 @@ def compute_off_policy_correction_weights(
             local_cp_group,
         )
         modified_mask = modified_mask * veto_mask
+
+    # verl-style rejection sampling (rollout_rs): orthogonal to IS, after veto.
+    modified_mask = _apply_rollout_rs(config, raw_log_ratio_diff, mask, modified_mask, metrics)
 
     ratio_after_clip_mean, ratio_after_clip_min, ratio_after_clip_max = masked_statistic(
         weights, mask

@@ -95,7 +95,7 @@ graph TD
 | 文件 | 职责 |
 |------|------|
 | `gpatch_v4/configs/dist_config.py` | `DistConfig`：`dynamic_context_parallel`, `max_seqlen_per_dp_cp_rank`, `max_seqlen_per_dp_cp_rank_fwd_only`, `dynamic_cp_scheduler_type` |
-| `gpatch_v4/configs/config.py` | 要求 `training.attention_backend='flash'`；**SFT** `FinetuneConfig` 另要求 `calculate_per_token_loss=True` |
+| `gpatch_v4/configs/config.py` | 要求 `training.attention_backend='flash'`；SFT 普通 CE 支持 token-mean / sequence-mean |
 | `gpatch_v4/configs/policy_config.py` | dyn_cp 与 smart_pad / dynamic_mbs 等互斥校验 |
 | `gpatch_v4/core/parallel_state.py` | 初始化 Megatron dynamic CP parallel groups |
 | `gpatch_v4/utils/dynamic_cp_utils.py` | 调度 / reroute / pack / `reverse_reroute_logprobs` / **loss reconstruct + response-pad helpers** |
@@ -124,7 +124,7 @@ policy:
     dynamic_cp_scheduler_type: default    # default | smart_padding
 
   override_transformer_config:
-    calculate_per_token_loss: True        # SFT FinetuneConfig 在 dyn_cp 下必填；RL GRPO 常用 True
+    calculate_per_token_loss: True        # True: token-mean；False: sequence-mean-token-mean
 
 training:
   attention_backend: flash                # dyn_cp 必填，否则 grad_norm NaN
@@ -176,6 +176,53 @@ training:
 | `extended_model/welm_v4.py` | ✅ | ✅（含 R3 `routed_experts`）；OPD 继承 LLM 的 `opd_train_with_dynamic_cp` | WeLM |
 | `extended_model/welm_omni_v4_5.py` | ✅ | — | 当前仅见 SFT dyn_cp 路径 |
 | `extended_model/deepseek_v4.py` | ✅ | ✅ train | 继承 LLM reroute；train 为 **contiguous** CP 切分 |
+
+### SFT cross-entropy loss
+
+Dynamic CP 下普通 `cross_entropy` 支持两种归一化，dense CE、linear CE 和 CE
+compaction 使用相同语义：
+
+- `calculate_per_token_loss=True`：每个 CP rank 保留本地 token loss sum 和有效
+  token 数；`finalize_model_grads` 在 DP×CP 上汇总后除以全局 token 数。
+- `calculate_per_token_loss=False`：先在动态 CP 子组内汇总每条序列的 token
+  sum/count，计算每条序列的 token mean，再除以配置的 `training.train_gbs`。
+  Megatron 的 microbatch 除法和 DP×CP DDP AVG 由 backend 按 RL 相同方式补偿。
+
+False 模式不 reconstruct 全量 logits；zigzag THD 使用本地
+`cu_seqlens_padded / local_cp_size` 边界，DeepSeek V4 使用 contiguous 全局边界
+与本 rank 区间的交集，有效 token 数由 `loss_mask` 决定。
+
+Dynamic CP + `calculate_per_token_loss=False` 支持
+`training.loss_func=cross_entropy` 和 `custom`。custom loss 会收到
+`calculate_per_token_loss`、`cu_seqlens_padded`、`local_cp_size` 和
+`cp_partition_mode`，须自行完成 CP 子组内的逐 sequence 聚合，并返回
+`(sequence_loss_sum, sample_count, metrics)`；backend 负责 step-global sequence
+归一化。`ce_with_kl` 和 `square_averaging_cross_entropy` 尚未接入这套契约。
+
+### Packed pretrain sequence-level loss（非 Dynamic CP）
+
+`PretrainConfig` 的 dataset-packed THD 路径仍要求
+`dynamic_context_parallel=False`、`context_parallel_size=1` 和
+`train_mbs=1`。该路径同样支持两种归一化：
+
+- `calculate_per_token_loss=True`：保持原有全局 token-mean 语义。
+- `calculate_per_token_loss=False`：利用每个 packed microbatch 的
+  `cu_seqlens_padded`，先计算每条原始 sequence 的有效 token mean，再按本 step
+  跨 DP 的真实 sequence 总数归一化。这里不能使用 `training.train_gbs` 作为分母，
+  因为 pretrain 的 `train_gbs` / GAS 统计 packed microbatch 数，而每个 pack 中包含
+  的原始 sequence 数可能不同。
+
+False 模式支持 `training.loss_func=cross_entropy` 和 `custom`。普通 CE 由 backend
+完成逐 sequence 聚合；custom loss 会收到 `FinetuneLossInput.calculate_per_token_loss`
+和 `FinetuneLossInput.cu_seqlens_padded`，并须返回：
+
+```python
+(sequence_loss_sum, sample_count, metrics)
+```
+
+其中 `sequence_loss_sum` 是当前 packed microbatch 内各 sequence loss 的和；
+backend 负责补偿 Megatron 的 microbatch 除法以及 DP DDP AVG，最终得到 step-global
+sequence mean。`ce_with_kl` 和 `square_averaging_cross_entropy` 暂未接入该契约。
 
 ### RL policy loss（train 侧，response-pad 之后）
 
@@ -382,7 +429,7 @@ SFT / GRPO 遵循同一范式。按下列 checklist 实现（AI agent 可直接�
 ### Step 0: 确认约束
 
 - [ ] 不需要 VPP、MTP (deepseek_v3)；SFT dump + dyn-CP / `ppo_dump_moe_topk` 仍不支持
-- [ ] `attention_backend=flash`；SFT 另需 `calculate_per_token_loss=True`
+- [ ] `attention_backend=flash`；SFT 普通 CE 可按目标语义选择 `calculate_per_token_loss`
 - [ ] 模型 extended class 继承 `PrepareDataForward`
 
 ### Step 1: `{task}_reroute_data_for_dynamic_cp`
@@ -476,7 +523,8 @@ def xxx_train_with_dynamic_cp(
 |----------|------|
 | `virtual_pipeline_model_parallel_size > 1` | `DistConfig.__post_init__` assert |
 | `model_arch == deepseek_v3` (MTP) | `_update_policy` assert |
-| `ppo_dump_moe_topk > 0` + dyn-CP dump | `_update_policy` assert |
+| `ppo_dump_moe_topk > 0` + dyn-CP | `_assert_dynamic_cp_requires` assert |
+| `dump_metrics_logprobs_topk > 0` + dyn-CP | `_assert_dynamic_cp_requires` assert |
 | SFT `ppo_dump_metrics_interval > 0` + dyn-CP | `_finetune_step` assert |
 | `OffPolicyDistillConfig` | 未实现 |
 | `ppo.loss_func='steer'` + dyn_cp | `grpo_train_actor` assert |

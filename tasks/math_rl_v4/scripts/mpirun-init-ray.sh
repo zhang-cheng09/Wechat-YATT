@@ -6,7 +6,9 @@ fi
 sed -i 's/slots=8/slots=1/g' /root/hostfile
 
 ray stop --force
-pkill -9 -f python
+if [ "${GCORE_SKIP_PKILL_PYTHON:-0}" != "1" ]; then
+    pkill -9 -f python
+fi
 
 export RAY_DEDUP_LOGS=0
 export PYTHONUNBUFFERED=1
@@ -21,6 +23,12 @@ mpirun -v --allow-run-as-root \
   -x PATH -x LIBRARY_PATH -x LD_LIBRARY_PATH -x PYTHONPATH \
   hostname
 
+mpirun -v --allow-run-as-root \
+  --bind-to none --map-by slot --hostfile /root/hostfile \
+  --mca btl_tcp_if_include bond1 --mca oob_tcp_if_include bond1 --mca routed direct \
+  -x PATH -x LIBRARY_PATH -x LD_LIBRARY_PATH -x PYTHONPATH -x RAY_DEDUP_LOGS \
+  bash tasks/math_dsv4/scripts/prepare_env.sh
+sleep 3
 
 mpirun -v --allow-run-as-root \
   --bind-to none --map-by slot --hostfile /root/hostfile \

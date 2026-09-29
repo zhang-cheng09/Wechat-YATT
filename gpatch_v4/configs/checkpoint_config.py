@@ -45,6 +45,13 @@ class CheckpointConfig(MappingProtocol):
     save_ckpt_path: Optional[str] = field(default=None, metadata={"help": "Save model path"})
     no_load_optim: bool = field(default=False, metadata={"help": "Whether to load optimizer"})
     no_save_optim: bool = field(default=False, metadata={"help": "Whether to save optimizer"})
+    save_distributed_ep_shard: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Save DSV4/Qwen4Exp HF experts per EP partition without cross-EP gather; requires a shared output directory."
+        },
+    )
 
     load_ref_ckpt_path: Optional[str] = field(
         default=None, metadata={"help": "Reference ckpt load path"}

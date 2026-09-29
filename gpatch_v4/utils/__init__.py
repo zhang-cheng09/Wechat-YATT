@@ -29,6 +29,10 @@ from gpatch_v4.utils.communication_utils import (
     average_losses_across_data_parallel_group,
     reduce_metrics_across_data_parallel_group,
 )
+from gpatch_v4.utils.cuda_peak_tracker import (
+    finish_policy_cuda_memory_profile,
+    start_policy_cuda_memory_profile,
+)
 from gpatch_v4.utils.data_manipulate_utils import aggregate_metrics, pad_to_length
 from gpatch_v4.utils.filter_samplings import (
     BUILDIN_FILTER_SAMPLING_STRATEGIES,
@@ -69,4 +73,5 @@ from gpatch_v4.utils.timer_utils import (
     record_time_to_metrics,
 )
 from gpatch_v4.utils.tokenizer_utils import get_tokenizer_template
+from gpatch_v4.utils.torch_compile import compile_dynamic_dims
 from gpatch_v4.utils.training_utils import *

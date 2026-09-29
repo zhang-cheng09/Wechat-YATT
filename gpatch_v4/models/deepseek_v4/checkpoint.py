@@ -18,17 +18,19 @@ import re
 import shutil
 from collections import defaultdict
 from copy import deepcopy
-from typing import Literal, Optional
-from packaging.version import Version
 from importlib.metadata import version as pkg_version
+from itertools import groupby
+from typing import Literal, Optional
 
 import safetensors
 import torch
 import torch.nn as nn
+from packaging.version import Version
 from safetensors import safe_open
 from torch import distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
+from gpatch_v4.models.expert_gather import gather_ep_partition
 from gpatch_v4.utils import log_debug
 from gpatch_v4.utils.safetensor_io import save_file
 
@@ -47,6 +49,18 @@ _ROUTED_EXPERT_DISK_KEY_RE = re.compile(
 )
 _EXPERT_WEIGHT_PART_ORDER = {"w1": 0, "w2": 1, "w3": 2}
 _EXPERT_TENSOR_KIND_ORDER = {"weight": 0, "scale": 1}
+
+
+def _restore_mtp_output_norm_target(
+    disk_key: str,
+    logical_disk_key: str,
+    renamed_key: str,
+    source_pattern: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Keep the MTP output norm out of the generic attention-norm rename."""
+    if re.fullmatch(r"mtp\.\d+\.norm\.weight", disk_key):
+        return logical_disk_key, None
+    return renamed_key, source_pattern
 
 
 def routed_expert_disk_key_order(disk_key: str) -> tuple[int, int, int, int, int]:
@@ -292,7 +306,8 @@ def _load_checkpoint_hp(
         renamings.extend(
             [
                 WeightRenaming(
-                    source_patterns=r"^(.*\.)?self_attn\.compressor\.indexer\.scorer\.weights_proj\.weight$",
+                    source_patterns=
+                    r"^(.*\.)?self_attn\.compressor\.indexer\.scorer\.weights_proj\.weight$",
                     target_patterns=r"\1self_attn.compressor.indexer.weights_proj.weight",
                 ),
             ]
@@ -404,6 +419,12 @@ def _load_checkpoint_hp(
         )
 
         if _is_mtp_key:
+            renamed_key, source_pattern = _restore_mtp_output_norm_target(
+                disk_key,
+                logical_disk_key,
+                renamed_key,
+                source_pattern,
+            )
             # Manual prefix + MTP remap: renamed_key is e.g.
             # "layers.4.self_attn.kv_proj.weight" (no "model." prefix).
             # Strip any leading "layers." (the converter may or may not
@@ -1191,6 +1212,7 @@ def _save_checkpoint_hp(
     *,
     dtype_format: Literal["quantized", "bf16"] = "quantized",
     preserve_mtp: bool = True,
+    save_distributed_ep_shard: bool = False,
 ) -> None:
     """Save an EP+FSDP2(+CP) model as a HF-compatible checkpoint dir.
 
@@ -1206,6 +1228,9 @@ def _save_checkpoint_hp(
         tokenizer + README files.
     max_shard_size
         Approximate per-shard byte budget (5 GiB default).
+    save_distributed_ep_shard : bool, default False
+        Save experts per EP partition in a shared directory instead of gathering
+        all experts to each parameter's owner. The wave layout below applies when enabled.
     dtype_format
         Disk dtype layout, keyword-only. Two paths are supported:
 
@@ -1223,7 +1248,7 @@ def _save_checkpoint_hp(
           touching the FP8 dequant path. Total disk size ≈ 530 GiB on full
           43L (~3.5× larger than quantized).
 
-        The two paths share the wave-based parallel save framework, EP gather,
+        The two paths share the wave-based parallel save framework, FSDP gather,
         rename table, and per-expert split — they only differ in the wave-B
         dtype dispatch and ``_rank0_finalize`` config-strip step.
 
@@ -1254,23 +1279,22 @@ def _save_checkpoint_hp(
     -----------------------------------
     Mirrors :func:`_load_checkpoint_hp`'s Phase 4 — distribute work
     across ranks via round-robin ownership over a ``(-global_numel,
-    name)``-sorted item list, processed in **waves** of ``world_size``
-    params each. No background threads, queues, CUDA events, or
+    name)``-sorted item list. Expert waves contain at most
+    ``world_size / ep_size`` params; other waves contain ``world_size``.
+    No background threads, queues, CUDA events, or
     cross-thread CUDA state.
 
     Each wave runs two sub-phases:
 
-    * **Wave-A (gather, ``world_size`` collectives)**: For each of the
-      ≤``world_size`` params in the wave, every rank participates in
-      one gather (``DTensor.from_local + full_tensor + dist.all_gather``
-      2-step for experts; plain ``full_tensor()`` otherwise). The
-      round-robin **owner rank** ``i % world_size`` (i within wave)
-      synchronously D2H-copies the result to CPU; non-owners drop.
+    * **Wave-A (gather)**: Each expert parameter is restored only within
+      its EP partition's FSDP mesh. Mesh-local rank ``i`` owns that
+      partition's CPU tensor; there is no cross-EP gather. Other parameters
+      use ``full_tensor()`` with global rank ``i`` as owner.
       Each rank holds **at most one** owned tensor in CPU memory after
       Wave-A (last wave may have fewer).
     * **Wave-B (per-rank parallel CPU + disk)**: With no further
       collectives, every rank independently splits stacked experts
-      into per-expert leaves, renames model FQN → disk-form key via
+      into per-expert leaves with global expert IDs, renames model FQN → disk-form key via
       :func:`_model_key_to_disk_key`, casts to on-disk dtype, and
       streams to a rank-private shard file
       (``model-rank{r:02d}-{i:05d}-of-XXXXX.safetensors``). All
@@ -1301,24 +1325,14 @@ def _save_checkpoint_hp(
 
     Memory budget (DSV4-Flash, fp32 case, per rank):
 
-    * GPU peak: dominated by the 2-step expert gather inside Wave-A
-      — ``ep_local_full`` (~3.75 GiB) + ``ep_chunks`` (``ep_size`` ×
-      ~3.75 = ~30 GiB) + ``cat(t)`` (~30 GiB) all alive simultaneously
-      just before ``del ep_chunks``, plus FSDP-sharded local model +
-      caches. Roughly ~64-80 GiB transient on H20 96 GiB. After
-      ``del ep_chunks`` peak drops to ~30 GiB (just ``t``).
-    * CPU peak in Wave-A: **at most one owned tensor** per rank
-      (~30 GiB for the biggest expert), not the sum of all owned.
-    * CPU peak in Wave-B: one expert split intermediate (~30 GiB) +
-      pending shard buffer (~5 GiB) ≈ ~35 GiB transient. Drops to
-      pending size between waves.
+    * Expert GPU staging: one EP-local parameter restored over FSDP;
+      the complete cross-EP tensor is never materialized.
+    * CPU staging in Wave-A: **at most one owned tensor** per rank,
+      containing only this EP partition's experts.
+    * Wave-B additionally retains the pending shard buffer and dtype
+      conversion temporaries.
 
     bf16-loaded paths halve all expert sizes.
-
-    DSV4-Pro caveat: fp32 ``gate_up_proj`` is ~67 GiB → 2-step gather
-    transient on H20 will OOM. A chunked variant of the 2-step gather
-    (mirror of load Phase B's chunked all_reduce) is left as
-    follow-up; bf16 path works as-is.
 
     Notes
     -----
@@ -1445,17 +1459,26 @@ def _save_checkpoint_hp(
         )
 
     # ------------------------------------------------------------------
-    # 2) Wave loop — each wave gathers ``world_size`` params (last may be
-    #    short) so every rank holds AT MOST ONE owned tensor in CPU at
+    # 2) Wave loop — expert waves use one writer per EP partition so
+    #    every rank holds AT MOST ONE owned tensor in CPU at
     #    a time, then writes it before the next wave's gather. Errors
     #    in Wave-B are recorded locally; subsequent waves still
     #    participate in the gather collectives so no rank deadlocks
     #    waiting on a failed peer. Final ``_spread_fail`` propagates
     #    after the loop.
     # ------------------------------------------------------------------
-    waves: list[list[tuple[str, torch.Tensor]]] = [
-        sorted_items[i:i + world_size] for i in range(0, len(sorted_items), world_size)
-    ]
+    # sorted_items is every (name, tensor), biggest first. groupby emits consecutive
+    # expert-only or dense-only runs so one wave never mixes the two collectives.
+    # Only distributed EP saves split waves by kind and use one writer per partition.
+    waves: list[list[tuple[str, torch.Tensor]]] = []
+    for is_expert, items in groupby(
+        sorted_items,
+        key=lambda kv: save_distributed_ep_shard and
+        (".experts.gate_up_proj" in kv[0] or ".experts.down_proj" in kv[0]),
+    ):
+        items = list(items)
+        wave_size = world_size // self._ep_size if is_expert else world_size
+        waves.extend(items[i:i + wave_size] for i in range(0, len(items), wave_size))
     if is_rank0:
         print(
             f"[save_checkpoint_hp] waves: {len(waves)} (≤{world_size} params each, "
@@ -1470,9 +1493,10 @@ def _save_checkpoint_hp(
         _tw0 = _time.time()
 
         # ---------- Wave-A: gather (at most one owned per rank) ----------
-        my_owned: list[tuple[str, torch.Tensor]] = []
+        my_owned: list[tuple[str, torch.Tensor, int]] = []
         for i, (name, p) in enumerate(wave):
             owner = i % world_size
+            expert_offset = 0
             is_expert_weight = (".experts.gate_up_proj" in name or ".experts.down_proj" in name)
 
             if isinstance(p, DTensor):
@@ -1481,32 +1505,16 @@ def _save_checkpoint_hp(
                 if local_is_fp8:
                     local = local._tensor
                 if is_expert_weight and self._ep_size > 1:
-                    # Two-step gather to recover expert weights in MODEL ORDER.
-                    #
-                    # Expert weights are sharded on two mesh dims:
-                    #   ep      (slow): ep_idx holds experts [ep_idx * num_local ..)
-                    #   ep_fsdp (fast): FSDP2 further shards the local block
-                    #
-                    # A naive ``DTensor.from_local(mesh=(ep_fsdp, ep),
-                    # placements=[Shard(0), Shard(0)]).full_tensor()`` reassembles in
-                    # MESH row-major order (ep_fsdp slow, ep fast), transposing the
-                    # expert layout. Fix: gather ep_fsdp first (correct order within
-                    # each EP slot), then ``dist.all_gather`` over ep to concatenate
-                    # slots in ep_idx order → full expert tensor.
-                    local = local.contiguous()
-                    dt_fsdp = DTensor.from_local(
-                        local,
-                        device_mesh=self._ep_fsdp_mesh,
-                        placements=[Shard(0)],
-                        shape=p.shape,
-                        stride=p.stride(),
-                    )
-                    ep_local_full = dt_fsdp.full_tensor()  # (num_local, ...)
-
-                    ep_chunks = [torch.empty_like(ep_local_full) for _ in range(self._ep_size)]
-                    dist.all_gather(ep_chunks, ep_local_full, group=self._ep_group)
-                    t = torch.cat(ep_chunks, dim=0)  # (num_experts, ...)
-                    del ep_local_full, ep_chunks
+                    t = gather_ep_partition(p, local, self._ep_fsdp_mesh)
+                    if save_distributed_ep_shard:
+                        # Each partition owns its local experts, numbered globally on disk.
+                        owner = int(self._ep_fsdp_mesh.mesh[i].item())
+                        expert_offset = self._ep_rank * p.shape[0]
+                    else:
+                        ep_chunks = [torch.empty_like(t) for _ in range(self._ep_size)]
+                        dist.all_gather(ep_chunks, t, group=self._ep_group)
+                        t = torch.cat(ep_chunks, dim=0)
+                        del ep_chunks
                 else:
                     gather_param = p
                     if local_is_fp8:
@@ -1529,7 +1537,7 @@ def _save_checkpoint_hp(
             # ``state_dict()`` keys have a ``model.`` prefix for
             # inner-model params; rename table operates on the bare FQN.
             model_key = name.removeprefix("model.")
-            my_owned.append((model_key, t.cpu()))
+            my_owned.append((model_key, t.cpu(), expert_offset))
             del t
 
         # Reclaim GPU caches from the wave's gather transients before disk work.
@@ -1544,7 +1552,7 @@ def _save_checkpoint_hp(
         if write_err is None:
             try:
                 while my_owned:
-                    model_key, t_cpu = my_owned.pop(0)
+                    model_key, t_cpu, expert_offset = my_owned.pop(0)
                     for disk_key, out_tensor in iter_disk_checkpoint_tensors(
                         model_key,
                         t_cpu,
@@ -1552,6 +1560,7 @@ def _save_checkpoint_hp(
                         expert_dtype=expert_dtype,
                         is_sgl_ckpt_fmt=is_sgl_ckpt_fmt,
                         include_mtp=preserve_mtp,
+                        expert_offset=expert_offset,
                     ):
                         _add(disk_key, out_tensor)
                     del t_cpu
@@ -1563,10 +1572,9 @@ def _save_checkpoint_hp(
         _t_write_total += _tw2 - _tw1
 
         if is_rank0:
-            n_owned_r0 = sum(1 for i in range(len(wave)) if i % world_size == 0)
             print(
                 f"[save_checkpoint_hp]   wave {wave_idx + 1}/{len(waves)} "
-                f"{len(wave)} params ({n_owned_r0} owned by rank0): "
+                f"{len(wave)} params: "
                 f"gather={_tw1 - _tw0:.2f}s write(rank0)={_tw2 - _tw1:.2f}s",
                 flush=True,
             )

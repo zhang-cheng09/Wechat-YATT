@@ -158,6 +158,20 @@ class TestGetSamplingParamsFromConfig(unittest.TestCase):
         self.assertEqual(params.temperature, 0.0)
         self.assertEqual(params.top_k, 1)
 
+    def test_eval_top_k_one_is_greedy_at_temperature_one(self):
+        ie = InferEngineConfig(
+            eval_generate_params=GenerateParams(
+                temperature=1.0, top_k=1, top_p=1.0, min_p=0.0
+            ),
+        )
+        params = InferEngine.get_sampling_params_from_config(
+            _StubInferEngine(), ie, stop_at_token_id=2, is_eval=True
+        )
+        self.assertEqual(params.temperature, 1.0)
+        self.assertEqual(params.top_k, 1)
+        self.assertEqual(params.top_p, 1.0)
+        self.assertEqual(params.min_p, 0.0)
+
 
 class TestEvalWiring(unittest.IsolatedAsyncioTestCase):
     async def test_sampler_actor_forwards_is_eval_to_generate_func(self):

@@ -150,20 +150,28 @@ def test_dynamic_cp_local_packed_token_count_uses_only_local_thd_shard(
         ("zigzag", [torch.tensor([0, 3]), torch.tensor([1, 2])]),
     ],
 )
+@pytest.mark.parametrize("strided", [False, True])
 def test_reconstruct_dynamic_cp_packed_tensor_keeps_only_local_autograd(
     monkeypatch,
     partition_mode,
     indices,
+    strided: bool,
 ):
     class FakeGroup:
         def rank(self):
             return 0
 
-    local = torch.tensor([[10.0, 11.0]], requires_grad=True)
+    local = torch.tensor([[10.0, 11.0]])
+    if strided:
+        local = torch.stack([local, torch.zeros_like(local)], dim=-1)[..., 0]
+        assert not local.is_contiguous()
+    local.requires_grad_()
     remote = torch.tensor([[20.0, 21.0]])
 
     def fake_all_gather(outputs, _input, group):
         assert isinstance(group, FakeGroup)
+        assert _input.is_contiguous()
+        assert all(output.is_contiguous() for output in outputs)
         outputs[0].copy_(local.detach())
         outputs[1].copy_(remote)
 
@@ -191,6 +199,39 @@ def test_reconstruct_dynamic_cp_packed_tensor_keeps_only_local_autograd(
         torch.testing.assert_close(reconstructed, torch.tensor([[10.0, 11.0, 20.0, 21.0]]))
     else:
         torch.testing.assert_close(reconstructed, torch.tensor([[10.0, 20.0, 21.0, 11.0]]))
+    reconstructed.sum().backward()
+    torch.testing.assert_close(local.grad, torch.ones_like(local))
+
+
+def test_reconstruct_dynamic_cp_accepts_explicit_group(monkeypatch):
+    class FakeGroup:
+        def rank(self):
+            return 0
+
+    group = FakeGroup()
+    local = torch.tensor([[1.0, 2.0]], requires_grad=True)
+
+    def fake_all_gather(outputs, _input, group):
+        assert group is not None
+        outputs[0].copy_(torch.tensor([[1.0, 2.0]]))
+        outputs[1].copy_(torch.tensor([[3.0, 4.0]]))
+
+    monkeypatch.setattr(dynamic_cp_utils.torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        dynamic_cp_utils.parallel_state,
+        "get_dynamic_data_context_parallel_groups",
+        lambda group_size: pytest.fail("explicit group must bypass parallel_state"),
+    )
+
+    reconstructed = reconstruct_dynamic_cp_packed_tensor(
+        local,
+        cu_seqlens_padded=torch.tensor([0, 4], dtype=torch.int32),
+        local_cp_size=2,
+        cp_partition_mode="contiguous",
+        cp_group=group,
+    )
+
+    torch.testing.assert_close(reconstructed, torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
     reconstructed.sum().backward()
     torch.testing.assert_close(local.grad, torch.ones_like(local))
 

@@ -14,6 +14,7 @@ Hydra `@hydra.main` 入口脚本，每种训练 / 评估 / 推理任务对应一
 | `train_dpo.py` | `DpoConfig` | `DpoTrainer` | DPO 训练 |
 | `train_on_policy_distill.py` | `OnPolicyDistillConfig` | `OnPolicyDistillTrainer` | On-policy 蒸馏 |
 | `train_off_policy_distill.py` | `OffPolicyDistillConfig` | `OffPolicyDistillTrainer` | Off-policy 蒸馏 |
+| `train_embedding_off_policy_distill.py` | `EmbeddingOffPolicyDistillConfig` | `OffPolicyDistillTrainer` | Embedding Off-policy 蒸馏 |
 | `train_t2i_grpo.py` | `T2iRlConfig` | `T2iGrpoTrainer` | T2I GRPO |
 | `train_t2i_dpo.py` | `T2iDpoConfig` | `T2iDpoTrainer` | T2I DPO |
 | `train_t2i_edit_sft.py` | `T2iEditSftConfig` | `T2iEditSftTrainer` | T2I 编辑 SFT |

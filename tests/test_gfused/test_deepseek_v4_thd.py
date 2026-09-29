@@ -59,6 +59,7 @@ class TestPackedSeqParamsBasic(unittest.TestCase):
     def test_psp_basic(self):
         psp = _build_psp([100, 256], [128, 256])
         self.assertEqual(psp.qkv_format, "thd")
+        self.assertEqual(psp.cp_partition_mode, "contiguous")
         self.assertEqual(psp.max_seqlen_q, 256)
         self.assertEqual(psp.total_seqlen, 384)
         self.assertEqual(psp.cu_seqlens_q.dtype, torch.int64)

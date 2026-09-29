@@ -12,7 +12,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, List, Tuple
+from unittest.mock import AsyncMock, Mock, patch
 
+from gpatch_v4.actor.grpo_train_actor import GrpoTrainActor
+from gpatch_v4.orches.train_group import RayTrainGroup
 from gpatch_v4.trainer.grpo_single_ctrl_trainer import GrpoSingleCtrlTrainer
 
 # ---- Fakes ---------------------------------------------------------- #
@@ -32,6 +35,7 @@ class _FakeEngineGroup:
 class _GenerateResult:
     """Mimic ``GenerateResult`` with a per-step dp_refs list."""
     dp_refs: List[str] = field(default_factory=list)
+    tq_clear_refs: List = field(default_factory=list)
 
 
 class _RemoteMethod:
@@ -49,9 +53,15 @@ class _FakeRolloutController:
       - ``collect_rollout_step(step)`` is only legal if ``step`` has been
         fired and not yet collected (i.e. is sitting in the queue).
     """
-    def __init__(self, events: List[Tuple], ppo_step_per_epoch: int):
+    def __init__(
+        self,
+        events: List[Tuple],
+        ppo_step_per_epoch: int,
+        completion_order: List[int] | None = None,
+    ):
         self.events = events
         self.ppo_step_per_epoch = ppo_step_per_epoch
+        self.completion_order = list(completion_order or [])
         # A FIFO queue of PPO steps that have been fired but not yet
         # collected.  Used to simulate first-finished ordering: we expect
         # the trainer loop to collect steps in the same order it fires them.
@@ -61,6 +71,10 @@ class _FakeRolloutController:
         self.collect_rollout_step = _RemoteMethod(self._collect_rollout_step)
         self.wait_all_inflight = _RemoteMethod(self._wait_all_inflight)
         self.save_data_source = _RemoteMethod(self._save_data_source)
+        self.load_data_source = _RemoteMethod(self._load_data_source)
+        self.begin_step = _RemoteMethod(self._begin_step)
+        self.evaluate = _RemoteMethod(self._evaluate)
+        self.poll_eval = _RemoteMethod(self._poll_eval)
 
     async def _fire_generation_requests(self, epoch: int, ppo_step: int, num_ppo_steps: int):
         # Validate single-epoch invariant: caller must never fire across
@@ -83,16 +97,39 @@ class _FakeRolloutController:
 
     async def _collect_rollout_step(self, ppo_step: int):
         assert self._pending_steps, (f"collect({ppo_step}) called but no steps have been fired")
-        # Trainer passes train_step; we model the queue as FIFO.
-        fired_step = self._pending_steps.pop(0)
+        if self.completion_order:
+            fired_step = self.completion_order.pop(0)
+            self._pending_steps.remove(fired_step)
+        else:
+            fired_step = self._pending_steps.pop(0)
         self.events.append(("collect", ppo_step))
-        return _GenerateResult(dp_refs=[f"dp_ref_{fired_step}"])
+        return _GenerateResult(
+            dp_refs=[f"dp_ref_{fired_step}"],
+            tq_clear_refs=[
+                f"tq_ref_{fired_step}_kept",
+                f"tq_ref_{fired_step}_filtered",
+            ],
+        )
 
     async def _wait_all_inflight(self):
         self.events.append(("wait_all_inflight", ))
 
     async def _save_data_source(self, step: int):
         self.events.append(("save_data_source", step))
+
+    async def _load_data_source(self, step: int):
+        self.events.append(("load_data_source", step))
+
+    async def _begin_step(self, target_mb: int):
+        self.events.append(("begin_step", target_mb))
+
+    async def _evaluate(self, ppo_step: int):
+        self.events.append(("eval", ppo_step))
+        return [SimpleNamespace(source_step=ppo_step, metrics={"eval/reward": ppo_step})]
+
+    async def _poll_eval(self, force: bool = False):
+        self.events.append(("poll_eval", force))
+        return None
 
 
 class _FakeSamplerGroup:
@@ -112,11 +149,13 @@ class _FakeTrainGroup:
         total_ppo_step: int,
         ppo_step_per_epoch: int,
         prev_ppo_step: int = 0,
+        fail_train_step: int = -1,
     ):
         self.events = events
         self.total_ppo_step = total_ppo_step
         self.ppo_step_per_epoch = ppo_step_per_epoch
         self.prev_ppo_step = prev_ppo_step
+        self.fail_train_step = fail_train_step
 
     async def init_train_state(self):
         # num_train_epoches is informative only; total_ppo_step is what
@@ -133,6 +172,8 @@ class _FakeTrainGroup:
 
     async def train_step(self, epoch: int, ppo_step: int, dp_refs, extra_metrics=None):
         self.events.append(("train_step", epoch, ppo_step, tuple(dp_refs)))
+        if ppo_step == self.fail_train_step:
+            raise RuntimeError(f"train step {ppo_step} failed")
         return [{"policy/loss": 0.0}]
 
     async def save_checkpoint(self, step: int):
@@ -140,6 +181,12 @@ class _FakeTrainGroup:
 
     async def prepare_for_final_save(self):
         self.events.append(("prepare_for_final_save", ))
+
+    async def eval_logging(self, metrics, iteration, report_step=None, commit=False):
+        self.events.append(("eval_logging", iteration, report_step, commit, metrics))
+
+    async def finish_reporting(self):
+        self.events.append(("finish_reporting", ))
 
     async def log_memory(self, tag: str):
         pass
@@ -149,6 +196,10 @@ def _make_config(
     max_stale: int,
     save_interval: int = 100,
     placement_type: str = "disaggregated",
+    tq_enable: bool = False,
+    eval_interval: int = 0,
+    eval_before_train: bool = False,
+    disable_save_checkpoint: bool = False,
 ) -> Any:
     is_colocate = placement_type == "colocate"
     cfg_cls = RlConfig if placement_type == "partial_colocated" else SimpleNamespace
@@ -163,12 +214,18 @@ def _make_config(
             load_aware_sampler_dispatch_stagger_s=0,
             use_gen_rm_reward=placement_type == "partial_colocated",
             use_bt_rm_reward=False,
+            rollout_gbs=1,
+            rollout_mbs=1,
+            eval_interval=eval_interval,
+            eval_before_train=eval_before_train,
         ),
         debug=SimpleNamespace(
             trainer_return_ppo_step_metrics=False,
             skip_rollout_load_from_disk=False,
-            disable_save_checkpoint=False,
+            disable_save_checkpoint=disable_save_checkpoint,
         ),
+        data=SimpleNamespace(e2h=SimpleNamespace(enable=False)),
+        tq=SimpleNamespace(enable=tq_enable),
     )
     if placement_type == "partial_colocated":
         dc_policy = SimpleNamespace(nnodes=2, num_gpus_per_node=8)
@@ -203,21 +260,42 @@ async def _run_loop(
     save_interval: int = 100,
     prev_ppo_step: int = 0,
     placement_type: str = "disaggregated",
+    tq_enable: bool = False,
+    fail_train_step: int = -1,
+    completion_order: List[int] | None = None,
+    eval_interval: int = 0,
+    eval_before_train: bool = False,
+    disable_save_checkpoint: bool = False,
 ):
     events: List[Tuple] = []
     trainer = object.__new__(GrpoSingleCtrlTrainer)
-    trainer.train_group = _FakeTrainGroup(events, total_ppo_step, ppo_step_per_epoch, prev_ppo_step)
-    trainer.rollout_controller = _FakeRolloutController(events, ppo_step_per_epoch)
+    trainer.train_group = _FakeTrainGroup(
+        events,
+        total_ppo_step,
+        ppo_step_per_epoch,
+        prev_ppo_step,
+        fail_train_step,
+    )
+    trainer.rollout_controller = _FakeRolloutController(
+        events,
+        ppo_step_per_epoch,
+        completion_order,
+    )
     trainer.sampler_group = _FakeSamplerGroup(events)
     trainer._pipeline_ts = {}
     trainer.sampler_group = _FakeEngineGroup()
     trainer.gen_rm_group = None
+    trainer._pending_abort_metrics = {}
 
     await trainer._run_train_loop(
         _make_config(
             max_stale,
             save_interval=save_interval,
             placement_type=placement_type,
+            tq_enable=tq_enable,
+            eval_interval=eval_interval,
+            eval_before_train=eval_before_train,
+            disable_save_checkpoint=disable_save_checkpoint,
         )
     )
     return events, trainer.get_pipeline_stats()
@@ -247,7 +325,257 @@ def _update_events_non_initial(events):
 # ---- Tests ---------------------------------------------------------- #
 
 
+class FinalSavePreparationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_onload_follows_all_sampler_sleeps_and_barrier(self):
+        events = []
+
+        async def sleep(sampler_idx):
+            events.append(("sleep", sampler_idx))
+
+        actor = SimpleNamespace(
+            config=SimpleNamespace(placement_type="colocate"),
+            sampler_client=SimpleNamespace(num_samplers=2, sleep=sleep),
+            policy_engine=SimpleNamespace(
+                onload_model=lambda: events.append(("onload_model",)),
+                onload_optimizer=lambda: events.append(("onload_optimizer",)),
+            ),
+        )
+        with patch("gpatch_v4.actor.grpo_train_actor.logging_memory_usage_details"), patch(
+            "gpatch_v4.actor.grpo_train_actor.cpu_barrier",
+            side_effect=lambda: events.append(("barrier",)),
+        ), patch(
+            "gpatch_v4.actor.grpo_train_actor.clear_memory",
+            side_effect=lambda: events.append(("clear_memory",)),
+        ):
+            await GrpoTrainActor.prepare_for_final_save(actor)
+
+        self.assertEqual(events, [
+            ("sleep", 0),
+            ("sleep", 1),
+            ("barrier",),
+            ("clear_memory",),
+            ("onload_model",),
+            ("onload_optimizer",),
+        ])
+
+    async def test_sleep_failure_prevents_model_and_optimizer_onload(self):
+        actor = SimpleNamespace(
+            config=SimpleNamespace(placement_type="colocate"),
+            sampler_client=SimpleNamespace(
+                num_samplers=2,
+                sleep=AsyncMock(side_effect=[None, RuntimeError("sleep failed")]),
+            ),
+            policy_engine=SimpleNamespace(onload_model=Mock(), onload_optimizer=Mock()),
+        )
+        with patch("gpatch_v4.actor.grpo_train_actor.logging_memory_usage_details"), patch(
+            "gpatch_v4.actor.grpo_train_actor.cpu_barrier"
+        ) as barrier, patch("gpatch_v4.actor.grpo_train_actor.clear_memory") as clear_memory:
+            with self.assertRaisesRegex(RuntimeError, "sleep failed"):
+                await GrpoTrainActor.prepare_for_final_save(actor)
+
+        self.assertEqual(actor.sampler_client.sleep.await_count, 2)
+        barrier.assert_not_called()
+        clear_memory.assert_not_called()
+        actor.policy_engine.onload_model.assert_not_called()
+        actor.policy_engine.onload_optimizer.assert_not_called()
+
+
 class SlidingPrefetchLoopTest(unittest.IsolatedAsyncioTestCase):
+    async def test_eval_before_train_runs_after_weight_sync_before_cold_fire(self):
+        events, _ = await _run_loop(
+            max_stale=0,
+            total_ppo_step=1,
+            eval_interval=10,
+            eval_before_train=True,
+        )
+
+        initial_update = events.index(("update_weights", True, True))
+        eval_index = events.index(("eval", 0))
+        fire_index = events.index(("fire", 0, 0, 1))
+        assert initial_update < eval_index < fire_index
+        assert (
+            "eval_logging",
+            0,
+            0,
+            False,
+            {
+                "eval/reward": 0
+            },
+        ) in events
+
+    async def test_interval_eval_runs_at_regular_update_before_refire(self):
+        events, _ = await _run_loop(
+            max_stale=4,
+            total_ppo_step=7,
+            eval_interval=4,
+        )
+
+        train_three = events.index(("train_step", 0, 3, ("dp_ref_3", )))
+        wait_after_train = next(
+            index
+            for index, event in enumerate(events)
+            if index > train_three and event == ("wait_all_inflight", )
+        )
+        update_after_train = next(
+            index
+            for index, event in enumerate(events)
+            if index > wait_after_train and event == ("update_weights", True, True)
+        )
+        eval_index = events.index(("eval", 4))
+        fire_after_eval = next(
+            index for index, event in enumerate(events)
+            if index > eval_index and event[0] == "fire"
+        )
+        assert train_three < wait_after_train < update_after_train < eval_index < fire_after_eval
+        final_save = events.index(("save_data_source", 7))
+        final_eval_flush = len(events) - 2
+        assert events[final_eval_flush] == ("poll_eval", True)
+        assert final_save < final_eval_flush
+        assert events[-1] == ("finish_reporting", )
+        assert [event for event in events if event[0] == "poll_eval"] == (
+            [("poll_eval", False)] * 7 + [("poll_eval", True)]
+        )
+
+    async def test_eval_rejects_intervals_misaligned_with_weight_updates(self):
+        for interval in (1, 2, 3, 6):
+            with self.subTest(eval_interval=interval), patch.object(
+                _FakeTrainGroup, "update_weights", new_callable=AsyncMock
+            ) as update:
+                with self.assertRaisesRegex(AssertionError, "eval_interval .* must be a multiple"):
+                    await _run_loop(max_stale=4, total_ppo_step=9, eval_interval=interval)
+                update.assert_not_awaited()
+
+    async def test_save_rejects_intervals_misaligned_with_weight_updates(self):
+        for eval_interval in (0, 4):
+            for save_interval in (1, 2, 3, 6):
+                with self.subTest(eval_interval=eval_interval, save_interval=save_interval):
+                    with patch.object(
+                        _FakeTrainGroup, "update_weights", new_callable=AsyncMock
+                    ) as update:
+                        with self.assertRaisesRegex(
+                            AssertionError, "save_interval .* must be a multiple"
+                        ):
+                            await _run_loop(
+                                max_stale=4, total_ppo_step=9,
+                                eval_interval=eval_interval, save_interval=save_interval,
+                            )
+                        update.assert_not_awaited()
+
+    async def test_disabled_save_allows_misaligned_save_interval(self):
+        events, _ = await _run_loop(
+            max_stale=4, total_ppo_step=9, eval_interval=4,
+            save_interval=3, disable_save_checkpoint=True,
+        )
+        self.assertEqual(len(_train_step_events(events)), 9)
+        self.assertEqual(_save_events(events), [])
+
+    async def test_aligned_save_interval_saves_at_requested_steps(self):
+        for eval_interval in (0, 4):
+            with self.subTest(eval_interval=eval_interval):
+                events, _ = await _run_loop(
+                    max_stale=4, total_ppo_step=16,
+                    eval_interval=eval_interval, save_interval=8,
+                )
+                self.assertEqual(_save_events(events), [
+                    ("save_checkpoint", 8),
+                    ("save_checkpoint", 16),
+                ])
+
+    async def test_eval_rejects_misaligned_resume_step(self):
+        with patch.object(_FakeTrainGroup, "update_weights", new_callable=AsyncMock) as update:
+            with self.assertRaisesRegex(AssertionError, "resume step .* must align"):
+                await _run_loop(
+                    max_stale=4, total_ppo_step=9, prev_ppo_step=3, eval_interval=4,
+                )
+            update.assert_not_awaited()
+
+    async def test_aligned_eval_preserves_training_schedule(self):
+        schedule_events = {"train_step", "wait_all_inflight", "update_weights", "fire",
+                           "save_checkpoint", "save_data_source", "prepare_for_final_save"}
+        for max_stale in (0, 1, 2, 4):
+            window_size = max(max_stale, 1)
+            for prev_step in (0, window_size):
+                for multiplier in (1, 2, 3):
+                    interval = window_size * multiplier
+                    with self.subTest(staleness=max_stale, resume=prev_step, interval=interval):
+                        kwargs = dict(
+                            max_stale=max_stale,
+                            total_ppo_step=prev_step + 3 * window_size + 1,
+                            prev_ppo_step=prev_step,
+                        )
+                        baseline, _ = await _run_loop(**kwargs)
+                        evaluated, _ = await _run_loop(**kwargs, eval_interval=interval)
+                        self.assertEqual(
+                            [event for event in evaluated if event[0] in schedule_events],
+                            [event for event in baseline if event[0] in schedule_events],
+                        )
+                        self.assertEqual(
+                            [event[1] for event in evaluated if event[0] == "eval"],
+                            [step for step in range(prev_step + 1, kwargs["total_ppo_step"] + 1)
+                             if step % interval == 0],
+                        )
+
+    async def test_eval_disabled_allows_misaligned_resume(self):
+        events, _ = await _run_loop(
+            max_stale=4, total_ppo_step=9, prev_ppo_step=3, eval_interval=0,
+        )
+        self.assertEqual(len(_train_step_events(events)), 6)
+        self.assertFalse(any(event[0] == "eval" for event in events))
+
+    async def test_final_async_eval_is_committed_before_reporter_finish(self):
+        async def start_pending(controller, ppo_step):
+            controller.events.append(("eval", ppo_step))
+            return []
+
+        async def complete_pending(controller, force=False):
+            controller.events.append(("poll_eval", force))
+            if force:
+                return SimpleNamespace(source_step=2, metrics={"eval/reward": 0.5})
+            return None
+
+        with patch.object(_FakeRolloutController, "_evaluate", start_pending), patch.object(
+            _FakeRolloutController, "_poll_eval", complete_pending
+        ):
+            events, _ = await _run_loop(
+                max_stale=0,
+                total_ppo_step=2,
+                eval_interval=2,
+            )
+
+        assert events[-2:] == [
+            ("eval_logging", 2, 3, True, {"eval/reward": 0.5}),
+            ("finish_reporting", ),
+        ]
+
+    def test_finish_reporting_only_closes_last_rank_writer(self):
+        with patch(
+            "gpatch_v4.actor.grpo_train_actor.is_last_rank",
+            side_effect=[False, True],
+        ), patch(
+            "gpatch_v4.actor.grpo_train_actor.TrainReporterSingleton.finish"
+        ) as finish:
+            GrpoTrainActor.finish_reporting(None)
+            finish.assert_not_called()
+            GrpoTrainActor.finish_reporting(None)
+            finish.assert_called_once_with()
+
+    async def test_train_group_waits_for_reporter_finish(self):
+        events = []
+
+        class _FinishRemote:
+            def __init__(self, rank):
+                self.rank = rank
+
+            async def remote(self):
+                events.append(self.rank)
+
+        group = object.__new__(RayTrainGroup)
+        group._actor_handlers = [
+            SimpleNamespace(finish_reporting=_FinishRemote(rank)) for rank in range(2)
+        ]
+        await group.finish_reporting()
+        assert events == [0, 1]
+
     async def test_s_eq_0_sync_behavior(self):
         """s=0 degenerates to synchronous: fire(1) per step, wait+update
         after every train, tail save only.
@@ -273,6 +601,65 @@ class SlidingPrefetchLoopTest(unittest.IsolatedAsyncioTestCase):
 
         saves = _save_events(events)
         assert saves == [("save_checkpoint", 3)]  # tail save only
+
+    async def test_tq_rows_clear_only_after_successful_train(self):
+        cleared = []
+
+        async def record_clear(refs):
+            cleared.append(tuple(refs))
+
+        with patch(
+            "gpatch_v4.trainer.grpo_single_ctrl_trainer.TQInterface.async_clear_sample_refs",
+            new=record_clear,
+        ):
+            await _run_loop(
+                max_stale=2,
+                total_ppo_step=3,
+                tq_enable=True,
+                completion_order=[2, 0, 1],
+            )
+
+        assert cleared == [
+            ("tq_ref_2_kept", "tq_ref_2_filtered"),
+            ("tq_ref_0_kept", "tq_ref_0_filtered"),
+            ("tq_ref_1_kept", "tq_ref_1_filtered"),
+        ]
+
+    async def test_tq_rows_survive_failed_train_step(self):
+        cleared = []
+
+        async def record_clear(refs):
+            cleared.append(tuple(refs))
+
+        with patch(
+            "gpatch_v4.trainer.grpo_single_ctrl_trainer.TQInterface.async_clear_sample_refs",
+            new=record_clear,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "train step 1 failed"):
+                await _run_loop(
+                    max_stale=1,
+                    total_ppo_step=3,
+                    tq_enable=True,
+                    fail_train_step=1,
+                )
+
+        assert cleared == [(
+            "tq_ref_0_kept",
+            "tq_ref_0_filtered",
+        )]
+
+    async def test_tq_runtime_closes_only_driver_services(self):
+        events = []
+
+        trainer = object.__new__(GrpoSingleCtrlTrainer)
+
+        with patch(
+            "gpatch_v4.trainer.grpo_single_ctrl_trainer.close_tq_connector",
+            side_effect=lambda: events.append("driver_services"),
+        ):
+            await trainer._close_tq_runtime()
+
+        assert events == ["driver_services"]
 
     async def test_colocate_single_controller_is_s_eq_0_fire_collect_loop(self):
         """Colocate single-controller reuses the s=0 fire/collect schedule."""
@@ -394,7 +781,7 @@ class SlidingPrefetchLoopTest(unittest.IsolatedAsyncioTestCase):
         boundary matches the modulo → boundary save runs at ``total``.
         Tail save is skipped by the ``% != 0`` guard.
         """
-        events, _ = await _run_loop(max_stale=2, total_ppo_step=7, save_interval=7)
+        events, _ = await _run_loop(max_stale=1, total_ppo_step=7, save_interval=7)
         saves = _save_events(events)
         # Only step 7 matches save_interval=7; boundary fires, tail skipped.
         assert saves == [("save_checkpoint", 7)], f"got {saves}"
@@ -439,7 +826,10 @@ class SlidingPrefetchLoopTest(unittest.IsolatedAsyncioTestCase):
         """
         for s in (0, 1, 2, 3):
             for total in (1, 2, 3, 5, 6, 7, 10):
-                for si in (1, 2, 3, total):
+                window_size = max(s, 1)
+                for si in (window_size, 2 * window_size, 3 * window_size, total):
+                    if si % window_size != 0:
+                        continue
                     events, _ = await _run_loop(max_stale=s, total_ppo_step=total, save_interval=si)
                     save_steps = [e[1] for e in _save_events(events)]
                     final_saves = [step for step in save_steps if step == total]
@@ -587,6 +977,7 @@ class SlidingPrefetchLoopTest(unittest.IsolatedAsyncioTestCase):
                             total_ppo_step=total,
                             ppo_step_per_epoch=ppe,
                             prev_ppo_step=prev,
+                            save_interval=100 * max(s, 1),
                         )
 
     async def test_pipeline_timestamps_recorded(self):

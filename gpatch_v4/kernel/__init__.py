@@ -55,11 +55,34 @@ def linear_cross_entropy(
     )
 
 
+def linear_full_kl(
+    student_hidden_states: torch.Tensor,
+    teacher_hidden_states: torch.Tensor,
+    student_output_weight: torch.Tensor,
+    teacher_output_weight: torch.Tensor,
+    loss_mask: torch.Tensor,
+    temperature: float,
+    tp_group: typing.Optional[dist.ProcessGroup],
+    kl_alpha_mask: typing.Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return get_kernel("linear_full_kl")(
+        student_hidden_states,
+        teacher_hidden_states,
+        student_output_weight,
+        teacher_output_weight,
+        loss_mask,
+        temperature,
+        tp_group,
+        kl_alpha_mask,
+    )
+
+
 __all__ = [
     "get_cur_kernel_device_name",
     "get_kernel",
     "is_kernel_registered",
     "linear_cross_entropy",
+    "linear_full_kl",
     "list_kernels",
     "register_kernel",
     "set_linear_ce_backend",

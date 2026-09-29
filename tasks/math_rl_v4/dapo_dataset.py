@@ -15,6 +15,7 @@ import glob
 import os
 from typing import Any, Dict
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
@@ -22,6 +23,7 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 
 from gpatch_v4.configs.config import RlConfig
+from gpatch_v4.utils.e2h_sampler import E2HTaskSampler, remap_levels
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 
 
@@ -114,6 +116,21 @@ class DapoMathDataset(torch.utils.data.Dataset):
             raise ValueError(f"unknown split: {split}")
 
         self.dataset = _load_dataset_auto(data_dir, split)
+        self.level_ids = None
+        self._maybe_build_level_ids(split)
+
+    def _maybe_build_level_ids(self, split: str) -> None:
+        e2h = self.config.data.e2h
+        if not e2h.enable or split != "train":
+            return
+        key = e2h.level_key
+        if key not in self.dataset.column_names:
+            raise ValueError(
+                f"data.e2h.enable=True but column {key!r} is missing; "
+                f"columns={self.dataset.column_names}"
+            )
+        mapped, _unique_raw = remap_levels(np.asarray(self.dataset[key]))
+        self.level_ids = mapped
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -150,11 +167,14 @@ class DapoMathDataset(torch.utils.data.Dataset):
         except (ValueError, TypeError):
             gt_label = target
 
-        return {
+        sample = {
             "input_ids": input_ids,
             "prompt_len": prompt_len,
             "gt_label": gt_label,
         }
+        if self.level_ids is not None:
+            sample["level"] = int(self.level_ids[idx])
+        return sample
 
     def get_features(self) -> list:
         return self.dataset.column_names
@@ -191,11 +211,15 @@ def collate_fn(examples):
             # String labels are kept as-is; collation stores them in a list.
             gt_label.append(label)
 
-    return {
+    batched = {
         "prompt_token_ids": prompt_token_ids,
         "prompt_lens": prompt_lens,
         "gt_label": gt_label,
     }
+    if "level" in examples[0]:
+        batched["level"] = [example["level"] for example in examples]
+        batched["cache_keys"] = ["level"]
+    return batched
 
 
 def get_dataset_and_dataloader(
@@ -207,14 +231,36 @@ def get_dataset_and_dataloader(
 ):
     train_dataset = DapoMathDataset(config=config, tokenizer=tokenizer, split="train")
 
-    train_sampler = ResumableDistributedSampler(
-        train_dataset,
-        rank=dp_rank,
-        num_replicas=dp_size,
-        shuffle=config.data.shuffle,
-        seed=config.data.sampler_seed,
-        drop_last=True,
-    )
+    e2h = config.data.e2h
+    if e2h.enable:
+        if train_dataset.level_ids is None:
+            raise ValueError("data.e2h.enable=True but train dataset has no level_ids")
+        train_sampler = E2HTaskSampler(
+            levels=train_dataset.level_ids,
+            rollout_gbs=config.training.rollout_gbs,
+            rollout_mbs=config.training.rollout_mbs,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+            seed=config.data.sampler_seed,
+            num_epochs=config.training.num_train_epoches,
+            curriculum_schedule=e2h.curriculum_schedule,
+            mu_exp=e2h.mu_exp,
+            mu_end=e2h.mu_end,
+            hard_end_prob=e2h.hard_end_prob,
+            sigma=e2h.sigma,
+            min_prob=e2h.min_prob,
+            epoch_from_hard_cover=e2h.set_total_ppo_step_from_hard_cover,
+            total_ppo_step=config.training.total_ppo_step,
+        )
+    else:
+        train_sampler = ResumableDistributedSampler(
+            train_dataset,
+            rank=dp_rank,
+            num_replicas=dp_size,
+            shuffle=config.data.shuffle,
+            seed=config.data.sampler_seed,
+            drop_last=True,
+        )
     if meta_info is not None and "resume_step" in meta_info:
         resume_step = meta_info["resume_step"]
         rollout_gas = config.training.rollout_gbs // (dp_size * config.training.rollout_mbs)

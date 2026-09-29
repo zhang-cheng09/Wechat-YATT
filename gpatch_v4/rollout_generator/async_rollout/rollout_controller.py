@@ -1,16 +1,18 @@
 import asyncio
+import math
 import time
 import traceback
-from contextlib import asynccontextmanager
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 import ray
 from transformers import AutoTokenizer
 
-from gpatch_v4.client import BtRmClient, GenRmClient, SamplerClient
-from gpatch_v4.configs.config import RlConfig
+from gpatch_v4.client import BtRmClient, GenRmClient, SamplerClient, TeacherClient
+from gpatch_v4.configs.config import AgenticOnPolicyDistillConfig, RlConfig
 from gpatch_v4.core.dynamic_batch_reward_normalize import (
     prepare_sample_masks,
     reward_normalize,
@@ -21,8 +23,16 @@ from gpatch_v4.orches.data_source import DataSourceBase, get_data_source
 from gpatch_v4.orches.utils import build_actor_env_vars
 from gpatch_v4.rollout_generator.async_rollout.agent_loop_actor import (
     AgentLoopActor,
+    AgentLoopEvalResult,
     BaseAgentLoopActor,
+    pop_external_reward_timing_metrics,
 )
+from gpatch_v4.rollout_generator.async_rollout.mixin.prepare_result import (
+    PrepareResultMixin,
+)
+from gpatch_v4.transfer import init_tq_connector
+from gpatch_v4.transfer.tq_connector import KVBatchMeta
+from gpatch_v4.transfer.transfer_queue_interface import TQInterface
 from gpatch_v4.utils import (
     Envelope,
     GenerationAborted,
@@ -40,12 +50,51 @@ from gpatch_v4.utils.dynamic_batch_utils import (
     split_train_steps_by_dp,
     validate_dynamic_batch_samples,
 )
+from gpatch_v4.utils.e2h_sampler import E2HTaskSampler, collect_e2h_rollout_metrics
 from gpatch_v4.utils.filter_samplings import filter_rollout_samples
 from gpatch_v4.utils.placement import is_colocate, is_partial_colocated
 from gpatch_v4.utils.training_utils import expand_rollout_batches
 
 ORIGIN_PPO_STEP_KEY = "_origin_ppo_step"
 ORIGIN_MICROBATCH_IDX_KEY = "_origin_microbatch_idx"
+
+_CONTROLLER_TQ_RESTORE_FIELDS = (
+    "tokens",
+    "mask",
+    "sample_mask",
+    "prompt_lengths",
+    "sequence_lengths",
+    "prompt_idx",
+    "group_id",
+    "traj_id",
+    "rewards",
+    "per_token_rewards",
+    "token_weights",
+    "unique_id",
+    "parent_unique_id",
+)
+
+
+def _tq_fields_for_controller_restore(config) -> Optional[List[str]]:
+    if config.training.use_bt_rm_reward:
+        return None
+    fields: List[str] = []
+    seen = set()
+    configured_fields = list(config.tq.controller_restore_fields or [])
+    if config.training.dynamic_batch_train:
+        requested_fields = [
+            *_CONTROLLER_TQ_RESTORE_FIELDS,
+            *(config.training.metrics_report or []),
+            *configured_fields,
+        ]
+    else:
+        requested_fields = configured_fields
+    for field in requested_fields:
+        if field in seen:
+            continue
+        seen.add(field)
+        fields.append(field)
+    return fields
 
 
 @dataclass
@@ -88,24 +137,46 @@ class GenerateResult:
     Attributes
     ----------
     dp_refs : list
-        One ``ObjectRef`` per DP rank with that rank's rollout batches.
+        One entry per DP rank: a Ray envelope or a tuple of ``KVBatchMeta``.
     num_aborted_samples : int
         Aborted partial samples (already re-buffered by the controller).
     metrics : dict
         Rollout metrics from the controller, including scalars and
         ``*_histogram`` entries.
+    tq_clear_refs : list
+        Exact consumed TQ rows to clear after all train ranks finish.
     """
 
     dp_refs: List = field(default_factory=list)
     num_aborted_samples: int = 0
     metrics: Dict[str, Any] = field(default_factory=dict)
+    tq_clear_refs: List[KVBatchMeta] = field(default_factory=list)
+
+
+@dataclass
+class EvalResult:
+    source_step: int
+    metrics: Dict[str, Any]
+
+
+@dataclass
+class PendingEval:
+    source_step: int
+    rollout_batches: List[Dict[str, List[Any]]]
+    reward_tasks: List[Tuple[List[int], asyncio.Task]]
+
+
+@dataclass
+class _EvalSamplingContext:
+    cleaned_batches: List[Dict[str, Any]]
+    rollout_batches: Optional[List[Dict[str, List[Any]]]] = None
 
 
 @dataclass
 class QueuedRolloutBatch:
     """Controller-internal queue item with ordering metadata."""
 
-    rollout_batch: Dict[str, List[Any]]
+    rollout_batch: Dict[str, List[Any]] | KVBatchMeta
     ppo_step: int
     microbatch_idx: int
     sample_idx: int
@@ -142,7 +213,7 @@ def resolve_agent_loop_actor_cls(config: RlConfig) -> Type[BaseAgentLoopActor]:
     return cls
 
 
-class RolloutController:
+class RolloutController(PrepareResultMixin):
     """Single-controller for centralized rollout data management.
 
     当前只用在 async train 上面才用到。
@@ -166,6 +237,8 @@ class RolloutController:
     def __init__(self, config: RlConfig):
         self.config = config
         self.training_config = config.training
+        if config.tq.enable:
+            init_tq_connector(config.tq)
 
         # Will be populated in setup()
         self.bt_rm_client: Optional[BtRmClient] = None
@@ -195,6 +268,15 @@ class RolloutController:
         self._ready_queue: asyncio.Queue = asyncio.Queue()
         self._ordered_ready: Dict[int, Dict[int, List[QueuedRolloutBatch]]] = {}
         self._inflight_tasks: List[asyncio.Task] = []
+        self._stream_teacher_clients: Dict[str, TeacherClient] = {}
+        self._stream_teacher_queues = defaultdict(lambda: defaultdict(deque))
+        self._stream_teacher_flush_tasks: Dict[tuple, asyncio.Task] = {}
+        self._stream_teacher_flushing = set()
+        self._stream_teacher_futures = defaultdict(list)
+        self._stream_teacher_request_counter = 0
+        self._stream_teacher_active_steps = set()
+        self._stream_teacher_lifecycle_lock = asyncio.Lock()
+        self._stream_teacher_compute_locks: Dict[str, asyncio.Lock] = {}
 
         # Tail-batching state.  ``_tail_batching`` gates every code path below;
         # when it is False the controller behaves exactly as it did before
@@ -210,6 +292,8 @@ class RolloutController:
         self._last_inflight_done_at: Optional[float] = None
         self._fire_metrics: Dict[int, Dict[str, float]] = {}
         self._discard_hook: Optional[Callable[[List], None]] = None
+        self._pending_eval: Optional[PendingEval] = None
+        self.eval_external_reward = None
 
     async def setup(self, train_actors: Optional[List] = None):
         """Initialize data source, tokenizer, AgentLoopActor pool, and BT RM client.
@@ -255,6 +339,30 @@ class RolloutController:
         self.apply_sampling_rollout_attr = (
             ApplySamplingRolloutAttrFactory.get_apply_sampling(self.config)
         )
+        self.eval_apply_sampling_rollout_attr = (
+            ApplySamplingRolloutAttrFactory.get_apply_sampling(self.config)
+        )
+        eval_reward_info = self.config.external_reward.eval_reward_info
+        if self.training_config.eval_interval > 0 and self.training_config.use_external_reward:
+            external_reward_config = self.config.external_reward
+            reward_info = (
+                eval_reward_info
+                if eval_reward_info is not None else external_reward_config.reward_info
+            )
+            assert reward_info is not None, (
+                "external_reward.reward_info must be set when use_external_reward=True"
+            )
+            assert len(reward_info
+                      ) == 1, ("Currently only one evaluation external reward is supported")
+            rm_info = reward_info[0]
+            assert rm_info.reward_py_path is not None, "reward_py_path must be set"
+            assert rm_info.reward_cls_name is not None, "reward_cls_name must be set"
+            reward_cls = import_fn_from_path(rm_info.reward_py_path, rm_info.reward_cls_name)
+            assert hasattr(reward_cls, "calc_external_reward")
+            self.eval_external_reward = reward_cls(
+                config=self.config,
+                tokenizer=self.tokenizer,
+            )
         self.custom_reward_normalize = None
         if self.config.ppo.custom_reward_normalize_py_path is not None:
             self.custom_reward_normalize = import_fn_from_path(
@@ -279,6 +387,12 @@ class RolloutController:
                 self.training_config.custom_compute_rollout_metrics_path,
                 self.training_config.custom_compute_rollout_metrics_name,
             )
+        self.custom_compute_eval_metrics = self.custom_compute_rollout_metrics
+        if self.training_config.custom_compute_eval_metrics_path is not None:
+            self.custom_compute_eval_metrics = import_fn_from_path(
+                self.training_config.custom_compute_eval_metrics_path,
+                self.training_config.custom_compute_eval_metrics_name,
+            )
 
         if self.training_config.use_bt_rm_reward:
             self.bt_rm_client = BtRmClient(self.config, dp_rank=0, dp_size=1)
@@ -295,9 +409,41 @@ class RolloutController:
         self._num_microbatches = (
             self.training_config.rollout_gbs // self.training_config.rollout_mbs
         )
-        self._ppo_step_per_epoch = (self.data_source.dataloader_length // self._num_microbatches)
+        self._num_eval_microbatches = 0
+        self._total_eval_step = 0
+        self._eval_rollout_mbs = 0
+        if self.training_config.eval_interval > 0:
+            assert self.training_config.eval_rollout_gbs is not None, (
+                "eval_rollout_gbs must be set when eval_interval > 0"
+            )
+            assert self.training_config.eval_rollout_mbs is not None, (
+                "eval_rollout_mbs must be set when eval_interval > 0"
+            )
+            eval_gbs = self.training_config.eval_rollout_gbs
+            eval_mbs = self.training_config.eval_rollout_mbs
+            assert eval_gbs % eval_mbs == 0, (
+                f"eval_rollout_gbs ({eval_gbs}) must be divisible by "
+                f"eval_rollout_mbs ({eval_mbs})"
+            )
+            self._eval_rollout_mbs = eval_mbs
+            self._num_eval_microbatches = eval_gbs // eval_mbs
+            self._total_eval_step = (
+                self.data_source.eval_dataloader_length // self._num_eval_microbatches
+            )
+            assert self._total_eval_step > 0, (
+                f"eval dataloader length ({self.data_source.eval_dataloader_length}) "
+                f"must cover one eval step ({self._num_eval_microbatches} microbatches)"
+            )
+        train_sampler = self.data_source.train_sampler
+        if isinstance(train_sampler, E2HTaskSampler):
+            self._ppo_step_per_epoch = train_sampler.steps_per_epoch
+        else:
+            self._ppo_step_per_epoch = (
+                self.data_source.dataloader_length // self._num_microbatches
+            )
         self.rb_multiplier = self.training_config.rb_multiplier
 
+        await self._setup_streaming_teachers()
         await self.setup_agent_loop_actors()
 
         if self.use_colocate:
@@ -312,6 +458,234 @@ class RolloutController:
             f"rb_multiplier={self.rb_multiplier}, "
             f"num_agent_loop_workers={self.training_config.num_agent_loop_workers}"
         )
+
+    @property
+    def _streaming_teachers_enabled(self) -> bool:
+        return bool(
+            isinstance(self.config, AgenticOnPolicyDistillConfig) and
+            self.config.ppo.teacher_streaming_enabled
+        )
+
+    async def _setup_streaming_teachers(self):
+        if not self._streaming_teachers_enabled:
+            return
+        assert self.config.ppo.log_prob_top_k == 0
+        assert self.config.ppo.g_opd_compute_only_routed_teacher_logps, (
+            "teacher_streaming_enabled requires "
+            "g_opd_compute_only_routed_teacher_logps=true"
+        )
+        assert self.training_config.rollout_mbs == 1
+        assert self.config.ppo.teacher_streaming_batch_size > 0
+        assert self.config.ppo.teacher_streaming_timeout_ms >= 0
+
+        for teacher_name, teacher_config in self.config.teachers.items():
+            self._stream_teacher_clients[teacher_name] = TeacherClient(
+                self.config,
+                teacher_name=teacher_name,
+                teacher_config=teacher_config,
+                dp_rank=0,
+                dp_size=1,
+                standalone_lifecycle=True,
+            )
+            self._stream_teacher_compute_locks[teacher_name] = asyncio.Lock()
+        log(
+            "[RolloutController] streaming teachers enabled: "
+            f"teachers={list(self._stream_teacher_clients)}, "
+            f"batch_size={self.config.ppo.teacher_streaming_batch_size}, "
+            f"timeout_ms={self.config.ppo.teacher_streaming_timeout_ms}"
+        )
+
+    def _stream_teacher_name(self, rollout_batch: Dict[str, List[Any]]) -> str:
+        routing_field = self.config.ppo.g_opd_teacher_routing_field
+        values = rollout_batch.get(routing_field)
+        if values is None and len(self._stream_teacher_clients) == 1:
+            return next(iter(self._stream_teacher_clients))
+        assert values is not None, (f"streaming teacher routing requires {routing_field!r}")
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        teacher_names = {str(value) for value in values}
+        assert len(teacher_names
+                  ) == 1, (f"one teacher per rollout microbatch is required, got {values}")
+        teacher_name = next(iter(teacher_names))
+        assert teacher_name in self._stream_teacher_clients
+        return teacher_name
+
+    @staticmethod
+    def _lightweight_stream_teacher_batch(
+        rollout_batch: Dict[str, List[Any]]
+    ) -> Dict[str, List[Any]]:
+        assert "teacher_tokens" not in rollout_batch, (
+            "streaming teacher mode does not yet support distinct teacher_tokens"
+        )
+        teacher_keys = {
+            "tokens",
+            "prompt_lengths",
+            "sequence_lengths",
+            "position_ids",
+            "image_input_mask",
+            "vision_data",
+            "vision_grid_thw",
+            "input_features",
+            "feature_attention_mask",
+            "audio_feature",
+        }
+        return {key: rollout_batch[key] for key in teacher_keys if key in rollout_batch}
+
+    async def _submit_stream_teacher_request(
+        self,
+        rollout_batch: Dict[str, List[Any]],
+        ppo_step: int,
+        microbatch_idx: int,
+        sample_idx: int,
+        result_idx: int,
+    ):
+        if not self._streaming_teachers_enabled:
+            return
+        teacher_name = self._stream_teacher_name(rollout_batch)
+        request_id = (
+            f"{ppo_step}:{microbatch_idx}:{sample_idx}:{result_idx}:"
+            f"{self._stream_teacher_request_counter}"
+        )
+        self._stream_teacher_request_counter += 1
+        future = asyncio.get_running_loop().create_future()
+        self._stream_teacher_queues[teacher_name][ppo_step].append(
+            {
+                "request_id": request_id,
+                "batched_data": self._lightweight_stream_teacher_batch(rollout_batch),
+                "future": future,
+                "rollout_batch": rollout_batch,
+            }
+        )
+        self._stream_teacher_futures[ppo_step].append(future)
+        rollout_batch["_stream_teacher_name"] = [teacher_name]
+        rollout_batch["_stream_teacher_request_id"] = [request_id]
+
+        queue_key = (teacher_name, ppo_step)
+        client = self._stream_teacher_clients[teacher_name]
+        async with self._stream_teacher_lifecycle_lock:
+            if ppo_step not in self._stream_teacher_active_steps:
+                if not self._stream_teacher_active_steps:
+                    await asyncio.gather(
+                        *[
+                            teacher_client.wake_up(0)
+                            for teacher_client in self._stream_teacher_clients.values()
+                        ]
+                    )
+                self._stream_teacher_active_steps.add(ppo_step)
+        full_batch = self.config.ppo.teacher_streaming_batch_size * client.svr_cluster
+        if len(self._stream_teacher_queues[teacher_name][ppo_step]) >= full_batch:
+            self._schedule_stream_teacher_flush(teacher_name, ppo_step, 0.0)
+        elif queue_key not in self._stream_teacher_flush_tasks:
+            self._schedule_stream_teacher_flush(
+                teacher_name,
+                ppo_step,
+                self.config.ppo.teacher_streaming_timeout_ms / 1000.0,
+            )
+
+    def _schedule_stream_teacher_flush(self, teacher_name: str, ppo_step: int, delay_s: float):
+        queue_key = (teacher_name, ppo_step)
+        old_task = self._stream_teacher_flush_tasks.get(queue_key)
+        if old_task is not None and not old_task.done():
+            if delay_s > 0 or queue_key in self._stream_teacher_flushing:
+                return
+            old_task.cancel()
+
+        async def delayed_flush():
+            try:
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
+                self._stream_teacher_flushing.add(queue_key)
+                await self._flush_stream_teacher_queue(teacher_name, ppo_step)
+            finally:
+                self._stream_teacher_flushing.discard(queue_key)
+
+        task = asyncio.create_task(delayed_flush())
+        self._stream_teacher_flush_tasks[queue_key] = task
+
+        def clear_task(done_task):
+            if self._stream_teacher_flush_tasks.get(queue_key) is done_task:
+                self._stream_teacher_flush_tasks.pop(queue_key, None)
+
+        task.add_done_callback(clear_task)
+
+    async def _flush_stream_teacher_queue(self, teacher_name: str, ppo_step: int):
+        # Serialize endpoint-wide forwards for one teacher so every EP rank
+        # observes the same collective ordering across prefetched PPO steps.
+        async with self._stream_teacher_compute_locks[teacher_name]:
+            queue = self._stream_teacher_queues[teacher_name][ppo_step]
+            client = self._stream_teacher_clients[teacher_name]
+            max_real = self.config.ppo.teacher_streaming_batch_size * client.svr_cluster
+
+            while queue:
+                entries = [queue.popleft() for _ in range(min(len(queue), max_real))]
+                per_endpoint = math.ceil(len(entries) / client.svr_cluster)
+                endpoint_entries = [[] for _ in range(client.svr_cluster)]
+                for index, entry in enumerate(entries):
+                    endpoint_entries[index % client.svr_cluster].append(entry)
+
+                template = entries[0]
+                issue_cos = []
+                padding_index = 0
+                for endpoint_idx, endpoint_queue in enumerate(endpoint_entries):
+                    for entry in endpoint_queue:
+                        entry["rollout_batch"]["_stream_teacher_endpoint_idx"] = [endpoint_idx]
+                        issue_cos.append(
+                            client.stream_issue_calc_logps(
+                                entry["batched_data"], entry["request_id"], endpoint_idx
+                            )
+                        )
+                    for _ in range(per_endpoint - len(endpoint_queue)):
+                        padding_index += 1
+                        issue_cos.append(
+                            client.stream_issue_calc_logps(
+                                template["batched_data"],
+                                f"padding:{teacher_name}:{ppo_step}:{padding_index}",
+                                endpoint_idx,
+                                is_padding=True,
+                            )
+                        )
+                try:
+                    await asyncio.gather(*issue_cos)
+                    await asyncio.gather(
+                        *[
+                            client.stream_compute_pending(endpoint_idx)
+                            for endpoint_idx in range(client.svr_cluster)
+                        ]
+                    )
+                    for entry in entries:
+                        if not entry["future"].done():
+                            entry["future"].set_result(True)
+                except BaseException as exc:
+                    for entry in entries:
+                        if not entry["future"].done():
+                            entry["future"].set_exception(exc)
+                    while queue:
+                        entry = queue.popleft()
+                        if not entry["future"].done():
+                            entry["future"].set_exception(exc)
+                    raise
+
+            self._stream_teacher_queues[teacher_name].pop(ppo_step, None)
+
+    async def _finish_stream_teacher_step(self, ppo_step: int):
+        if not self._streaming_teachers_enabled:
+            return
+        for teacher_name in sorted(self._stream_teacher_clients):
+            queue_key = (teacher_name, ppo_step)
+            task = self._stream_teacher_flush_tasks.pop(queue_key, None)
+            if task is not None and not task.done():
+                await task
+            if self._stream_teacher_queues[teacher_name].get(ppo_step):
+                await self._flush_stream_teacher_queue(teacher_name, ppo_step)
+        futures = self._stream_teacher_futures.pop(ppo_step, [])
+        if futures:
+            await asyncio.gather(*futures)
+        async with self._stream_teacher_lifecycle_lock:
+            self._stream_teacher_active_steps.discard(ppo_step)
+            if not self._stream_teacher_active_steps:
+                await asyncio.gather(
+                    *[client.sleep(0) for client in self._stream_teacher_clients.values()]
+                )
 
     @asynccontextmanager
     async def partial_colocated_rollout(self, ppo_step: int):
@@ -373,11 +747,325 @@ class RolloutController:
         """
         ppo_step_per_epoch = self._ppo_step_per_epoch
         total_ppo_step = ppo_step_per_epoch * self.training_config.num_train_epoches
+        self.training_config.total_ppo_step = total_ppo_step
+        self.training_config.ppo_step_per_epoch = ppo_step_per_epoch
         return {
             "ppo_step_per_epoch": ppo_step_per_epoch,
             "total_ppo_step": total_ppo_step,
             "num_train_epoches": self.training_config.num_train_epoches,
         }
+
+    def _read_eval_batches(
+        self,
+        num_microbatches: int,
+        ppo_step: int,
+        eval_step: int,
+    ) -> List[Dict[str, Any]]:
+        batches = self.data_source.get_eval_batch(num_microbatches)
+        prompt_idx = eval_step * num_microbatches * self._eval_rollout_mbs
+        for rbi, batch in enumerate(batches):
+            first_key = next(iter(batch))
+            batch_size = len(batch[first_key])
+            if "unique_id" not in batch:
+                batch["unique_id"] = [
+                    f"eval_step_{ppo_step}_rbi_{rbi}_batch_{index}_{time.time_ns()}"
+                    for index in range(batch_size)
+                ]
+            batch["prompt_idx"] = list(range(prompt_idx, prompt_idx + batch_size))
+            prompt_idx += batch_size
+            cache_keys = list(batch.get("cache_keys", []))
+            if "prompt_idx" not in cache_keys:
+                cache_keys.append("prompt_idx")
+            batch["cache_keys"] = cache_keys
+        return batches
+
+    @staticmethod
+    def _merge_eval_agent_results(
+        results: Sequence[AgentLoopEvalResult],
+    ) -> tuple[List[Dict[str, List[Any]]], List[int]]:
+        rollout_batches = []
+        deferred_indices = []
+        for result in results:
+            if not isinstance(result, AgentLoopEvalResult):
+                raise TypeError(
+                    "agent_loop_actor_cls must return AgentLoopEvalResult when is_eval=True, "
+                    f"got {type(result).__name__}"
+                )
+            offset = len(rollout_batches)
+            rollout_batches.extend(result.rollout_batches)
+            deferred_indices.extend(
+                offset + index for index in result.deferred_external_reward_indices
+            )
+        return rollout_batches, deferred_indices
+
+    @contextmanager
+    def _eval_sampling_context(
+        self,
+        batches: List[Dict[str, Any]],
+    ):
+        context = _EvalSamplingContext(
+            cleaned_batches=[
+                self.eval_apply_sampling_rollout_attr.remove_rollout_attr_before_sampling(batch)
+                for batch in batches
+            ]
+        )
+        try:
+            yield context
+        finally:
+            if context.rollout_batches is not None:
+                handler = self.eval_apply_sampling_rollout_attr
+                context.rollout_batches = handler.add_back_rollout_attr_after_sampling(
+                    context.rollout_batches
+                )
+
+    async def _dispatch_eval_step(
+        self,
+        batches: List[Dict[str, Any]],
+        ppo_step: int,
+        eval_step: int,
+    ) -> tuple[List[Dict[str, List[Any]]], List[int]]:
+        with self._eval_sampling_context(batches) as context:
+            context.rollout_batches, deferred_indices = (
+                await self._dispatch_cleaned_eval_step(
+                    context.cleaned_batches,
+                    ppo_step,
+                    eval_step,
+                )
+            )
+        assert context.rollout_batches is not None
+        return context.rollout_batches, deferred_indices
+
+    async def _dispatch_cleaned_eval_step(
+        self,
+        cleaned_batches: List[Dict[str, Any]],
+        ppo_step: int,
+        eval_step: int,
+    ) -> tuple[List[Dict[str, List[Any]]], List[int]]:
+        sample_idx_base = eval_step * self._num_eval_microbatches
+        per_agent_batches, per_agent_indices, per_agent_microbatch_indices = (
+            self.partition_batches(cleaned_batches, sample_idx_base)
+        )
+        if self.use_colocate:
+            results = await asyncio.gather(
+                *[
+                    agent.agent_loop.remote(
+                        batches,
+                        ppo_step,
+                        microbatch_indices,
+                        sample_indices,
+                        use_colocate=True,
+                        is_eval=True,
+                    ) for agent, batches, sample_indices, microbatch_indices in zip(
+                        self.agent_loop_actors,
+                        per_agent_batches,
+                        per_agent_indices,
+                        per_agent_microbatch_indices,
+                        strict=True,
+                    )
+                ]
+            )
+        else:
+            dispatch_items = []
+            for actor_idx, (
+                actor_batches,
+                sample_indices,
+                microbatch_indices,
+            ) in enumerate(
+                zip(
+                    per_agent_batches,
+                    per_agent_indices,
+                    per_agent_microbatch_indices,
+                    strict=True,
+                )
+            ):
+                for batch, sample_idx, microbatch_idx in zip(
+                    actor_batches,
+                    sample_indices,
+                    microbatch_indices,
+                    strict=True,
+                ):
+                    dispatch_items.append((microbatch_idx, actor_idx, batch, sample_idx))
+
+            async def dispatch_items_to_agents():
+                return await asyncio.gather(
+                    *[
+                        self.agent_loop_actors[actor_idx].agent_loop.remote(
+                            batch,
+                            ppo_step,
+                            microbatch_idx,
+                            sample_idx,
+                            is_eval=True,
+                        )
+                        for microbatch_idx, actor_idx, batch, sample_idx in sorted(dispatch_items)
+                    ]
+                )
+
+            if self.is_partial_colocated:
+                async with self.partial_colocated_rollout(ppo_step):
+                    results = await dispatch_items_to_agents()
+            else:
+                results = await dispatch_items_to_agents()
+        return self._merge_eval_agent_results(results)
+
+    async def _start_async_eval_reward(
+        self,
+        rollout_batches: List[Dict[str, List[Any]]],
+        indices: List[int],
+        ppo_step: int,
+    ) -> asyncio.Task:
+        selected = [rollout_batches[index] for index in indices]
+        started = asyncio.Event()
+        task = asyncio.create_task(
+            self.eval_external_reward.calc_external_reward(
+                selected,
+                ppo_step,
+                is_eval=True,
+                _started_event=started,
+            )
+        )
+        await started.wait()
+        return task
+
+    def _compute_eval_metrics(
+        self,
+        rollout_batches: List[Dict[str, List[Any]]],
+    ) -> Dict[str, Any]:
+        samples = expand_rollout_batches(rollout_batches)
+        metrics = compute_rollout_metrics(
+            self.config,
+            samples,
+            self.training_config.metrics_report or [],
+            custom_metrics_fn=self.custom_compute_eval_metrics,
+        )
+        return {f"eval-{key}": value for key, value in metrics.items()}
+
+    async def _finalize_pending_eval(self) -> EvalResult:
+        pending = self._pending_eval
+        assert pending is not None
+        tasks = [task for _, task in pending.reward_tasks]
+        try:
+            task_updates = await asyncio.gather(*tasks)
+            for (indices, _), updates in zip(
+                pending.reward_tasks,
+                task_updates,
+                strict=True,
+            ):
+                assert len(updates) == len(indices), (
+                    f"eval external reward returned {len(updates)} updates "
+                    f"for {len(indices)} batches"
+                )
+                for index, update in zip(indices, updates, strict=True):
+                    pending.rollout_batches[index].update(update)
+            metrics = self._compute_eval_metrics(pending.rollout_batches)
+            if tasks:
+                log(
+                    f"[GRPO EVAL] external_reward complete "
+                    f"source_step={pending.source_step} reward_tasks={len(tasks)}"
+                )
+            return EvalResult(source_step=pending.source_step, metrics=metrics)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            self.eval_apply_sampling_rollout_attr.clear_data_cache()
+            self._pending_eval = None
+
+    def pending_eval_ready(self) -> bool:
+        if self._pending_eval is None:
+            return False
+        return all(task.done() for _, task in self._pending_eval.reward_tasks)
+
+    async def poll_eval(self, force: bool = False) -> Optional[EvalResult]:
+        if self._pending_eval is None:
+            return None
+        if not force and not self.pending_eval_ready():
+            return None
+        return await self._finalize_pending_eval()
+
+    async def evaluate(self, ppo_step: int) -> List[EvalResult]:
+        assert self.training_config.eval_interval > 0
+        completed = []
+        previous = await self.poll_eval(force=True)
+        if previous is not None:
+            completed.append(previous)
+
+        self.data_source.reset_eval()
+        all_rollout_batches = []
+        reward_tasks = []
+        async_external_reward = (
+            self.eval_external_reward is not None and self.config.external_reward.async_eval
+        )
+        try:
+            for eval_step in range(self._total_eval_step):
+                batches = self._read_eval_batches(
+                    self._num_eval_microbatches,
+                    ppo_step,
+                    eval_step,
+                )
+                rollout_batches, deferred_indices = await self._dispatch_eval_step(
+                    batches,
+                    ppo_step,
+                    eval_step,
+                )
+                assert check_rollout_batches(rollout_batches)
+                if self.training_config.use_bt_rm_reward:
+                    rollout_batches = await self._bt_rm_reward(
+                        rollout_batches,
+                        len(rollout_batches),
+                        ppo_step,
+                        sample_idx_base=eval_step * self._num_eval_microbatches,
+                        sampling_repeat_n=self.training_config.eval_sampling_repeat_n,
+                    )
+
+                offset = len(all_rollout_batches)
+                all_rollout_batches.extend(rollout_batches)
+                global_indices = [offset + index for index in deferred_indices]
+                if not global_indices:
+                    continue
+                assert self.eval_external_reward is not None
+                if async_external_reward:
+                    task = await self._start_async_eval_reward(
+                        all_rollout_batches,
+                        global_indices,
+                        ppo_step,
+                    )
+                    reward_tasks.append((global_indices, task))
+                else:
+                    selected = [all_rollout_batches[index] for index in global_indices]
+                    updates = await self.eval_external_reward.calc_external_reward(
+                        selected,
+                        ppo_step,
+                        is_eval=True,
+                    )
+                    assert len(updates) == len(global_indices)
+                    for index, update in zip(global_indices, updates, strict=True):
+                        all_rollout_batches[index].update(update)
+        except BaseException:
+            tasks = [task for _, task in reward_tasks]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.eval_apply_sampling_rollout_attr.clear_data_cache()
+            raise
+
+        self._pending_eval = PendingEval(
+            source_step=ppo_step,
+            rollout_batches=all_rollout_batches,
+            reward_tasks=reward_tasks,
+        )
+        if async_external_reward and reward_tasks:
+            log(
+                f"[GRPO EVAL] external_reward pending "
+                f"source_step={ppo_step} reward_tasks={len(reward_tasks)} "
+                f"rollout_batches={len(all_rollout_batches)}"
+            )
+            return completed
+        completed.append(await self._finalize_pending_eval())
+        return completed
 
     # ------------------------------------------------------------------ #
     #  aborting generation and recycling unused prompts
@@ -630,11 +1318,34 @@ class RolloutController:
 
     async def finalize_rollout_batches(
         self,
-        rbs: List[Dict[str, List[Any]]],
+        rbs: List[Dict[str, List[Any]] | KVBatchMeta],
         ppo_step: int,
         num_expected: int,
     ) -> GenerateResult:
         """Run shared post-rollout steps and split data by DP rank."""
+        tq_metas = None
+        tq_original_state = None
+        tq_clear_refs = None
+        if self.config.tq.enable:
+            assert all(isinstance(rb, KVBatchMeta) for rb in rbs)
+            tq_metas = list(rbs)
+            tq_clear_refs = list(tq_metas)
+            # Materialize sample dicts from TQ metas for post-rollout processing.
+            rbs = await TQInterface.async_restore_kv_batches(
+                tq_metas,
+                fields=_tq_fields_for_controller_restore(self.config),
+            )
+            # Snapshot post-restore tensors so later UPDATE can detect dirty columns.
+            tq_original_state = TQInterface.capture_tq_sample_tensor_state(
+                expand_rollout_batches(rbs),
+                tq_metas,
+            )
+        else:
+            assert all(isinstance(rb, dict) for rb in rbs)
+
+        # Timing stamps live on materialized sample dicts (not KVBatchMeta).
+        timing_metrics = pop_external_reward_timing_metrics(rbs)
+
         if self.training_config.use_bt_rm_reward:
             rbs = await self._bt_rm_reward(rbs, num_expected, ppo_step)
 
@@ -644,126 +1355,33 @@ class RolloutController:
         if self.training_config.rollout_ordered_collection:
             self._validate_and_drop_rollout_origin_attrs(rbs, ppo_step, num_expected)
         self.apply_sampling_rollout_attr.clear_data_cache()
+        e2h_metrics = {}
+        train_sampler = self.data_source.train_sampler
+        if isinstance(train_sampler, E2HTaskSampler):
+            e2h_metrics = collect_e2h_rollout_metrics(train_sampler, ppo_step, rbs)
+
         if self.training_config.dynamic_batch_train:
-            result = self._prepare_variable_sample_count_train_data(rbs)
+            result = await self._prepare_variable_sample_count_train_data(
+                rbs,
+                tq_metas,
+                tq_original_state,
+                tq_clear_refs,
+            )
         else:
-            result = GenerateResult(dp_refs=self._split_train_data_by_dp(rbs))
+            result = await self._prepare_fixed_batch_train_data(
+                rbs,
+                tq_metas,
+                tq_original_state,
+                tq_clear_refs,
+            )
         fire_metrics = self._fire_metrics.pop(ppo_step, None)
         if fire_metrics is not None:
             result.metrics.update(fire_metrics)
+        if timing_metrics:
+            result.metrics.update(timing_metrics)
+        if e2h_metrics:
+            result.metrics.update(e2h_metrics)
         return result
-
-    def _prepare_variable_sample_count_train_data(
-        self,
-        rbs: List[Dict[str, List[Any]]],
-    ) -> GenerateResult:
-        """Prepare variable-sample-count train data for distributed training.
-
-        Here, ``dynamic`` means that sample-level filtering and conversion may
-        leave each train step with a different number and structure of samples.
-        The controller must therefore plan train-step boundaries from the full
-        rollout view and partition the actual post-processed samples, instead
-        of deriving fixed batches from nominal GBS. This is independent of
-        dynamic microbatch sizing and Dynamic Context Parallel; Dynamic CP is
-        an optional downstream mechanism for routing variable-length sequences.
-
-        The preparation pipeline performs the following operations:
-
-        1. Expand each batched dictionary into per-sample dictionaries and
-           assign complete prompts to train steps.
-        2. Build sample masks, filter samples, normalize rewards, and compute
-           rollout metrics.
-        3. Convert the samples to the policy training format and validate the
-           resulting fields and train-step grouping.
-        4. Balance every train step by token count across DP ranks and store
-           each rank's nested train-step data in the Ray object store.
-
-        Parameters
-        ----------
-        rbs : List[Dict[str, List[Any]]]
-            Collected rollout batches. Each element is a batched dictionary
-            that maps a field name to an aligned list of field values. Position
-            ``i`` across all fields represents one rollout sample. Expanding
-            the outer list produces ``List[Dict[str, Any]]``.
-
-        Returns
-        -------
-        GenerateResult
-            Prepared training data and metrics. ``dp_refs`` has length
-            ``self._dp_size``. Element ``dp_refs[rank]`` is an ``Envelope``
-            whose ``inner_data`` is a Ray ``ObjectRef`` resolving to
-            ``List[List[Dict[str, Any]]]``: the outer list is ordered by train
-            step, and each inner list contains the converted samples assigned
-            to that DP rank for the step. ``metrics`` maps metric names to
-            scalars and ``*_histogram`` values computed from the filtered samples.
-
-        Raises
-        ------
-        AssertionError
-            If the rollout or training configuration cannot form complete
-            train steps, filtering or conversion removes an entire train step,
-            converted samples violate dynamic-batch invariants, or a train
-            step cannot be partitioned across DP ranks.
-        """
-        training_config = self.training_config
-        samples = expand_rollout_batches(rbs)
-        # 1. stamp _train_step_id by prompt_idx
-        samples = assign_train_steps(samples, training_config)
-        expected_train_step_ids = {sample[TRAIN_STEP_ID_KEY] for sample in samples}
-        # 2. prepare train masks
-        prepare_sample_masks(samples)
-        # 3. filter samples
-        samples = filter_rollout_samples(
-            self.config,
-            samples,
-            custom_filter_fn=self.custom_filter_samples,
-        )
-        # 4. normalize rewards
-        pre_advantage_metrics = reward_normalize(
-            self.config,
-            samples,
-            custom_reward_normalize_fn=self.custom_reward_normalize,
-        )
-        requires_normalized_rewards = uses_group_reward_normalization(self.config)
-        assert {sample[TRAIN_STEP_ID_KEY]
-                for sample in samples
-               } == expected_train_step_ids, ("filter removed an entire train step")
-        # 5. compute rollout metrics
-        metrics = compute_rollout_metrics(
-            self.config,
-            samples,
-            training_config.metrics_report or [],
-            custom_metrics_fn=self.custom_compute_rollout_metrics,
-        )
-        metrics.update(pre_advantage_metrics)
-        # 6. convert samples to train data
-        samples = convert_samples_to_train_data(
-            self.config,
-            samples,
-            custom_convert_fn=self.custom_convert_samples_to_train_data,
-        )
-        validate_dynamic_batch_samples(
-            samples,
-            require_normalized_rewards=requires_normalized_rewards,
-        )
-        assert {
-            sample[TRAIN_STEP_ID_KEY]
-            for sample in samples
-        } == expected_train_step_ids, ("custom train-data conversion removed an entire train step")
-        # 7. re-group by _train_step_id and balance each step by DP rank
-        dp_partitions = split_train_steps_by_dp(
-            samples,
-            self._dp_size,
-            training_config.train_mbs,
-            self.config.policy.dist_config.dynamic_context_parallel,
-        )
-        refs = [Envelope(ray.put(partition)) for partition in dp_partitions]
-        num_train_steps = len(dp_partitions[0]) if dp_partitions else 0
-        log(
-            f"[RolloutController] split {len(samples)} samples in "
-            f"{num_train_steps} train steps across {self._dp_size} DP ranks"
-        )
-        return GenerateResult(dp_refs=refs, metrics=metrics)
 
     # ------------------------------------------------------------------ #
     #  Streaming generation pipeline
@@ -994,7 +1612,14 @@ class RolloutController:
             rb_list = await ref
             if not self._try_accept_completed_microbatch(rb_list, ppo_step, microbatch_idx):
                 return
-            for rb in rb_list:
+            for result_idx, rb in enumerate(rb_list):
+                await self._submit_stream_teacher_request(
+                    rb,
+                    ppo_step,
+                    microbatch_idx,
+                    sample_idx,
+                    result_idx,
+                )
                 await self._ready_queue.put(
                     QueuedRolloutBatch(
                         rollout_batch=rb,
@@ -1067,7 +1692,14 @@ class RolloutController:
                 for sample_idx, microbatch_idx in zip(
                     sample_indices, microbatch_indices, strict=True
                 ):
-                    for _ in range(self.rb_multiplier):
+                    for result_offset in range(self.rb_multiplier):
+                        await self._submit_stream_teacher_request(
+                            agent_rbs[result_idx],
+                            ppo_step,
+                            microbatch_idx,
+                            sample_idx,
+                            result_offset,
+                        )
                         await self._ready_queue.put(
                             QueuedRolloutBatch(
                                 rollout_batch=agent_rbs[result_idx],
@@ -1114,6 +1746,7 @@ class RolloutController:
         else:
             rbs = await self.collect_first_finished_rollout_batches(num_collect)
 
+        await self._finish_stream_teacher_step(ppo_step)
         result = await self.finalize_rollout_batches(rbs, ppo_step, num_collect)
         self._sample_idx += num_mb
         return result
@@ -1257,6 +1890,8 @@ class RolloutController:
         rbs: List[Dict[str, List[Any]]],
         num_microbatches: int,
         ppo_step: int,
+        sample_idx_base: Optional[int] = None,
+        sampling_repeat_n: Optional[int] = None,
     ) -> List[Dict[str, List[Any]]]:
         """Call BT reward model(s) for a batch of microbatches.
 
@@ -1275,6 +1910,10 @@ class RolloutController:
         assert len(rbs) == num_microbatches
         num_rms = self.bt_rm_client.num_rms
         assert num_rms == 1, f"num_rms should be 1, but got {num_rms}"
+        if sample_idx_base is None:
+            sample_idx_base = self._sample_idx
+        if sampling_repeat_n is None:
+            sampling_repeat_n = self.training_config.sampling_repeat_n
 
         for rm_idx in range(num_rms):
             await self.bt_rm_client.mark_ppo_step_begin(rm_idx, ppo_step)
@@ -1282,17 +1921,16 @@ class RolloutController:
             issue_cos = []
 
             for rbi, rb in enumerate(rbs):
-                sidx = self._sample_idx + rbi
+                sidx = sample_idx_base + rbi
                 co = self.bt_rm_client.issue_bt_rm(rb, rm_idx, ppo_step, sidx)
                 issue_cos.append(co)
             await asyncio.gather(*issue_cos)
 
             # Collect all
             result_cos = []
-            sampling_repeat_n = self.training_config.sampling_repeat_n
 
             for rbi, rb in enumerate(rbs):
-                sidx = self._sample_idx + rbi
+                sidx = sample_idx_base + rbi
                 co = self.bt_rm_client.get_bt_rm_result(
                     rm_idx, ppo_step, sidx, sampling_repeat_n=sampling_repeat_n
                 )

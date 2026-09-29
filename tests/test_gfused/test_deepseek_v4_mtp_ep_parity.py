@@ -47,7 +47,7 @@ NUM_GPUS = 32
 EP_SIZE_BASELINE = 1   # pure FSDP
 EP_SIZE_TEST = 4       # EP + FSDP
 NUM_BACKBONE_LAYERS = 4
-SEQ_LEN = 128
+SEQ_LEN = 256
 
 
 def _truncate_config(config: DeepseekV4Config) -> DeepseekV4Config:

@@ -7,6 +7,8 @@ Gcore 当前支持以下 rollout sampling 策略：
 - partial rollout
 - oversampling
 
+Prompt 课程（generate 之前按难度抽题）见 [E2H Curriculum Sampler](e2h.md)。
+
 ## dynamic sampling
 
 V4 实现见 [Dynamic Sampling V4](dynamic_sampling.md)。

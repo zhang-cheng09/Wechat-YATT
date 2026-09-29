@@ -14,6 +14,8 @@ so it does **not** use ``BroadcastUtils`` or ``is_mp_and_cp_head``.
 
 import asyncio
 import json
+import logging
+import random
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -22,6 +24,9 @@ from tasks.math_rl_v4.bt_reward_dapo import math_accuracy_reward, math_format_re
 
 from gpatch_v4.reward.base_external_reward import BaseExternalReward
 from gpatch_v4.utils.training_utils import list_of_tensor_to_list
+
+_EVAL_DELAY_RANDOM_MIN_S = 50.0
+_EVAL_DELAY_RANDOM_MAX_S = 200.0
 
 
 def _resolve_gt_answer(label: Any) -> str:
@@ -46,10 +51,12 @@ class DapoMathRuleExternalReward(BaseExternalReward):
     Parameters
     ----------
     config : RlConfig or None
-        Top-level RL config (unused here, kept for interface compat).
+        Supplies the optional evaluation reward delay.
     tokenizer : PreTrainedTokenizer or None
         Actor tokenizer used to decode generated tokens.
     """
+
+    supports_concurrent_calls = True
 
     def __init__(self, config=None, tokenizer=None):
         super().__init__(config=config, tokenizer=tokenizer)
@@ -71,6 +78,35 @@ class DapoMathRuleExternalReward(BaseExternalReward):
         if _started_event is not None:
             _started_event.set()
 
+        delay_s = 0.0
+        eval_delay_s = self.config.external_reward.eval_delay_s if self.config else 0.0
+        if is_eval and eval_delay_s != 0:
+            if eval_delay_s == -1:
+                delay_s = random.uniform(
+                    _EVAL_DELAY_RANDOM_MIN_S, _EVAL_DELAY_RANDOM_MAX_S
+                )
+                logging.info("[external_reward] eval random delay=%.3fs", delay_s)
+            elif eval_delay_s > 0:
+                delay_s = float(eval_delay_s)
+            else:
+                raise ValueError(
+                    f"external_reward.eval_delay_s must be >= 0 or -1, got {eval_delay_s}"
+                )
+        score_task = asyncio.create_task(
+            asyncio.to_thread(self._compute_updates, rollout_batches)
+        )
+        try:
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            return await score_task
+        except BaseException:
+            score_task.cancel()
+            await asyncio.gather(score_task, return_exceptions=True)
+            raise
+
+    def _compute_updates(
+        self, rollout_batches: List[Dict[str, List[Any]]]
+    ) -> List[Dict[str, Any]]:
         return [self._compute_update(batch) for batch in rollout_batches]
 
     def _compute_update(self, batch: Dict[str, List[Any]]) -> Dict[str, Any]:

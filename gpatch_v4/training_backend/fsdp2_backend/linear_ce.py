@@ -21,6 +21,7 @@ class LinearCERequest:
     backend: str
     temperature: float
     return_entropy: bool
+    loss_mask: torch.Tensor | None
 
 
 _linear_ce_request: contextvars.ContextVar[LinearCERequest | None] = (
@@ -58,6 +59,24 @@ def _linear_ce_head_forward(
 
     set_linear_ce_backend(request.backend)
     safe_labels = request.labels.clamp_min(0)
+    if request.loss_mask is not None:
+        assert request.loss_mask.shape == request.labels.shape
+        assert request.loss_mask.device == hidden_states.device
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        keep_indices = request.loss_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+        num_valid_tokens = keep_indices.numel()
+        if num_valid_tokens == 0:
+            # Keep both gradient paths when a CP rank has no supervised tokens.
+            zero = (flat_hidden[:0].sum() + head.weight[:0].sum()).float()
+            zero = zero.expand_as(request.labels)
+            return (-zero, zero) if request.return_entropy else -zero
+        hidden_states = flat_hidden.index_select(0, keep_indices)
+        safe_labels = safe_labels.reshape(-1).index_select(0, keep_indices)
+        if num_valid_tokens == 1:
+            # Triton specializes a single token to a scalar.
+            hidden_states = torch.cat((hidden_states, hidden_states), dim=0)
+            safe_labels = torch.cat((safe_labels, safe_labels))
+
     ce_out = linear_cross_entropy(
         hidden_states.contiguous(),
         head.weight,
@@ -68,8 +87,19 @@ def _linear_ce_head_forward(
     )
     if request.return_entropy:
         nll, entropy = ce_out
+        if request.loss_mask is not None:
+            entropy = entropy.new_zeros(request.labels.numel()).scatter(
+                0, keep_indices, entropy[:num_valid_tokens]
+            ).view_as(request.labels)
+    else:
+        nll = ce_out
+    if request.loss_mask is not None:
+        nll = nll.new_zeros(request.labels.numel()).scatter(
+            0, keep_indices, nll[:num_valid_tokens]
+        ).view_as(request.labels)
+    if request.return_entropy:
         return -nll, entropy
-    return -ce_out
+    return -nll
 
 
 def install_linear_ce_head_bypass(model: nn.Module) -> None:
@@ -88,6 +118,8 @@ def linear_ce_head_context(
     backend: str,
     temperature: float = 1.0,
     return_entropy: bool = False,
+    *,
+    loss_mask: torch.Tensor | None = None,
 ) -> Iterator[None]:
     """Activate fused CE for ``head.forward``; nestable (MTP depth labels)."""
     assert hasattr(head, _ORIGINAL_FORWARD_ATTR), "Linear CE head bypass is not installed"
@@ -96,6 +128,7 @@ def linear_ce_head_context(
         backend=backend,
         temperature=temperature,
         return_entropy=return_entropy,
+        loss_mask=loss_mask,
     )
     token = _linear_ce_request.set(request)
     try:
@@ -111,7 +144,11 @@ def linear_ce_forward_context(
     backend: str,
     temperature: float = 1.0,
     return_entropy: bool = False,
+    *,
+    loss_mask: torch.Tensor | None = None,
 ) -> Iterator[None]:
     head = resolve_output_head(model)
-    with linear_ce_head_context(head, labels, backend, temperature, return_entropy=return_entropy):
+    with linear_ce_head_context(
+        head, labels, backend, temperature, return_entropy=return_entropy, loss_mask=loss_mask
+    ):
         yield

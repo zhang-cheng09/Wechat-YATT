@@ -9,6 +9,7 @@ Note: the abbreviation "DCP" in this codebase elsewhere refers to PyTorch
 ``torch.distributed.checkpoint``; this module always uses ``dyn_cp``.
 """
 import io
+import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +31,8 @@ A2A_CHECK_ENV_VAR = "GPATCH_DYN_CP_CHECK_A2A"
 # When set to "1", ``dyn_cp_schedule_default`` runs both the legacy per-key
 # reroute and the fused uint8 path, then ``compare_reroute_sample_dicts``.
 COMPARE_REROUTE_ENV_VAR = "GPATCH_DYN_CP_COMPARE_REROUTE"
+# When set to "1", print the global Dynamic-CP schedule on rank 0.
+LOG_SCHEDULE_ENV_VAR = "GPATCH_DYN_CP_LOG_SCHEDULE"
 
 
 def _flatten_routed_experts_for_dynamic_cp(
@@ -77,6 +80,7 @@ def reconstruct_dynamic_cp_packed_tensor(
     local_cp_size: int | torch.Tensor,
     *,
     cp_partition_mode: str = "zigzag",
+    cp_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Reconstruct a packed THD tensor inside its dynamic-CP subgroup.
 
@@ -95,7 +99,8 @@ def reconstruct_dynamic_cp_packed_tensor(
             f"got {tuple(tensor.shape)}"
         )
 
-    cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
+    if cp_group is None:
+        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
     cp_rank = cp_group.rank()
     total_tokens = int(cu_seqlens_padded[-1].item())
     local_tokens = tensor.shape[1]
@@ -105,6 +110,7 @@ def reconstruct_dynamic_cp_packed_tensor(
             f"total={total_tokens}, local={local_tokens}, cp={local_cp_size}"
         )
 
+    tensor = tensor.contiguous()
     gathered = [torch.empty_like(tensor) for _ in range(local_cp_size)]
     torch.distributed.all_gather(gathered, tensor.detach(), group=cp_group)
     # Preserve the graph only for the shard owned by this rank.
@@ -135,6 +141,7 @@ def dynamic_cp_local_packed_token_count(
     local_cp_size: int | torch.Tensor,
     *,
     cp_partition_mode: str = "zigzag",
+    cp_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Count valid response tokens owned by this rank's dynamic-CP THD shard.
 
@@ -161,7 +168,8 @@ def dynamic_cp_local_packed_token_count(
             f"global token count {total_tokens} is not divisible by local CP size {local_cp_size}"
         )
 
-    cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
+    if cp_group is None:
+        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
     cp_rank = cp_group.rank()
     local_tokens = total_tokens // local_cp_size
     if cp_partition_mode == "contiguous":
@@ -436,6 +444,10 @@ def _a2a_check_enabled() -> bool:
 
 def _compare_reroute_enabled() -> bool:
     return os.environ.get(COMPARE_REROUTE_ENV_VAR, "0") == "1"
+
+
+def _log_schedule_enabled() -> bool:
+    return os.environ.get(LOG_SCHEDULE_ENV_VAR, "0") == "1"
 
 
 def check_all_to_all_single_legal(
@@ -825,21 +837,37 @@ def reroute_samples_to_dcp_ranks_by_keys(
     recv_samples = [{k: None for k in data_keys} for _ in range(sum(recv_counts))]
 
     def _pack_sample_by_key(key: str) -> torch.Tensor:
-        flattened_tensors = []
+        total_len = 0
+        valid_ids = []
         for gid in send_ids_sorted:
-            value = batch[gid2local_id[gid]][key]
+            local_id = gid2local_id[gid]
+            value = batch[local_id][key]
             if value is None:
                 continue
-            t = value.to(torch.cuda.current_device(), non_blocking=True)
-            flattened_tensors.append(t.reshape(-1))
+            valid_ids.append(local_id)
+            total_len += value.numel()
         if key in dtype_map:
             dtype = dtype_map[key]
         else:
             dtype = batch[0][key].dtype
-        return (
-            torch.cat(flattened_tensors, dim=0) if flattened_tensors else
-            torch.empty(0, device=torch.cuda.current_device(), dtype=dtype)
-        )
+
+        device = torch.cuda.current_device()
+        if total_len == 0:
+            return torch.empty(0, device=device, dtype=dtype)
+
+        send_tensor = torch.empty(total_len, device=device, dtype=dtype)
+        offset = 0
+        for local_id in valid_ids:
+            value = batch[local_id][key]
+            assert value.dtype == dtype, (
+                f"key={key}: local dtype {value.dtype} != agreed {dtype}; "
+                f"dyn-cp all-to-all requires a uniform dtype"
+            )
+            n = value.numel()
+            src = value.reshape(-1)
+            send_tensor[offset:offset + n].copy_(src, non_blocking=True)
+            offset += n
+        return send_tensor
 
     def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):
         cursor = 0
@@ -1106,6 +1134,71 @@ def compare_reroute_sample_dicts(
             assert torch.equal(lv, rv), (f"gid={gid} key={key}: values differ")
 
 
+def _chunked_all_to_all_single(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    output_split_sizes: List[int],
+    input_split_sizes: List[int],
+    group: dist.ProcessGroup,
+    chunk_bytes: int,
+) -> None:
+    """``all_to_all_single`` for CPU uint8 buffers in rounds through GPU.
+
+    Each (src, dst) split of ``n`` bytes sends ``[r*n//R, (r+1)*n//R)`` in
+    round ``r``, so both sides derive identical per-round sizes from the
+    global round count ``R = ceil(max_rank_bytes / chunk_bytes)`` (one
+    all-reduce MAX of per-rank send+recv bytes, the only extra collective).
+    """
+    device = torch.cuda.current_device()
+    max_bytes = torch.tensor(
+        [sum(input_split_sizes) + sum(output_split_sizes)], dtype=torch.int64, device=device
+    )
+    dist.all_reduce(max_bytes, op=dist.ReduceOp.MAX, group=group)
+    max_bytes = int(max_bytes.item())
+    num_rounds = max(1, -(-max_bytes // chunk_bytes))
+
+    def _round_bounds(sizes: List[int], r: int) -> List[Tuple[int, int]]:
+        return [(r * n // num_rounds, (r + 1) * n // num_rounds) for n in sizes]
+
+    in_offsets = [0]
+    for n in input_split_sizes:
+        in_offsets.append(in_offsets[-1] + n)
+    out_offsets = [0]
+    for n in output_split_sizes:
+        out_offsets.append(out_offsets[-1] + n)
+    send_buf = torch.empty(
+        sum(-(-n // num_rounds) for n in input_split_sizes), device=device, dtype=torch.uint8
+    )
+    recv_buf = torch.empty(
+        sum(-(-n // num_rounds) for n in output_split_sizes), device=device, dtype=torch.uint8
+    )
+    for r in range(num_rounds):
+        in_bounds = _round_bounds(input_split_sizes, r)
+        out_bounds = _round_bounds(output_split_sizes, r)
+        cursor = 0
+        for d, (lo, hi) in enumerate(in_bounds):
+            send_buf[cursor:cursor + hi - lo].copy_(input[in_offsets[d] + lo:in_offsets[d] + hi])
+            cursor += hi - lo
+        in_sizes = [hi - lo for lo, hi in in_bounds]
+        out_sizes = [hi - lo for lo, hi in out_bounds]
+        dist.all_to_all_single(
+            output=recv_buf[:sum(out_sizes)],
+            input=send_buf[:cursor],
+            output_split_sizes=out_sizes,
+            input_split_sizes=in_sizes,
+            group=group,
+        )
+        cursor = 0
+        for s, (lo, hi) in enumerate(out_bounds):
+            output[out_offsets[s] + lo:out_offsets[s] + hi].copy_(recv_buf[cursor:cursor + hi - lo])
+            cursor += hi - lo
+    logging_with_rank_and_datetime(
+        f"[dyn_cp] chunked reroute a2a: rounds={num_rounds} "
+        f"max_send+recv={max_bytes / (1 << 30):.2f}GB",
+        rank=0,
+    )
+
+
 def reroute_samples_to_dcp_ranks_by_keys_fused(
     batch: list[dict[str, torch.Tensor]],
     global_ids_this_rank: torch.Tensor,
@@ -1117,6 +1210,7 @@ def reroute_samples_to_dcp_ranks_by_keys_fused(
     dp_cp_group: torch.distributed.ProcessGroup,
     total_dcp_gpus: int,
     dtype_map: Optional[dict[str, torch.dtype]] = None,
+    a2a_chunk_gb: Optional[float] = None,
 ):
     """Reroute samples with a single uint8 ``all_to_all_single`` for all keys.
 
@@ -1141,6 +1235,10 @@ def reroute_samples_to_dcp_ranks_by_keys_fused(
     total_dcp_gpus : int
     dtype_map : dict[str, torch.dtype], optional
         Required for keys that may be all-None on some ranks.
+    a2a_chunk_gb : float, optional
+        If set, send/recv buffers live on CPU and the all-to-all is split into
+        rounds using at most ~this many GB of GPU memory (send + recv); the
+        returned tensors are then on CPU.
     """
     if dtype_map is None:
         dtype_map = {}
@@ -1153,6 +1251,8 @@ def reroute_samples_to_dcp_ranks_by_keys_fused(
         return dcp_rank
 
     device = torch.cuda.current_device()
+    # 分块模式下完整 send/recv buffer 放 CPU，只有每轮的分块上 GPU
+    stage_device = device if a2a_chunk_gb is None else torch.device("cpu")
     gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
     dcp_rank = dp_cp_group.rank()
     dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
@@ -1190,24 +1290,41 @@ def reroute_samples_to_dcp_ranks_by_keys_fused(
 
     send_gids_per_dest = [_gids_to_send(d) for d in range(total_dcp_gpus)]
 
-    # One cat per key across all dests (dest-major gid order), then slice.
+    # Per key: sum the lengths first, allocate one buffer of exactly that size,
+    # then copy each sample in (dest-major gid order). Avoids ``torch.cat``,
+    # which keeps every per-sample tensor -- for CPU inputs, every H2D copy --
+    # alive at the same time as its output.
     key_packed: Dict[str, torch.Tensor] = {}
     key_dest_numel: Dict[str, List[int]] = {key: [] for key in data_keys}
     for key in data_keys:
-        pieces = []
+        total_len = 0
+        valid_ids = []
         for dest_rank in range(total_dcp_gpus):
             gids = send_gids_per_dest[dest_rank]
             numel = _key_numel_for_gids(key, gids)
             key_dest_numel[key].append(numel)
             for gid in gids:
-                value = batch[gid2local_id[gid]][key]
+                local_id = gid2local_id[gid]
+                value = batch[local_id][key]
                 if value is None:
                     continue
-                pieces.append(value.to(device, non_blocking=True).reshape(-1))
-        if pieces:
-            key_packed[key] = torch.cat(pieces, dim=0)
+                valid_ids.append(local_id)
+                total_len += value.numel()
+        if total_len > 0:
+            key_packed[key] = torch.empty(total_len, device=stage_device, dtype=key_dtypes[key])
+            offset = 0
+            for local_id in valid_ids:
+                value = batch[local_id][key]
+                assert value.dtype == key_dtypes[key], (
+                    f"key={key}: local dtype {value.dtype} != agreed {key_dtypes[key]}; "
+                    f"dyn-cp all-to-all requires a uniform dtype"
+                )
+                n = value.numel()
+                src = value.reshape(-1)
+                key_packed[key][offset:offset + n].copy_(src, non_blocking=a2a_chunk_gb is None)
+                offset += n
         else:
-            key_packed[key] = torch.empty(0, device=device, dtype=key_dtypes[key])
+            key_packed[key] = torch.empty(0, device=stage_device, dtype=key_dtypes[key])
 
     # Plan send slices; write into one preallocated buffer.
     input_split_sizes: List[int] = []
@@ -1226,8 +1343,8 @@ def reroute_samples_to_dcp_ranks_by_keys_fused(
         input_split_sizes.append(total_nbytes)
 
     send_tensor = (
-        torch.zeros(sum(input_split_sizes), device=device, dtype=torch.uint8)
-        if sum(input_split_sizes) > 0 else torch.empty(0, device=device, dtype=torch.uint8)
+        torch.zeros(sum(input_split_sizes), device=stage_device, dtype=torch.uint8)
+        if sum(input_split_sizes) > 0 else torch.empty(0, device=stage_device, dtype=torch.uint8)
     )
     key_cursor = {key: 0 for key in data_keys}
     slice_cursor = 0
@@ -1251,6 +1368,8 @@ def reroute_samples_to_dcp_ranks_by_keys_fused(
             off = slice_cursor + entry["byte_offset"]
             send_tensor[off:off + nbytes].copy_(flat, non_blocking=True)
         slice_cursor += total_nbytes
+    # 释放打包中间结果（含残留 view），避免与 send/recv buffer 同时驻留
+    key_packed = src = flat = None
 
     # Recv: plan entries locally (no meta blob); unpack without torch.load.
     output_split_sizes: List[int] = []
@@ -1268,7 +1387,7 @@ def reroute_samples_to_dcp_ranks_by_keys_fused(
         output_split_sizes.append(total_nbytes)
         recv_entries_per_src.append(entries)
 
-    recv_tensor = torch.empty(sum(output_split_sizes), device=device, dtype=torch.uint8)
+    recv_tensor = torch.empty(sum(output_split_sizes), device=stage_device, dtype=torch.uint8)
     check_all_to_all_single_legal(
         name="reroute_samples_to_dcp_ranks_by_keys_fused",
         input_tensor=send_tensor,
@@ -1277,13 +1396,24 @@ def reroute_samples_to_dcp_ranks_by_keys_fused(
         output_split_sizes=output_split_sizes,
         group=dp_cp_group,
     )
-    torch.distributed.all_to_all_single(
-        output=recv_tensor,
-        input=send_tensor,
-        output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
-        group=dp_cp_group,
-    )
+    if a2a_chunk_gb is None:
+        torch.distributed.all_to_all_single(
+            output=recv_tensor,
+            input=send_tensor,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=dp_cp_group,
+        )
+    else:
+        _chunked_all_to_all_single(
+            recv_tensor,
+            send_tensor,
+            output_split_sizes,
+            input_split_sizes,
+            dp_cp_group,
+            chunk_bytes=int(a2a_chunk_gb * (1 << 30)),
+        )
+        del send_tensor
 
     cursor = 0
     sample_base = 0
@@ -1468,6 +1598,57 @@ def build_packed_microbatches_by_keys(
     return new_samples
 
 
+def _log_default_dynamic_cp_schedule(
+    global_id_seqlens: List[Tuple[int, int]],
+    sample_id_groups: List[List[List[int]]],
+) -> None:
+    seqlen_by_sample_id = dict(global_id_seqlens)
+    stats_by_cp_size: Dict[int, Dict[str, int]] = {}
+
+    for sample_id_group in sample_id_groups:
+        cohorts: Dict[Tuple[int, ...], List[int]] = {}
+        for sample_id in {sample_id for sample_ids in sample_id_group for sample_id in sample_ids}:
+            ranks = tuple(
+                rank for rank, sample_ids in enumerate(sample_id_group) if sample_id in sample_ids
+            )
+            cohorts.setdefault(ranks, []).append(sample_id)
+
+        for ranks, sample_ids in cohorts.items():
+            local_cp_size = len(ranks)
+            sample_lens = [seqlen_by_sample_id[sample_id] for sample_id in sample_ids]
+            stats = stats_by_cp_size.setdefault(
+                local_cp_size,
+                {
+                    "groups": 0,
+                    "samples": 0,
+                    "padded_tokens": 0,
+                    "min_padded_seq_len": 0,
+                    "max_padded_seq_len": 0,
+                },
+            )
+            stats["groups"] += 1
+            stats["samples"] += len(sample_lens)
+            stats["padded_tokens"] += sum(sample_lens)
+            if stats["min_padded_seq_len"] == 0:
+                stats["min_padded_seq_len"] = min(sample_lens)
+            else:
+                stats["min_padded_seq_len"] = min(stats["min_padded_seq_len"], min(sample_lens))
+            stats["max_padded_seq_len"] = max(stats["max_padded_seq_len"], max(sample_lens))
+
+    cp_summary = "; ".join(
+        (
+            f"K={cp_size}: groups={stats['groups']}, samples={stats['samples']}, "
+            f"padded_tokens={stats['padded_tokens']}, "
+            f"padded_seq_len=[{stats['min_padded_seq_len']}, {stats['max_padded_seq_len']}]"
+        ) for cp_size, stats in sorted(stats_by_cp_size.items())
+    )
+    logging_rank0(
+        f"[dyn_cp_schedule] global_samples={len(global_id_seqlens)}, "
+        f"global_padded_tokens={sum(seqlen_by_sample_id.values())}, "
+        f"scheduler_microbatches={len(sample_id_groups)}, {cp_summary}"
+    )
+
+
 def dyn_cp_schedule_default(
     gbs_batches: List[Dict[str, Any]],
     dp_group,
@@ -1527,6 +1708,8 @@ def dyn_cp_schedule_default(
         _get_global_seqlens_and_ids(subsample_seqlens, dp_group)
     )
     sample_id_groups = scheduler.get_groups_and_subsamples(global_id_seqlens)
+    if _log_schedule_enabled():
+        _log_default_dynamic_cp_schedule(global_id_seqlens, sample_id_groups)
 
     global_id_seqlens_dict = get_global_id_1d_len_by_keys(
         global_id_seqlens_keys,
@@ -1548,7 +1731,9 @@ def dyn_cp_schedule_default(
         total_dcp_gpus=total_dyn_cp_gpus,
         dtype_map=dtype_map,
     )
-    samples_this_rank_with_id = reroute_samples_to_dcp_ranks_by_keys_fused(**reroute_kwargs)
+    samples_this_rank_with_id = reroute_samples_to_dcp_ranks_by_keys_fused(
+        **reroute_kwargs, a2a_chunk_gb=dist_config.dynamic_cp_reroute_a2a_chunk_gb
+    )
     if _compare_reroute_enabled():
         samples_legacy = reroute_samples_to_dcp_ranks_by_keys(**reroute_kwargs)
         compare_reroute_sample_dicts(samples_legacy, samples_this_rank_with_id)
@@ -1782,8 +1967,9 @@ def scatter_response_padded_to_full_seq(
     response_start: int,
     response_length: int,
     orig_len: int,
+    fill_value: float | int = 0,
 ) -> torch.Tensor:
-    """Place a ``[R_max, ...]`` response row into ``[orig_len, ...]`` (prompt stays 0)."""
+    """Place a response row into its original shifted-token positions."""
     if not (
         orig_len >= 0 and response_start >= 0 and response_length >= 0 and
         response_start + response_length <= orig_len and response_row.shape[0] >= response_length
@@ -1792,7 +1978,7 @@ def scatter_response_padded_to_full_seq(
             f"invalid scatter: orig_len={orig_len}, start={response_start}, "
             f"length={response_length}, row={tuple(response_row.shape)}"
         )
-    full = response_row.new_zeros((orig_len, *response_row.shape[1:]))
+    full = response_row.new_full((orig_len, *response_row.shape[1:]), fill_value)
     if response_length:
         full[response_start:response_start + response_length] = response_row[:response_length]
     return full
@@ -1802,7 +1988,7 @@ def build_per_gid_fullseq_dump(
     dump_metrics_micro_batch: List[Dict[str, Any]],
     packed_batches: List[Dict[str, Any]],
 ) -> Dict[int, Dict[str, torch.Tensor]]:
-    """Scatter packed-MB dump rows ``[B, R_max]`` to ``[T-1]`` keyed by gid; keep 1D fields."""
+    """Scatter response-padded dump fields back to each sample's ``[T-1, ...]``."""
     if len(dump_metrics_micro_batch) != len(packed_batches):
         raise ValueError(
             f"dump microbatches ({len(dump_metrics_micro_batch)}) != "
@@ -1819,17 +2005,19 @@ def build_per_gid_fullseq_dump(
             raise ValueError(
                 f"cu_seqlens length {int(cu_seqlens.numel())} != batch_size+1 ({batch_size + 1})"
             )
-        dump_1d = []
+        dump_fields = []
         for key, value in mb_dump.items():
-            if value is None or not torch.is_tensor(value) or value.dim() != 2:
+            if value is None or not torch.is_tensor(value) or value.dim() < 2:
                 continue
             name = key[len("dump/"):] if key.startswith("dump/") else key
-            dump_1d.append((name, value))
-        if not dump_1d:
-            raise ValueError("packed microbatch has no 1D dump tensors to scatter")
-        tensor_bs = dump_1d[0][1].shape[0]
+            dump_fields.append((name, value))
+        if not dump_fields:
+            raise ValueError("packed microbatch has no per-token dump tensors to scatter")
+        tensor_bs = dump_fields[0][1].shape[0]
         if tensor_bs != batch_size:
             raise ValueError(f"dump dim0={tensor_bs} != packed sample count {batch_size}")
+        if any(value.shape[0] != batch_size for _, value in dump_fields):
+            raise ValueError("dump fields disagree on packed sample count")
 
         cu = cu_seqlens.tolist()
         start_l = starts.tolist()
@@ -1839,9 +2027,16 @@ def build_per_gid_fullseq_dump(
             per_gid[int(gid)] = {
                 name:
                     scatter_response_padded_to_full_seq(
-                        value[idx], int(start_l[idx]), int(length_l[idx]), orig_len
+                        value[idx],
+                        int(start_l[idx]),
+                        int(length_l[idx]),
+                        orig_len,
+                        fill_value=(
+                            -torch.inf
+                            if name == "topk_logprobs" else -1 if name == "topk_token_ids" else 0
+                        ),
                     )
-                for name, value in dump_1d
+                for name, value in dump_fields
             }
     return per_gid
 
@@ -1852,47 +2047,110 @@ def reverse_and_collect_dump_metrics(
     dp_cp_group: dist.ProcessGroup,
     dump_keys: List[str],
     dtypes: Dict[str, torch.dtype],
+    trailing_shapes: Dict[str, Tuple[int, ...]],
 ) -> List[Dict[str, torch.Tensor]]:
-    """Pack 1D dump fields, reverse-reroute, unpack in original local sample order."""
+    """Reverse-reroute ``[T-1, ...]`` fields into original sample order."""
     if not dump_keys:
         raise ValueError("dump_keys must be non-empty")
     gid_lens = routing_info["global_id_logprob_lens"]
     gid_to_len = dict(gid_lens)
-    nkeys = len(dump_keys)
-    scaled_lens = [(gid, nkeys * length) for gid, length in gid_lens]
+    widths = {
+        key: math.prod(trailing_shapes[key]) if trailing_shapes[key] else 1
+        for key in dump_keys
+    }
+    integer_dtypes = {torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64}
+    transport_groups: Dict[torch.dtype, List[str]] = {}
+    for key in dump_keys:
+        dtype = dtypes[key]
+        transport_dtype = dtype if dtype in integer_dtypes else torch.float32
+        transport_groups.setdefault(transport_dtype, []).append(key)
 
-    packed: Dict[int, torch.Tensor] = {}
-    for gid, fields in per_gid_fields.items():
-        orig_len = gid_to_len[gid]
-        row = torch.empty(nkeys, orig_len, dtype=torch.float32, device=fields[dump_keys[0]].device)
-        for i, key in enumerate(dump_keys):
-            tensor = fields[key]
-            if tensor.numel() != orig_len:
+    original_gids = [int(gid) for gid in routing_info["global_ids_this_rank"].tolist()]
+    result_by_gid: Dict[int, Dict[str, torch.Tensor]] = {gid: {} for gid in original_gids}
+    for transport_dtype, group_keys in transport_groups.items():
+        group_width = sum(widths[key] for key in group_keys)
+        scaled_lens = [(gid, group_width * length) for gid, length in gid_lens]
+        packed: Dict[int, torch.Tensor] = {}
+        for gid, fields in per_gid_fields.items():
+            orig_len = gid_to_len[gid]
+            pieces = []
+            for key in group_keys:
+                tensor = fields[key]
+                expected_shape = (orig_len, *trailing_shapes[key])
+                if tuple(tensor.shape) != expected_shape:
+                    raise ValueError(
+                        f"gid={gid} key={key!r} shape={tuple(tensor.shape)} "
+                        f"!= expected={expected_shape}"
+                    )
+                pieces.append(tensor.reshape(-1).to(dtype=transport_dtype))
+            packed[gid] = torch.cat(pieces)
+
+        restored_packed = reverse_reroute_logprobs(
+            packed,
+            routing_info["global_ids_this_rank"],
+            scaled_lens,
+            routing_info["gid_to_compute_rank"],
+            routing_info["gid_to_orig_dcp_rank"],
+            dp_cp_group,
+            transport_dtype=transport_dtype,
+        )
+
+        for gid in original_gids:
+            packed_row = restored_packed[gid]
+            orig_len = gid_to_len[gid]
+            expected_numel = group_width * orig_len
+            if packed_row.numel() != expected_numel:
                 raise ValueError(
-                    f"gid={gid} key={key!r} numel={tensor.numel()} != orig_len={orig_len}"
+                    f"gid={gid} reversed numel={packed_row.numel()} != {expected_numel}"
                 )
-            row[i].copy_(tensor.reshape(-1).float())
-        packed[gid] = row.reshape(-1)
+            offset = 0
+            for key in group_keys:
+                field_numel = widths[key] * orig_len
+                result_by_gid[gid][key] = packed_row[offset:offset + field_numel].reshape(
+                    orig_len, *trailing_shapes[key]
+                ).to(dtype=dtypes[key], device="cpu")
+                offset += field_numel
 
-    restored_packed = reverse_reroute_logprobs(
-        packed,
-        routing_info["global_ids_this_rank"],
-        scaled_lens,
-        routing_info["gid_to_compute_rank"],
-        routing_info["gid_to_orig_dcp_rank"],
-        dp_cp_group,
+    return [result_by_gid[gid] for gid in original_gids]
+
+
+def flatten_teacher_hidden_for_sft_pack(hidden: torch.Tensor, pad_len: int) -> torch.Tensor:
+    """Pad ``[S, H]`` teacher hidden to ``pad_len`` and flatten to 1-D.
+
+    Packed-keys all-to-all requires 1-D tensors whose grouping still follows
+    token length; the flattened width is ``pad_len * H``. ``pad_len`` is
+    ``round_up(tokens)``, so hidden must not be longer than that.
+    """
+    assert hidden.ndim == 2, f"teacher hidden must be [S, H], got {tuple(hidden.shape)}"
+    seq_len, hidden_size = hidden.shape
+    assert seq_len <= pad_len, (
+        f"teacher hidden tokens {seq_len} > pack pad_len {pad_len}; "
+        "hidden must match the sample tokens used for dyn-CP pack"
     )
+    if seq_len < pad_len:
+        hidden = torch.cat(
+            (hidden, hidden.new_zeros(pad_len - seq_len, hidden_size)),
+            dim=0,
+        )
+    return hidden.reshape(-1).contiguous()
 
-    result: List[Dict[str, torch.Tensor]] = []
-    for gid in routing_info["global_ids_this_rank"].tolist():
-        gid = int(gid)
-        packed_row = restored_packed[gid]
-        orig_len = gid_to_len[gid]
-        if packed_row.numel() != nkeys * orig_len:
-            raise ValueError(f"gid={gid} reversed numel={packed_row.numel()} != {nkeys}*{orig_len}")
-        row = packed_row.reshape(nkeys, orig_len)
-        result.append({key: row[i].to(dtype=dtypes[key]).cpu() for i, key in enumerate(dump_keys)})
-    return result
+
+def restore_packed_teacher_hidden(
+    sample: Dict[str, Any],
+    key: str = "teacher_hidden_states",
+) -> None:
+    """Restore flattened packed teacher hidden to ``[S, H]`` using token length."""
+    hidden = sample.get(key)
+    tokens = sample.get("tokens")
+    if hidden is None or tokens is None:
+        return
+    n_tok = int(tokens.numel())
+    assert n_tok > 0, f"packed tokens are empty, cannot restore {key}"
+    assert hidden.numel() % n_tok == 0, (
+        f"packed {key} numel {hidden.numel()} is not divisible by tokens {n_tok}"
+    )
+    hidden_size = hidden.numel() // n_tok
+    sample[key] = hidden.reshape(-1, hidden_size).contiguous()
 
 
 def reverse_reroute_logprobs(
@@ -1902,6 +2160,7 @@ def reverse_reroute_logprobs(
     gid_to_compute_rank: Dict[int, int],
     gid_to_orig_dcp_rank: Dict[int, List[int]],
     dp_cp_group: dist.ProcessGroup,
+    transport_dtype: torch.dtype = torch.float32,
 ) -> Dict[int, torch.Tensor]:
     """Reverse the dynamic CP all-to-all with a single data exchange.
 
@@ -1960,7 +2219,7 @@ def reverse_reroute_logprobs(
         )
         for dest in gid_to_orig_dcp_rank[gid]:
             if dest == my_dcp_rank:
-                local_results[gid] = lp.to(device=dev, dtype=torch.float32)
+                local_results[gid] = lp.to(device=dev, dtype=transport_dtype)
             else:
                 send_by_dest[dest].append((gid, lp))
     for dest_list in send_by_dest:
@@ -1987,12 +2246,12 @@ def reverse_reroute_logprobs(
     # --- Single all-to-all for log-prob data. ---
     send_data = torch.cat(
         [
-            lp.to(device=dev, dtype=torch.float32).reshape(-1) for dest_list in send_by_dest
+            lp.to(device=dev, dtype=transport_dtype).reshape(-1) for dest_list in send_by_dest
             for _, lp in dest_list
         ]
-    ) if sum(send_split_sizes) > 0 else torch.empty(0, device=dev, dtype=torch.float32)
+    ) if sum(send_split_sizes) > 0 else torch.empty(0, device=dev, dtype=transport_dtype)
 
-    recv_data = torch.empty(sum(recv_split_sizes), device=dev, dtype=torch.float32)
+    recv_data = torch.empty(sum(recv_split_sizes), device=dev, dtype=transport_dtype)
     check_all_to_all_single_legal(
         name="reverse_reroute_logprobs",
         input_tensor=send_data,
@@ -2017,5 +2276,106 @@ def reverse_reroute_logprobs(
             length = gid_to_len[gid]
             result[gid] = recv_data[data_cursor:data_cursor + length]
             data_cursor += length
+
+    return result
+
+
+def reverse_reroute_hidden_states(
+    per_sample_hidden: Dict[int, torch.Tensor],
+    global_ids_this_rank: torch.Tensor,
+    global_id_seq_lens: List[Tuple[int, int]],
+    gid_to_compute_rank: Dict[int, int],
+    gid_to_orig_dcp_rank: Dict[int, List[int]],
+    dp_cp_group: dist.ProcessGroup,
+    hidden_size: int,
+    transport_dtype: torch.dtype = torch.bfloat16,
+) -> Dict[int, torch.Tensor]:
+    """Reverse-reroute packed teacher hidden ``[S, H]`` back to original ranks.
+
+    Same DP×CP all-to-all schedule as ``reverse_reroute_logprobs``, but each
+    token carries ``hidden_size`` elements. Split sizes are ``S * H``; unpacked
+    results are ``[S, H]``.
+    """
+    assert hidden_size >= 1, f"{hidden_size=}"
+    total_dcp_gpus = dp_cp_group.size()
+    my_dcp_rank = dp_cp_group.rank()
+    dev = torch.cuda.current_device()
+
+    gid_to_len = {gid: length for gid, length in global_id_seq_lens}
+
+    local_results: Dict[int, torch.Tensor] = {}
+    send_by_dest: List[List[Tuple[int, torch.Tensor]]] = [[] for _ in range(total_dcp_gpus)]
+    for gid, hidden in per_sample_hidden.items():
+        if gid_to_compute_rank[gid] != my_dcp_rank:
+            continue
+        assert hidden.ndim == 2, (
+            f"teacher hidden must be [S, H], gid={gid} got {tuple(hidden.shape)}"
+        )
+        assert hidden.shape[0] == gid_to_len[gid], (
+            f"sequence length mismatch for gid={gid}: got {hidden.shape[0]}, "
+            f"expected {gid_to_len[gid]}"
+        )
+        assert hidden.shape[1] == hidden_size, (
+            f"hidden size mismatch for gid={gid}: got {hidden.shape[1]}, "
+            f"expected {hidden_size}"
+        )
+        for dest in gid_to_orig_dcp_rank[gid]:
+            if dest == my_dcp_rank:
+                local_results[gid] = hidden.to(device=dev, dtype=transport_dtype)
+            else:
+                send_by_dest[dest].append((gid, hidden))
+    for dest_list in send_by_dest:
+        dest_list.sort(key=lambda x: x[0])
+
+    send_split_sizes = [
+        sum(hidden.numel() for _, hidden in dest_list) for dest_list in send_by_dest
+    ]
+
+    my_gids = [int(g) for g in global_ids_this_rank.tolist()]
+    recv_by_src: List[List[int]] = [[] for _ in range(total_dcp_gpus)]
+    for gid in my_gids:
+        if gid in local_results:
+            continue
+        src = gid_to_compute_rank[gid]
+        recv_by_src[src].append(gid)
+    for src_list in recv_by_src:
+        src_list.sort()
+
+    recv_split_sizes = [
+        sum(gid_to_len[gid] * hidden_size for gid in src_list) for src_list in recv_by_src
+    ]
+
+    send_data = torch.cat(
+        [
+            hidden.to(device=dev, dtype=transport_dtype).reshape(-1) for dest_list in send_by_dest
+            for _, hidden in dest_list
+        ]
+    ) if sum(send_split_sizes) > 0 else torch.empty(0, device=dev, dtype=transport_dtype)
+
+    recv_data = torch.empty(sum(recv_split_sizes), device=dev, dtype=transport_dtype)
+    check_all_to_all_single_legal(
+        name="reverse_reroute_hidden_states",
+        input_tensor=send_data,
+        output_tensor=recv_data,
+        input_split_sizes=send_split_sizes,
+        output_split_sizes=recv_split_sizes,
+        group=dp_cp_group,
+    )
+    dist.all_to_all_single(
+        recv_data,
+        send_data,
+        output_split_sizes=recv_split_sizes,
+        input_split_sizes=send_split_sizes,
+        group=dp_cp_group,
+    )
+
+    result: Dict[int, torch.Tensor] = dict(local_results)
+    data_cursor = 0
+    for src_rank in range(total_dcp_gpus):
+        for gid in recv_by_src[src_rank]:
+            n_tokens = gid_to_len[gid]
+            n_elem = n_tokens * hidden_size
+            result[gid] = recv_data[data_cursor:data_cursor + n_elem].view(n_tokens, hidden_size)
+            data_cursor += n_elem
 
     return result

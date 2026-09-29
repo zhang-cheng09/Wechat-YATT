@@ -244,7 +244,10 @@ class TestCispoVsGrpo:
         bwd_loss, metrics = cispo_loss_func(config, loss_input)
 
         # 确认有 token 被 clip 了
-        clipfrac = metrics["cispo/clipfrac"].item()
+        clipfrac_sum_count = metrics["cispo/clipfrac"]
+        clipfrac = (
+            clipfrac_sum_count[0] / clipfrac_sum_count[1].clamp_min(1)
+        ).item()
         assert clipfrac > 0, "test setup error: no tokens were clipped"
 
         bwd_loss.backward()
@@ -344,7 +347,10 @@ class TestCispoClipRatios:
         )
 
         _, metrics = cispo_loss_func(config, loss_input)
-        clipfrac = metrics["cispo/clipfrac"].item()
+        clipfrac_sum_count = metrics["cispo/clipfrac"]
+        clipfrac = (
+            clipfrac_sum_count[0] / clipfrac_sum_count[1].clamp_min(1)
+        ).item()
         assert clipfrac == 0.0, f"on-policy should have 0 clip, got {clipfrac}"
 
 

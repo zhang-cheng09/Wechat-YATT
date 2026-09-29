@@ -3,6 +3,10 @@ from typing import Any, List, Optional
 
 from gpatch_v4.configs.utils import MappingProtocol
 
+# Keep this in configs, not gpatch_v4.core.constants. Importing gpatch_v4.core
+# at module load time runs core/__init__.py and circular-imports configs.config.
+SUPPORTED_ROLLOUT_RS_OPTIONS = frozenset({"token_k1", "token_k2", "token_k3"})
+
 
 @dataclass
 class PpoConfig(MappingProtocol):
@@ -15,11 +19,10 @@ class PpoConfig(MappingProtocol):
         ``"gdpo_sample_bn"`` / ``"custom"``.
     loss_func : str
         ``"grpo"`` / ``"steer"`` / ``"gspo"`` / ``"fipo"`` / ``"sapo"`` /
-        ``"cispo"`` / ``"vespo"``.
-    use_legacy_loss : bool
-        If True (default), use ``loss_factory`` policy losses. If False, use
-        ``gpatch_v4.training_backend.loss`` (grpo/steer/cispo/gspo/sapo/vespo
-        only). ``"vespo"`` exists only on the non-legacy path.
+        ``"cispo"`` / ``"vespo"`` / ``"opd"``.
+    use_legacy_loss : Optional[bool]
+        Deprecated compatibility override for ``training.use_legacy_loss``.
+        ``None`` leaves the training setting unchanged; either boolean overrides it.
     ppo_value_truncate_head : bool
         When aligning full-token values or per-token rewards to next-token
         log probabilities, truncate the first entry instead of the last.
@@ -52,6 +55,19 @@ class PpoConfig(MappingProtocol):
     whiten_advantages: bool
         It takes effect in the reinforcement / identity stage.
     grpo_kl_loss_beta : float
+    use_kl_in_reward : bool
+        If True, subtract token-sum KL(old||ref) * ``kl_in_reward_coef`` from
+        scalar rewards before GRPO advantage (verl-style ``use_kl_in_reward``).
+        Forbidden when ``advantage_type='ppo'``.
+    kl_in_reward_coef : float
+        Initial coefficient. With ``kl_in_reward_ctrl_type='adaptive'`` this is
+        updated online.
+    kl_in_reward_ctrl_type : str
+        ``"fixed"`` or ``"adaptive"`` (verl ``algorithm.kl_ctrl``).
+    kl_in_reward_target_kl : float
+        Target mean per-token KL for adaptive KL-in-reward.
+    kl_in_reward_horizon : int
+        Horizon for adaptive KL-in-reward (verl ``kl_ctrl.horizon``).
     enable_off_policy_correction : bool
     off_policy_correction_level : str
         ``"token"`` / ``"sequence"`` / ``"geometric"``.
@@ -66,6 +82,12 @@ class PpoConfig(MappingProtocol):
     off_policy_correction_lower_bound : float or None
     off_policy_correction_veto_threshold : float or None
         If any token ratio < this value, zero the entire sequence weight.
+    off_policy_correction_rs : str or None
+        verl-style rollout RS options (comma-separated). Supported:
+        ``token_k1``, ``token_k2``, ``token_k3``. *None* disables RS.
+    off_policy_correction_rs_threshold : str or None
+        Threshold spec for RS. For ``*k1`` use ``lower_upper`` (e.g.
+        ``"0.5_5.0"``); for k2/k3 use a single upper bound.
     fipo_decay_rate : float
         Future-KL decay rate τ; γ = 2^(-1/τ). Larger τ → slower decay.
     fipo_chunk_size : int
@@ -122,14 +144,15 @@ class PpoConfig(MappingProtocol):
     # use_grpo: bool = field(default=True, metadata={"help": "Whether to use grpo."})
     loss_func: str = field(
         default="grpo",
-        metadata={"help": "Loss function. [grpo, steer, gspo, fipo, sapo, cispo, vespo]"}
+        metadata={"help": "Loss function. [grpo, steer, gspo, fipo, sapo, cispo, vespo, opd]"}
     )
-    use_legacy_loss: bool = field(
-        default=True,
+    use_legacy_loss: Optional[bool] = field(
+        default=None,
         metadata={
-            "help":
-                "If True, use loss_factory policy losses. If False, use "
-                "gpatch_v4.training_backend.loss (grpo/steer/cispo/gspo/sapo only)."
+            "help": (
+                "Deprecated: use training.use_legacy_loss. When set, overrides "
+                "training.use_legacy_loss for policy, finetune and value losses."
+            ),
         },
     )
     loss_func_py_path: Optional[str] = field(
@@ -291,6 +314,36 @@ class PpoConfig(MappingProtocol):
     )
 
     grpo_kl_loss_beta: float = field(default=1e-3, metadata={"help": "Grpo kl loss beta."})
+    use_kl_in_reward: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "If True, subtract token-sum KL(old||ref) * kl_in_reward_coef from scalar "
+                "rewards before GRPO advantage (verl-style use_kl_in_reward). Prefer "
+                "setting grpo_kl_loss_beta=0 when enabling this. Incompatible with "
+                "advantage_type='ppo' (use ppo_initial_policy_kl_penalty on the GAE path)."
+        },
+    )
+    kl_in_reward_coef: float = field(
+        default=0.001,
+        metadata={
+            "help":
+                "Initial coefficient for use_kl_in_reward. With "
+                "kl_in_reward_ctrl_type='adaptive', this is updated online."
+        },
+    )
+    kl_in_reward_ctrl_type: str = field(
+        default="fixed",
+        metadata={"help": "KL-in-reward controller: 'fixed' or 'adaptive' (verl kl_ctrl)."},
+    )
+    kl_in_reward_target_kl: float = field(
+        default=0.1,
+        metadata={"help": "Target mean per-token KL for adaptive KL-in-reward."},
+    )
+    kl_in_reward_horizon: int = field(
+        default=10000,
+        metadata={"help": "Horizon for adaptive KL-in-reward (verl kl_ctrl.horizon)."},
+    )
     norm_adv_by_std_in_grpo: bool = field(
         default=True,
         metadata={
@@ -321,6 +374,25 @@ class PpoConfig(MappingProtocol):
     # Per-token veto threshold. If any token ratio < this, zero the entire sequence weight, the sequences won't have gradient
     # Note: float number must be written with dot e.g. 1.0e-4, not 1e-4
     off_policy_correction_veto_threshold: Optional[float] = None
+    # Rejection sampling (verl rollout_rs). Comma-separated options, e.g. "token_k1".
+    # Applied on top of IS weights by zeroing modified_mask for rejected tokens.
+    off_policy_correction_rs: Optional[str] = field(
+        default=None,
+        metadata={
+            "help":
+                "verl-style rollout RS options (comma-separated). "
+                "Supported: token_k1, token_k2, token_k3. None disables RS."
+        },
+    )
+    # e.g. "0.5_5.0" for token_k1 → keep IS weight in [0.2, 2] (see verl rollout_corr_helper).
+    off_policy_correction_rs_threshold: Optional[str] = field(
+        default=None,
+        metadata={
+            "help":
+                "Threshold spec for off_policy_correction_rs. For *k1 use lower_upper "
+                "(e.g. '0.5_5.0'); for k2/k3 use a single upper bound."
+        },
+    )
     critic_model_warmup_steps: int = 0
     mask_negative_samples: bool = False
 
@@ -500,6 +572,43 @@ class PpoConfig(MappingProtocol):
             assert self.custom_reward_normalize_py_name is not None, (
                 "custom_reward_normalize_py_path requires custom_reward_normalize_py_name"
             )
+        if self.use_kl_in_reward:
+            assert self.ppo_initial_policy_kl_penalty == 0.0, (
+                "ppo.use_kl_in_reward requires ppo_initial_policy_kl_penalty=0.0"
+            )
+        if self.use_kl_in_reward and self.advantage_type == "ppo":
+            raise AssertionError(
+                "ppo.use_kl_in_reward is not supported with advantage_type='ppo'; "
+                "apply_kl_in_reward only adjusts scalar rewards before GRPO-style "
+                "advantages. For PPO/GAE use ppo.ppo_initial_policy_kl_penalty."
+            )
+        if self.use_kl_in_reward and self.skip_prev_logps:
+            raise AssertionError(
+                "ppo.use_kl_in_reward requires real prev/old logprobs; "
+                "set ppo.skip_prev_logps=False."
+            )
+        if self.kl_in_reward_ctrl_type not in ("fixed", "adaptive"):
+            raise AssertionError(
+                f"ppo.kl_in_reward_ctrl_type must be 'fixed' or 'adaptive', "
+                f"got {self.kl_in_reward_ctrl_type}"
+            )
+        if self.kl_in_reward_ctrl_type == "adaptive":
+            assert self.kl_in_reward_horizon > 0
+            assert self.kl_in_reward_target_kl > 0
+        if self.off_policy_correction_rs is not None:
+            options = [
+                opt.strip() for opt in str(self.off_policy_correction_rs).split(",") if opt.strip()
+            ]
+            assert options, "ppo.off_policy_correction_rs must be a non-empty string when set"
+            unknown = set(options) - SUPPORTED_ROLLOUT_RS_OPTIONS
+            assert not unknown, (
+                f"unsupported off_policy_correction_rs options {sorted(unknown)}; "
+                f"supported={sorted(SUPPORTED_ROLLOUT_RS_OPTIONS)}"
+            )
+            assert self.off_policy_correction_rs_threshold is not None, (
+                "ppo.off_policy_correction_rs_threshold must be set when "
+                "ppo.off_policy_correction_rs is enabled"
+            )
         if self.loss_func == "vespo":
             self._validate_vespo()
         if self.use_adaptive_entropy:
@@ -517,10 +626,6 @@ class PpoConfig(MappingProtocol):
             )
 
     def _validate_vespo(self):
-        assert not self.use_legacy_loss, (
-            "loss_func='vespo' is only implemented on the new loss path; "
-            "set ppo.use_legacy_loss=False."
-        )
         assert not self.skip_prev_logps, (
             "loss_func='vespo' requires prev_log_probs; with skip_prev_logps the "
             "sequence weight W collapses to 1 and the kernel degenerates."
@@ -539,6 +644,10 @@ class PpoConfig(MappingProtocol):
         assert not self.enable_off_policy_correction, (
             "loss_func='vespo' folds the rollout IS ratio into W before the kernel; "
             "enable_off_policy_correction would apply it a second time."
+        )
+        assert self.off_policy_correction_rs is None, (
+            "loss_func='vespo' folds the rollout IS ratio into W; "
+            "off_policy_correction_rs would change the mask used to form W."
         )
 
 
@@ -624,6 +733,42 @@ class DistillConfig(PpoConfig):
                 "Data field name for per-sample teacher routing in multi-teacher mode. "
                 "Ignored when only one teacher is configured."
         }
+    )
+    g_opd_compute_only_routed_teacher_logps: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "When enabled, send each rollout microbatch only to the teacher selected "
+                "by g_opd_teacher_routing_field. Teacher endpoint queues are padded to an "
+                "equal number of requests so EP collectives remain safe for arbitrary "
+                "per-teacher sampling ratios. Currently supports label log-probs only "
+                "(log_prob_top_k=0) and homogeneous teacher routing within a microbatch."
+        }
+    )
+    teacher_streaming_enabled: bool = field(
+        default=False,
+        metadata={
+            "help":
+                "Agentic single-controller only: submit each completed rollout to its routed "
+                "teacher immediately. The rollout controller combines requests into small, "
+                "endpoint-balanced teacher batches and attaches the results before training."
+        },
+    )
+    teacher_streaming_batch_size: int = field(
+        default=1,
+        metadata={
+            "help":
+                "Maximum number of real/padding requests per teacher endpoint in one streaming "
+                "teacher forward. Must be positive."
+        },
+    )
+    teacher_streaming_timeout_ms: int = field(
+        default=200,
+        metadata={
+            "help":
+                "Maximum time a completed rollout waits for more requests before the streaming "
+                "teacher queue is flushed. Must be non-negative."
+        },
     )
     g_opd_mix_reward_advantage: bool = field(
         default=False,
@@ -712,3 +857,18 @@ class DistillConfig(PpoConfig):
                 f"log_prob_top_k={self.log_prob_top_k} produces 3D advantages that only "
                 f"loss_func='opd' can handle, got loss_func='{self.loss_func}'."
             )
+        if self.g_opd_compute_only_routed_teacher_logps:
+            assert self.log_prob_top_k == 0, (
+                "g_opd_compute_only_routed_teacher_logps currently supports only "
+                "label log-probs; set log_prob_top_k=0."
+            )
+        if self.teacher_streaming_enabled:
+            assert self.g_opd_compute_only_routed_teacher_logps, (
+                "teacher_streaming_enabled requires "
+                "g_opd_compute_only_routed_teacher_logps=True."
+            )
+            assert self.log_prob_top_k == 0, (
+                "teacher_streaming_enabled currently supports only label log-probs."
+            )
+            assert self.teacher_streaming_batch_size > 0
+            assert self.teacher_streaming_timeout_ms >= 0

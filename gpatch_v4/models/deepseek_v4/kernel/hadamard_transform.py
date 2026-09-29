@@ -15,5 +15,4 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert hadamard_transform is not None, "fast_hadamard_transform is not installed"
     d = x.size(-1)
     assert d > 0 and d & (d - 1) == 0, f"Hidden size must be a power of 2, got {d}"
-    assert x.dtype == torch.bfloat16, f"Expected bfloat16, got {x.dtype}"
     return hadamard_transform(x, scale=d**-0.5)

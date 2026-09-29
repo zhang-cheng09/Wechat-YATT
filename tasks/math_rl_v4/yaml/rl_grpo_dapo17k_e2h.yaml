@@ -1,0 +1,34 @@
+# @package _global_
+#
+# E2H demo on DAPO-17K. Inherit rl_grpo_dapo17k_config; only data path,
+# e2h block, ckpt dir, and wandb name change.
+#
+# Prep (once):
+#   python3 tasks/math_rl_v4/add_dapo_e2h_levels.py
+# Train:
+#   --config-path=../../tasks/math_rl_v4/yaml --config-name=rl_grpo_dapo17k_e2h.yaml
+#
+# ``level`` is synthetic (P(0,1,2)=5:3:2), not real difficulty.
+
+defaults:
+  - rl_grpo_dapo17k_config
+  - _self_
+
+training:
+  num_train_epoches: 2
+
+checkpoint:
+  load_ckpt_path: qwen3_4b_dapo17k_e2h_all_level
+  save_ckpt_path: qwen3_4b_dapo17k_e2h_all_level
+
+data:
+  data_pathes:
+    - "hf-hub/zhuzilin/dapo-math-17k-e2h/"
+  e2h:
+    enable: true
+    curriculum_schedule: gaussian
+    mu_exp: 0.5
+    sigma: 0.5
+    min_prob: true
+    level_key: level
+    set_total_ppo_step_from_hard_cover: false

@@ -14,6 +14,7 @@ import torch
 from transformers import PreTrainedTokenizer
 
 from gpatch_v4.agentic.env.tool_reason_env_wrapper import ToolReasonEnvWrapper
+from gpatch_v4.agentic.env_manager.position_utils import agentic_mrope_placeholders
 from gpatch_v4.agentic.env_manager.token_mask_utils import (
     compute_conversation_end_token_id,
     custom_apply_chat_template,
@@ -32,6 +33,9 @@ def make_invalid_traj_dummy_batch(
     metric_schema=(),
     pad_token_id=None,
     routed_experts_shape=None,
+    model_arch=None,
+    seq_length=None,
+    pad_to_mulitiple_of=None,
 ):
     """Build a THD/BSHD-safe placeholder for empty or failed trajectories.
 
@@ -39,20 +43,29 @@ def make_invalid_traj_dummy_batch(
     The response mask is all-False so the sample contributes no PPO loss.
     A length-2 placeholder also gets a non-zero padded budget in
     ``convert_mbs_for_pack_seq`` (unlike the old ``sequence_lengths=0`` dummy).
+
+    For mRoPE arches (qwen3.5 / qwen3_vl / omni / wemm), ``position_ids``
+    and ``image_input_mask`` are padded to
+    ``max(seq_length, ceil(2 / pad_multi) * pad_multi)`` so
+    ``Qwen3VLPrepareDataForward`` will not 0-pad mRoPE ids.
     """
     pad_id = 0 if pad_token_id is None else int(pad_token_id)
     # 2 tokens → shifted axis length 1 for mask / rollout_log_probs.
     tokens = torch.tensor([pad_id, pad_id], dtype=torch.long)
+    position_ids, image_input_mask = agentic_mrope_placeholders(
+        tokens.numel(),
+        model_arch,
+        seq_length,
+        pad_to_mulitiple_of,
+    )
     result = {
         "tokens": [tokens],
         "prompt_lengths": [torch.tensor(1, dtype=torch.long)],
         "sequence_lengths": [torch.tensor(2, dtype=torch.long)],
         "rewards": [torch.tensor(0.0, dtype=torch.float)],
         "mask": [torch.tensor([False], dtype=torch.bool)],
-        "position_ids": [
-            torch.arange(2, dtype=torch.long).view(1, 1, 2).expand(3, 1, 2).contiguous()
-        ],
-        "image_input_mask": [torch.zeros(1, 2, dtype=torch.bool)],
+        "position_ids": [position_ids],
+        "image_input_mask": [image_input_mask],
         "rollout_log_probs": [torch.tensor([0.0], dtype=torch.float)],
     }
     if routed_experts_shape is not None:
@@ -60,9 +73,8 @@ def make_invalid_traj_dummy_batch(
         assert num_layers > 0 and moe_router_topk > 0, routed_experts_shape
         dummy_experts = torch.arange(moe_router_topk, dtype=torch.int32)
         result["routed_experts"] = [
-            dummy_experts.view(1, 1, moe_router_topk).expand(
-                2, num_layers, moe_router_topk
-            ).contiguous()
+            dummy_experts.view(1, 1, moe_router_topk).expand(2, num_layers,
+                                                             moe_router_topk).contiguous()
         ]
     for name in metric_schema or ():
         result[name] = [torch.tensor(0.0, dtype=torch.float)]
@@ -127,8 +139,15 @@ class TrajEnvManager(EnvManagerStrMixin):
             )
         return int(num_layers), int(moe_router_topk)
 
-    def run(self, seed: int, ppo_step: int, data: Dict[str, Any]) -> Dict[str, List[Any]]:
+    def run(
+        self,
+        seed: int,
+        ppo_step: int,
+        data: Dict[str, Any],
+        is_eval: bool = False,
+    ) -> Dict[str, List[Any]]:
         """Run a single trajectory and return a rollout_batch dict."""
+        self.is_eval = is_eval
         self.sampling_seed_offset = seed * 10 + self.env_config["env_id"]
         rollout_cache = self._reset(seed, ppo_step, data)
         assert rollout_cache is not None
@@ -219,10 +238,28 @@ class TrajEnvManager(EnvManagerStrMixin):
         input_ids = self._format_messages(rollout_cache)
         seq_length = self.rl_config.training.seq_length
 
-        if input_ids.shape[1] >= seq_length:
+        # Some long-horizon agents can compact their conversation after the
+        # model endpoint reports a context overflow.  Reserve enough room for
+        # one full generation so a context-limited request is reported as
+        # MAX_LENGTH *before* sampling, instead of being misreported as a
+        # normal finish_reason=length response after consuming the remaining
+        # context.  The default is zero to preserve existing env behaviour.
+        context_compaction_reserve_tokens = int(
+            self.env_config.get("context_compaction_reserve_tokens", 0) or 0
+        )
+        context_remaining_tokens = seq_length - input_ids.shape[1]
+
+        if (
+            input_ids.shape[1] >= seq_length or (
+                context_compaction_reserve_tokens > 0 and
+                context_remaining_tokens < context_compaction_reserve_tokens
+            )
+        ):
             log(
                 f"sequence_length = {seq_length} input_ids length = {input_ids.shape[1]}, "
-                "maybe you should increase the response_length"
+                f"context_remaining_tokens = {context_remaining_tokens}, "
+                f"context_compaction_reserve_tokens = {context_compaction_reserve_tokens}; "
+                "requesting context compaction"
             )
             rollout_cache.terminated = True
             rollout_cache.terminated_reason = "EXCEED_MAX_LENGTH"
@@ -242,6 +279,7 @@ class TrajEnvManager(EnvManagerStrMixin):
                 "prompt_token_ids": prompt_token_ids,
                 "max_new_tokens": max_new_tokens_cap,
                 "seed_offset": self.sampling_seed_offset,
+                "is_eval": self.is_eval,
             },
             engine_index=self.env_config["engine_index"],
         )
@@ -331,8 +369,16 @@ class TrajEnvManager(EnvManagerStrMixin):
         response_ids = lm_output.get("response_ids")
         if hasattr(response_ids, "tolist"):
             response_ids = response_ids.tolist()
+        # Trailing EOS stays in the stored response_ids used for training.
+        # Strip it only from the text handed to env.step.
+        decode_ids = response_ids
+        if (
+            isinstance(decode_ids, list) and decode_ids and
+            decode_ids[-1] == self.tokenizer.eos_token_id
+        ):
+            decode_ids = decode_ids[:-1]
         responses = self.tokenizer.decode(
-            response_ids if isinstance(response_ids, list) else response_ids,
+            decode_ids,
             skip_special_tokens=False,
         )
         if not isinstance(responses, str):
@@ -448,6 +494,9 @@ class TrajEnvManager(EnvManagerStrMixin):
                 metric_schema,
                 pad_token_id,
                 routed_experts_shape=self._router_replay_shape(),
+                model_arch=self.rl_config.policy.model_arch,
+                seq_length=self.rl_config.training.seq_length,
+                pad_to_mulitiple_of=self.rl_config.training.pad_to_mulitiple_of,
             )
 
         scores = [item["reward"] for item in rollout_cache.history]
@@ -476,17 +525,13 @@ class TrajEnvManager(EnvManagerStrMixin):
         resp_mask = torch.tensor(response_masks, dtype=torch.bool)
         mask = resp_mask[1:]  # shifted by 1 to align with logprobs (L-1)
 
-        seq_length = self.rl_config.training.seq_length
-        pad_multi = self.rl_config.training.pad_to_mulitiple_of
-
         L = tokens.shape[-1]
-        pad_to_len = ((L + pad_multi - 1) // pad_multi) * pad_multi
-        pos_len = max(seq_length, pad_to_len)
-        position_ids = (
-            torch.arange(pos_len, dtype=torch.long).view(1, 1, pos_len).expand(3, 1,
-                                                                               pos_len).contiguous()
+        position_ids, image_input_mask = agentic_mrope_placeholders(
+            L,
+            self.rl_config.policy.model_arch,
+            self.rl_config.training.seq_length,
+            self.rl_config.training.pad_to_mulitiple_of,
         )
-        image_input_mask = torch.zeros(1, pos_len, dtype=torch.bool)
 
         result = {
             "tokens": [tokens],

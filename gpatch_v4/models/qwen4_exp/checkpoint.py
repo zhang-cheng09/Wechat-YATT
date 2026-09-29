@@ -9,23 +9,10 @@ The released checkpoint is 1658 tensors / 360 GB across 131 safetensors shards. 
 through ``from_pretrained`` would need the whole thing on one rank, so each rank streams
 the shards itself and keeps only what it owns.
 
-Name mapping (verified exhaustively against the real index: 0 unmapped keys in either
-direction, and every shape matches with **no** transpose, expert merge or QKV fusion):
-
-===================================================== =========================
-disk                                                  model
-===================================================== =========================
-``model.language_model.X``                            ``model.X``
-``lm_head.weight``                                    unchanged
-``mtp.*`` (31 tensors)                                skipped — head not trained
-``model.visual.*`` (333 tensors)                      skipped — language-only
-``...ngram_embedding.shard_{0..127}.weight``          rows of ``...ngram_embedding.weight``
-===================================================== =========================
-
-That is why this module does **not** use HF's ``conversion_mapping``: nothing needs
-converting, and the ``qwen4_exp_text`` mapping would otherwise pull in a
-``Concatenate`` over all 128 Engram shards, which upstream itself annotates as
-"~95 GiB, cannot afford this on device".
+The model uses the checkpoint's native names: ``model.language_model.*``,
+``model.visual.*``, ``lm_head.weight``, and ``mtp.*`` when MTP is loaded.
+Engram ``shard_{i}`` keys are streamed into owner-local rows instead of using
+HF's conversion mapping, which would concatenate the full table on one device.
 """
 from __future__ import annotations
 
@@ -40,24 +27,24 @@ import torch.distributed as dist
 import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file
-from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
+from gpatch_v4.models.expert_gather import gather_ep_partition
 from gpatch_v4.utils import log
 
-from .engram import OwnerShardedNGramEmbedding, materialize_engram_tables
+from .engram import (
+    OwnerShardedNGramEmbedding,
+    iter_engram_hf_shards,
+    materialize_engram_tables,
+)
 
 __all__ = ["load_checkpoint_hp", "save_checkpoint_hp"]
 
-_SKIP_PATTERNS = (re.compile(r"^mtp\."), re.compile(r"^model\.visual\."))
+_MTP_PATTERN = re.compile(r"^mtp\.")
 _ENGRAM_SHARD_RE = re.compile(r"^(?P<prefix>.*ngram_embedding)\.shard_(?P<index>\d+)\.weight$")
 _EXPERT_SUFFIXES = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
 _INDEX_FILE = "model.safetensors.index.json"
-
-
-def _disk_to_model_key(disk_key: str) -> str:
-    """``model.language_model.X`` -> ``model.X``; everything else unchanged."""
-    return disk_key.replace("model.language_model.", "model.", 1)
 
 
 def _read_weight_map(hf_path: Path) -> dict:
@@ -117,13 +104,22 @@ def load_checkpoint_hp(
     materialize_engram_tables(self, param_device, dtype)
 
     target_state = self.state_dict()
+    expected_mtp_keys = {key for key in target_state if key.startswith("mtp.")}
+    if expected_mtp_keys:
+        checkpoint_mtp_keys = {key for key in weight_map if key.startswith("mtp.")}
+        if checkpoint_mtp_keys != expected_mtp_keys:
+            raise RuntimeError(
+                "Qwen4Exp MTP checkpoint keys do not match the model: "
+                f"missing={sorted(expected_mtp_keys - checkpoint_mtp_keys)}, "
+                f"unexpected={sorted(checkpoint_mtp_keys - expected_mtp_keys)}"
+            )
     engram_plan = _plan_engram(self)
 
     # Group by shard file so each of the 131 files is opened at most once.
     keys_by_shard: dict[str, list[str]] = {}
     skipped = 0
     for disk_key, shard in weight_map.items():
-        if any(pattern.match(disk_key) for pattern in _SKIP_PATTERNS):
+        if _MTP_PATTERN.match(disk_key) and self.mtp is None:
             skipped += 1
             continue
         keys_by_shard.setdefault(shard, []).append(disk_key)
@@ -136,8 +132,7 @@ def load_checkpoint_hp(
             raise FileNotFoundError(f"{shard_path} referenced by {_INDEX_FILE} is missing")
         with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
             for disk_key in disk_keys:
-                model_key = _disk_to_model_key(disk_key)
-                engram_match = _ENGRAM_SHARD_RE.match(model_key)
+                engram_match = _ENGRAM_SHARD_RE.match(disk_key)
                 if engram_match is not None:
                     if engram_match.group("prefix") not in engram_plan["tables"]:
                         # A debug-truncated model can drop the only Engram-owning layer.
@@ -147,15 +142,14 @@ def load_checkpoint_hp(
                         handle, disk_key, engram_match, engram_plan, dtype
                     )
                     continue
-                if model_key not in target_state:
+                if disk_key not in target_state:
                     # debug_truncate_num_hidden_layers leaves extra disk layers.
                     skipped += 1
                     continue
-                loaded[model_key] = _load_regular_tensor(
+                loaded[disk_key] = _load_regular_tensor(
                     handle,
                     disk_key,
-                    model_key,
-                    target_state[model_key],
+                    target_state[disk_key],
                     self,
                     dtype,
                     param_device,
@@ -172,7 +166,6 @@ def load_checkpoint_hp(
             f"Engram load filled {engram_rows_filled} rows but this rank owns "
             f"{engram_plan['total_local_rows']}"
         )
-
     self.load_state_dict(loaded, strict=False, assign=True)
     _materialize_meta_buffers(self)
     self._engram_param_ids = {
@@ -197,14 +190,13 @@ def _load_device() -> torch.device:
 def _load_regular_tensor(
     handle,
     disk_key: str,
-    model_key: str,
     target: torch.Tensor,
     model: nn.Module,
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
     """Read one non-Engram tensor, EP-slicing experts, and match the target's layout."""
-    is_expert = model_key.endswith(_EXPERT_SUFFIXES)
+    is_expert = disk_key.endswith(_EXPERT_SUFFIXES)
     if is_expert:
         ep_size = model._ep_size
         ep_rank = model._ep_rank
@@ -227,7 +219,7 @@ def _load_regular_tensor(
         return distribute_tensor(value, target.device_mesh, target.placements)
     if tuple(value.shape) != tuple(target.shape):
         raise ValueError(
-            f"{model_key}: checkpoint shape {tuple(value.shape)} != model shape "
+            f"{disk_key}: checkpoint shape {tuple(value.shape)} != model shape "
             f"{tuple(target.shape)}"
         )
     # Hash buffers are not DTensors; safetensors + assign=True would leave them
@@ -296,8 +288,8 @@ def _load_engram_shard(
 def _materialize_meta_buffers(model: nn.Module) -> None:
     """Restore the non-persistent buffers, which the checkpoint does not contain.
 
-    Only ``Qwen4ExpTextRotaryEmbedding`` has any: ``inv_freq`` / ``original_inv_freq``
-    (``persistent=False``). The Engram metadata buffers (``layer_multipliers``,
+    The text and vision rotary modules have non-persistent ``inv_freq`` buffers. The
+    Engram metadata buffers (``layer_multipliers``,
     ``ngram_heads_vocab_sizes``, ``ngram_heads_offsets``) are persistent and arrive from
     the checkpoint.
 
@@ -328,6 +320,11 @@ def _materialize_meta_buffers(model: nn.Module) -> None:
             inv_freq = inv_freq.to(device)
             module.register_buffer("inv_freq", inv_freq, persistent=False)
             module.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+        elif type(module).__name__ == "Qwen4ExpVisionRotaryEmbedding":
+            inv_freq = 1.0 / (
+                module.theta**(torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim)
+            )
+            module.register_buffer("inv_freq", inv_freq.to(device), persistent=False)
 
         remaining = sorted(
             name for name, buffer in module.named_buffers(recurse=False) if buffer.is_meta
@@ -347,6 +344,9 @@ _SAVE_FILES = (
     "vocab.json",
     "merges.txt",
     "chat_template.jinja",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "video_preprocessor_config.json",
 )
 
 
@@ -365,6 +365,7 @@ class _ShardWriter:
         self.weight_map: dict[str, str] = {}
         self.total_bytes = 0
         self.shard_index = 0
+        self.expert_files: list[str] = []
 
     def add(self, key: str, tensor: torch.Tensor) -> None:
         self.pending[key] = tensor
@@ -387,38 +388,63 @@ class _ShardWriter:
 
     def finalize(self) -> None:
         self.flush()
-        total = self.shard_index
+        files = [
+            f"model-{index:05d}-of-PENDING.safetensors" for index in range(1, self.shard_index + 1)
+        ] + self.expert_files
+        total = len(files)
         renames = {}
-        for index in range(1, total + 1):
-            old = f"model-{index:05d}-of-PENDING.safetensors"
+        for index, old in enumerate(files, 1):
             new = f"model-{index:05d}-of-{total:05d}.safetensors"
             (self.out_dir / old).rename(self.out_dir / new)
             renames[old] = new
+        self.shard_index = total
         weight_map = {key: renames[shard] for key, shard in self.weight_map.items()}
         (self.out_dir / _INDEX_FILE).write_text(
             json.dumps(
-                {"metadata": {"total_size": self.total_bytes}, "weight_map": weight_map},
+                {
+                    "metadata": {
+                        "total_size": self.total_bytes
+                    },
+                    "weight_map": weight_map
+                },
                 indent=2,
             )
         )
 
 
-def _gather_expert_for_save(model: nn.Module, param: torch.Tensor) -> torch.Tensor:
-    """Reassemble an expert tensor in model expert order on every EP rank."""
+def _dtensor_full_tensor_on_cuda(param: DTensor) -> torch.Tensor:
+    """``full_tensor()`` after ensuring the DTensor lives on CUDA.
+
+    NCCL-only process groups reject collectives on CPU shards
+    (``No backend type associated with device type cpu``), including empty
+    FSDP local shards that may still report ``device_type == "cpu"``.
+    """
+    local = param.to_local()
+    if local.is_cuda:
+        return param.full_tensor()
+    dt_cuda = param.cuda()
+    torch.cuda.synchronize()
+    try:
+        return dt_cuda.full_tensor()
+    finally:
+        del dt_cuda
+
+
+def _gather_ep_local_expert(model: nn.Module, param: torch.Tensor) -> torch.Tensor:
     if isinstance(param, DTensor):
         if model._ep_size == 1:
-            return param.full_tensor()
+            return _dtensor_full_tensor_on_cuda(param)
         local = param.to_local().contiguous()
-        ep_local = DTensor.from_local(
-            local,
-            device_mesh=model._ep_fsdp_mesh,
-            placements=[Shard(0)],
-            shape=param.shape,
-            stride=param.stride(),
-        ).full_tensor()
-    else:
-        ep_local = param.detach()
+        if not local.is_cuda:
+            local = local.cuda()
+            torch.cuda.synchronize()
+        return gather_ep_partition(param, local, model._ep_fsdp_mesh)
+    return param.detach()
 
+
+def _gather_expert_for_save(model: nn.Module, param: torch.Tensor) -> torch.Tensor:
+    """Reassemble an expert tensor in model expert order on every EP rank."""
+    ep_local = _gather_ep_local_expert(model, param)
     if model._ep_size == 1:
         return ep_local
 
@@ -429,36 +455,77 @@ def _gather_expert_for_save(model: nn.Module, param: torch.Tensor) -> torch.Tens
     return value
 
 
+def _write_ep_expert_shard(
+    model: nn.Module,
+    value: torch.Tensor,
+    disk_key: str,
+    path: Path,
+) -> int:
+    shape = list(value.shape)
+    shape[0] *= model._ep_size
+    partition_bytes = value.numel() * torch.bfloat16.itemsize
+    total_bytes = partition_bytes * model._ep_size
+    # HF keeps all experts in one key; owners write disjoint byte ranges, not duplicate keys.
+    header = json.dumps(
+        {
+            "__metadata__": {
+                "format": "pt"
+            },
+            disk_key: {
+                "dtype": "BF16",
+                "shape": shape,
+                "data_offsets": [0, total_bytes]
+            },
+        }
+    ).encode("utf-8")
+    header += b" " * (-len(header) % 8)
+    data_start = 8 + len(header)
+    if dist.get_rank() == 0:
+        with path.open("wb") as handle:
+            handle.write(len(header).to_bytes(8, "little"))
+            handle.write(header)
+            handle.truncate(data_start + total_bytes)
+    dist.barrier()
+    if model._ep_fsdp_mesh.get_local_rank() == 0:
+        partition = value.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+        with path.open("r+b") as handle:
+            handle.seek(data_start + model._ep_rank * partition_bytes)
+            handle.write(memoryview(partition.view(torch.uint8).numpy()).cast("B"))
+    dist.barrier()
+    return total_bytes
+
+
 def save_checkpoint_hp(
     self: nn.Module,
     save_path: str,
     orig_ckpt_dir: Optional[str] = None,
     preserve_mtp: bool = False,
+    save_distributed_ep_shard: bool = False,
 ) -> None:
     """Write a ``from_pretrained``-ready bf16 HF directory.
 
-    Rank 0 writes, but **every** rank must call this: gathering DTensors and the Engram
-    table is collective. Names are converted back to the disk convention
-    (``model.X`` -> ``model.language_model.X``) and the Engram table is re-emitted as
-    ``shard_{i}`` keys so the output reloads through :func:`load_checkpoint_hp`.
+    By default rank 0 writes fully gathered experts. With ``save_distributed_ep_shard``,
+    EP partitions write disjoint ranges of shared shards; rank 0 writes other weights
+    and the index. Every rank must call this collectively.
+    Parameter names stay unchanged; the Engram table is re-emitted as
+    HF ``shard_{i}`` keys (``i < split_ngram_parts``) so the output reloads through
+    :func:`load_checkpoint_hp` and SGLang ``load_qwen4_exp_ple_shard``.
 
     Parameters
     ----------
     save_path : str
-        Output directory.
+        Output directory, shared by all ranks when EP is enabled.
     orig_ckpt_dir : str, optional
         Source checkpoint whose config / tokenizer files are copied alongside. Required:
         without them the output cannot be reloaded.
     preserve_mtp : bool, default False
-        Accepted for signature compatibility with the DSV4 saver. The MTP head is never
-        loaded here, so ``True`` raises rather than silently writing nothing.
+        Require the model to contain the MTP head when saving.
+    save_distributed_ep_shard : bool, default False
+        Write experts per EP partition without cross-EP gather; requires a shared directory.
 
     """
-    if preserve_mtp:
-        raise NotImplementedError(
-            "preserve_mtp=True is meaningless for qwen4_exp: the 4 B MTP head is never "
-            "loaded, so it cannot be written back."
-        )
+    if preserve_mtp and self.mtp is None:
+        raise ValueError("preserve_mtp=True requires a loaded qwen4_exp MTP head")
     if orig_ckpt_dir is None:
         raise ValueError(
             "orig_ckpt_dir is required so config/tokenizer files can be copied; without "
@@ -479,29 +546,42 @@ def save_checkpoint_hp(
     engram_keys = {f"{name}.weight" for name in engram_tables}
     writer = _ShardWriter(out_dir) if rank == 0 else None
 
-    for name, param in self.state_dict().items():
+    state = self.state_dict()
+    for name, param in state.items():
         if name in engram_keys:
             continue
         if name.endswith(_EXPERT_SUFFIXES):
-            # Expert DTensors are only global within the ep_fsdp sub-mesh. Recover that
-            # local EP block first, then concatenate EP blocks in model expert order.
+            if save_distributed_ep_shard and self._ep_size > 1:
+                value = _gather_ep_local_expert(self, param)
+                filename = f"{name}.safetensors"
+                total_bytes = _write_ep_expert_shard(self, value, name, out_dir / filename)
+                if rank == 0:
+                    writer.expert_files.append(filename)
+                    writer.weight_map[name] = filename
+                    writer.total_bytes += total_bytes
+                del value
+                continue
             value = _gather_expert_for_save(self, param)
         else:
             # Collective for DTensors, so it runs on every rank; only rank 0 keeps it.
-            value = param.full_tensor() if isinstance(param, DTensor) else param
+            value = (_dtensor_full_tensor_on_cuda(param) if isinstance(param, DTensor) else param)
         if rank == 0:
             gathered = value.detach().to("cpu")
             if gathered.dtype.is_floating_point:
                 gathered = gathered.to(torch.bfloat16)
-            writer.add(_model_to_disk_key(name), gathered)
+            writer.add(name, gathered)
         del value
 
-    # Owner-sharded and FSDP-ignored, so gather explicitly — one owner shard at a time,
-    # because the full table is 102 GB in bf16 and must never be resident.
+    # Owner-sharded and FSDP-ignored, so gather explicitly — one owner broadcast at a
+    # time, re-packed into HF ``split_ngram_parts`` shards (never materialize 102 GB).
+    split_parts = 0
+    if engram_tables:
+        text_config = self.config.get_text_config()
+        split_parts = int(text_config.split_ngram_parts)
     for name, table in engram_tables.items():
-        for disk_key, shard in _iter_engram_shards(table, f"{name}.weight", rank):
+        for disk_key, shard in _iter_engram_shards(table, f"{name}.weight", rank, split_parts):
             if rank == 0:
-                writer.add(_model_to_disk_key(disk_key), shard)
+                writer.add(disk_key, shard)
 
     if rank == 0:
         writer.finalize()
@@ -520,23 +600,17 @@ def save_checkpoint_hp(
         dist.barrier()
 
 
-def _model_to_disk_key(model_key: str) -> str:
-    """Inverse of :func:`_disk_to_model_key`."""
-    if model_key.startswith("model.") and not model_key.startswith("model.language_model."):
-        return model_key.replace("model.", "model.language_model.", 1)
-    return model_key
-
-
-def _iter_engram_shards(table: OwnerShardedNGramEmbedding, target_key: str, rank: int):
-    """Yield ``(shard_key, cpu_tensor)`` for each owner's slice of the Engram table."""
-    prefix = target_key[:-len(".weight")]
-    local = table.local_weight.detach().to(torch.bfloat16)
-    for owner in range(table.world_size):
-        if dist.is_initialized() and table.world_size > 1:
-            buffer = local.clone() if owner == rank else torch.empty_like(local)
-            dist.broadcast(buffer, src=owner, group=table.process_group)
-        else:
-            buffer = local
-        if rank == 0:
-            yield f"{prefix}.shard_{owner}.weight", buffer.to("cpu")
-        del buffer
+def _iter_engram_shards(
+    table: OwnerShardedNGramEmbedding,
+    target_key: str,
+    rank: int,
+    split_ngram_parts: int,
+):
+    """Yield ``(shard_key, cpu_tensor)`` in HF ``split_ngram_parts`` layout."""
+    return iter_engram_hf_shards(
+        table,
+        target_key,
+        split_ngram_parts,
+        out_device="cpu",
+        yield_on_all_ranks=False,
+    )

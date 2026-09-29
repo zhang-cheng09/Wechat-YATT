@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
+import torch
+
 from gpatch_v4.agentic.env_manager.traj_env_manager import TrajEnvManager
+from gpatch_v4.configs.agentic_config import EnvTemplateConfig
 from gpatch_v4.utils.constants import GenerateStopReason
 from tasks.retool.multi_segment.dup_traj_env_manager import DupTrajEnvManager
 
@@ -55,6 +58,47 @@ def test_traj_manager_does_not_step_when_prompt_exceeds_context_length():
 
     assert result == {"cache": cache}
     assert step_calls == []
+
+
+def test_traj_manager_requests_compaction_before_generation_reserve_is_consumed():
+    manager = TrajEnvManager.__new__(TrajEnvManager)
+    manager.rl_config = SimpleNamespace(
+        training=SimpleNamespace(seq_length=100),
+    )
+    manager.env_config = {
+        "context_compaction_reserve_tokens": 32,
+        "max_tokens_per_step": 32,
+    }
+    manager._format_messages = lambda rollout_cache: torch.zeros(
+        (1, 69), dtype=torch.long,
+    )
+    manager.llm_proxy = SimpleNamespace(
+        generate=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("generation must not start before compaction")
+        ),
+    )
+    cache = SimpleNamespace(terminated=False, terminated_reason=None)
+
+    result = manager._make_decision(cache)
+
+    assert result["stop_reason"] == GenerateStopReason.MAX_LENGTH
+    assert cache.terminated is True
+    assert cache.terminated_reason == "EXCEED_MAX_LENGTH"
+
+
+def test_context_compaction_reserve_is_an_explicit_optional_env_setting():
+    assert EnvTemplateConfig().context_compaction_reserve_tokens == 0
+    assert EnvTemplateConfig().skip_compaction_summary_segment is False
+    assert EnvTemplateConfig(
+        context_compaction_reserve_tokens=32768,
+        skip_compaction_summary_segment=True,
+    ).context_compaction_reserve_tokens == 32768
+    assert EnvTemplateConfig(
+        context_compaction_trigger_tokens=81920,
+    ).context_compaction_trigger_tokens == 81920
+    assert EnvTemplateConfig(
+        skip_compaction_summary_segment=True,
+    ).skip_compaction_summary_segment is True
 
 
 def test_dup_traj_manager_steps_generation_length(monkeypatch):

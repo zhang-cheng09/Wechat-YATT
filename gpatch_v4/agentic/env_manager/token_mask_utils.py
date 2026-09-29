@@ -26,11 +26,10 @@ def custom_apply_chat_template(
     tools=None,
     enable_thinking: Optional[bool] = None,
     reasoning_effort: Optional[str] = None,
+    preserve_thinking: Optional[bool] = None,
 ) -> List:
     if len(messages) == 0:
         return []
-    if tools is not None:
-        assert messages[0]["role"] == "system", "tools is only supported for system role message"
     extra_kwargs: Dict = {}
     if enable_thinking is not None:
         extra_kwargs["enable_thinking"] = enable_thinking
@@ -39,6 +38,11 @@ def custom_apply_chat_template(
         # template. This is prompt construction, not an SGLang sampling
         # parameter, so it must be forwarded to apply_chat_template here.
         extra_kwargs["reasoning_effort"] = reasoning_effort
+    if preserve_thinking is not None:
+        # Qwen3.8 retains historical assistant reasoning only when this
+        # template flag is enabled. Agent rollouts must keep it aligned with
+        # the native Chat Completions path.
+        extra_kwargs["preserve_thinking"] = preserve_thinking
     if messages[0]["role"] == "system":
         # NOTE 非常的离谱，transformers 新版本把 return_dict 默认设置改成 Ture 了
         # 导致 apply_chat_template 返回的是一个 dict，而不是一个 list，手动处理一下
@@ -54,8 +58,16 @@ def custom_apply_chat_template(
     else:
         # NOTE qwen3.5 的 jinja 要求必须要有 user role，否则报错... 所以这里加一个 user role 的 mock
         system_mock = [{"role": "system", "content": ""}, {"role": "user", "content": ""}]
+        # Render the prefix with the same tools and thinking options as the
+        # delta, without an assistant generation header to accidentally slice
+        # off part of the first observation.
         system_token_ids_mock = tokenizer.apply_chat_template(
-            system_mock, tokenize=True, return_dict=False
+            system_mock,
+            tokenize=True,
+            add_generation_prompt=False,
+            tools=tools,
+            return_dict=False,
+            **extra_kwargs,
         )
         token_ids = tokenizer.apply_chat_template(
             system_mock + messages,

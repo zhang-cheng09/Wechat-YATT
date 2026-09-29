@@ -46,7 +46,7 @@ HF_MODEL_PATH = "hf-hub/deepseek-ai/DeepSeek-V4-Flash"
 NUM_GPUS = 32
 EP_SIZE = 4
 NUM_BACKBONE_LAYERS = 4
-SEQ_LEN = 128
+SEQ_LEN = 256
 
 
 def _truncate_config(config: DeepseekV4Config) -> DeepseekV4Config:
@@ -890,7 +890,7 @@ class TestDeepseekV4MtpSmoke(unittest.TestCase):
         assert os.path.isdir(HF_MODEL_PATH)
 
         # 3 段不等长，pad 到 128 倍数
-        fake_seq_lens = [100, 80, 120]
+        fake_seq_lens = [200, 160, 240]
 
         pg = placement_group(
             [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",
@@ -1001,7 +1001,7 @@ class TestDeepseekV4MtpSmoke(unittest.TestCase):
         assert os.path.isdir(HF_MODEL_PATH)
 
         # segments must pad to multiples of 128 AND total T divisible by cp_size*128
-        fake_seq_lens = [100, 200, 100]
+        fake_seq_lens = [200, 400, 200]
 
         # 1. THD CP=1 (baseline, with router capture)
         pg = placement_group(

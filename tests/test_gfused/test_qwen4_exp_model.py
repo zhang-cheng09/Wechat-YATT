@@ -259,3 +259,47 @@ def test_meta_construction_matches_real_construction() -> None:
     mismatched = {k: (meta_sd[k].shape, real_sd[k].shape) for k in real_sd if meta_sd[k].shape != real_sd[k].shape}
     assert not mismatched, mismatched
     assert all(t.is_meta for t in meta_sd.values())
+
+
+def test_load_only_mtp_matches_released_parameter_tree() -> None:
+    model = _tiny_model(
+        mtp={"layer_types": ["full_attention"], "num_hidden_layers": 1},
+        mtp_num_hidden_layers=1,
+    )
+    mtp_names = {name for name in model.state_dict() if name.startswith("mtp.")}
+    assert mtp_names == {
+        "mtp.fc_embedding.weight",
+        "mtp.fc_hidden.weight",
+        "mtp.hyper_connection_mixer.hc_norm.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+        "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight",
+        "mtp.layers.0.attn_hyper_connection.hc_norm.weight",
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight",
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight",
+        "mtp.layers.0.mlp.experts.down_proj",
+        "mtp.layers.0.mlp.experts.gate_up_proj",
+        "mtp.layers.0.mlp.gate.weight",
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+        "mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight",
+        "mtp.layers.0.mlp_hyper_connection.hc_norm.weight",
+        "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight",
+        "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight",
+        "mtp.layers.0.self_attn.indexer.index_qk_proj.weight",
+        "mtp.layers.0.self_attn.indexer.k_layernorm.weight",
+        "mtp.layers.0.self_attn.indexer.q_layernorm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    }
+    assert model.mtp.pre_fc_norm_hidden.weight.shape == (
+        model.config.hc_count * model.config.hidden_size,
+    )

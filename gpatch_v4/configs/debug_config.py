@@ -15,14 +15,21 @@ class DebugConfig(MappingProtocol):
     debug_engine_save_path : str
     save_first_rollout_data : bool
     save_every_rollout_data : bool
+    step0_diagnostics : bool
+        Dump initial parameter, packed-input, and gradient-norm fingerprints.
+    step0_diagnostics_dir : str
+        Per-run output directory for Qwen4-Exp step-0 diagnostic records.
+    deepep_probe_layer : int or None
+        DeepEP layer whose first-step forward stages are fingerprinted.
+    deterministic_deepep_reduce : bool
+        Replace DeepEP's duplicated-index atomic reduction with fixed-order slot summation.
     save_decode_jsonl : bool
         Also save decoded rollout trajectories as JSONL when rollout data is saved.
     skip_rollout_load_from_disk : bool
         DEBUG: skip RolloutController fire/collect AND actor process_rollout;
         load saved batches/metrics from ``load_rollout_path`` instead.
     load_rollout_path : str
-        DEBUG: directory for loading saved rollout batches/metrics. Defaults
-        to ``"debug-tmp"`` (hardcoded save directory).
+        DEBUG: directory for saving/loading rollout batches and metrics.
     load_rollout_step : int
         DEBUG: which saved ppo_step's rollout to reuse for every step.
     save_images : bool
@@ -33,6 +40,8 @@ class DebugConfig(MappingProtocol):
     trainer_return_ppo_step_metrics : bool
     debug_no_optim : bool
         Disable optimizer updates entirely.
+    profile_policy_cuda_memory : bool
+        Report phase-local FSDP2 policy-train CUDA allocator peaks.
     synthetic_generation_prompt_expansion : bool
         Repeat each SFT generation prompt by a deterministic per-sample factor.
     debug_dump_first_n_ppo_step_moe_token_dist : int
@@ -46,9 +55,19 @@ class DebugConfig(MappingProtocol):
         Feeds the offline expert re-permutation pipeline.
     debug_dump_expert_token_counts_path: str
         DEBUG: path to dump expert token counts.
+    debug_dtype: bool
+        DEBUG: dump dtype of all module params, buffers, input and output,
+        and all op (any torch.* or Tensor.*) input and output
     log_thd_pack_layout : bool
         Rank-0 first microbatch of each step. Dumps per-segment
         ``raw_lens`` / ``pad_lens``, which grow with pack occupancy.
+    dump_tq_sample_hashes : bool
+        AgentLoop put-before-offload vs train restore-after-TQ hashes.
+        Requires Mooncake TransferQueue; incompatible with skip-from-disk.
+        Shards also record microbatch identity order, field dtype/shape
+        catalog, and GRPO ``group_id`` chunk errors.
+    tq_sample_hash_dir : str
+        Directory for ``put_step*`` / ``restore_step*`` JSON shards.
     """
     debug_engine_update_weight: bool = field(
         default=False, metadata={"help": "Whether to do debug."}
@@ -61,6 +80,40 @@ class DebugConfig(MappingProtocol):
     )
     save_every_rollout_data: bool = field(
         default=False, metadata={"help": "Whether to save every rollout data."}
+    )
+    step0_diagnostics: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: dump Qwen4-Exp initial parameter, packed-input, and "
+                    "gradient-norm fingerprints for the first finetune step."
+                )
+        },
+    )
+    step0_diagnostics_dir: str = field(
+        default="debug-tmp/qwen4_exp_step0_diagnostics",
+        metadata={"help": "DEBUG: output directory for Qwen4-Exp step-0 diagnostics."},
+    )
+    deepep_probe_layer: Optional[int] = field(
+        default=None,
+        metadata={
+            "help":
+                (
+                    "DEBUG: Qwen4-Exp layer index whose DeepEP dispatch, expert, "
+                    "local reduction, and combine stages are fingerprinted."
+                )
+        },
+    )
+    deterministic_deepep_reduce: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: replace Qwen4-Exp DeepEP index_add_ with unique-slot "
+                    "scatter followed by fixed-order top-k summation."
+                )
+        },
     )
     save_decode_jsonl: bool = field(
         default=False,
@@ -95,9 +148,8 @@ class DebugConfig(MappingProtocol):
         metadata={
             "help":
                 (
-                    "DEBUG: directory to load saved rollout batches/metrics from when "
-                    "`skip_rollout_load_from_disk` is enabled. Defaults to the same "
-                    "hardcoded save directory."
+                    "DEBUG: directory used by rollout batch/metric save and "
+                    "`skip_rollout_load_from_disk`."
                 )
         },
     )
@@ -123,7 +175,8 @@ class DebugConfig(MappingProtocol):
             "help":
                 (
                     "DEBUG: repeat each SFT generation prompt by a deterministic "
-                    "per-sample factor in [40, 100], capped at training.seq_length."
+                    "per-sample factor in [40, 100], capped at training.seq_length. "
+                    "Override with env GPATCH_PROMPT_EXPANSION_FACTOR."
                 )
         },
     )
@@ -173,6 +226,16 @@ class DebugConfig(MappingProtocol):
     disable_save_checkpoint: bool = field(
         default=False,
         metadata={"help": "DEBUG: skip all checkpoint saves (including final save on exit)."},
+    )
+    profile_policy_cuda_memory: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: reset CUDA allocator peak stats around each FSDP2 "
+                    "policy-train phase and report the maximum across ranks."
+                )
+        },
     )
     ignore_global_retention_ratio: bool = field(
         default=False,
@@ -231,6 +294,16 @@ class DebugConfig(MappingProtocol):
         default="debug-tmp/debug_moe_router/counts.pt",
         metadata={"help": ("DEBUG: path to dump expert token counts.")},
     )
+    debug_dtype: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: dump dtype of all module params, buffers, input and output, "
+                    "and all op (any torch.* or Tensor.*) input and output"
+                )
+        },
+    )
     log_thd_pack_layout: bool = field(
         default=False,
         metadata={
@@ -251,6 +324,22 @@ class DebugConfig(MappingProtocol):
                     "off | warn | abort."
                 )
         },
+    )
+    dump_tq_sample_hashes: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "DEBUG: dump per-sample sha256 before TQ put and after "
+                    "train restore, plus microbatch identity order and a "
+                    "field dtype/shape catalog. Requires tq.enable and "
+                    "MooncakeStore."
+                )
+        },
+    )
+    tq_sample_hash_dir: str = field(
+        default="",
+        metadata={"help": "DEBUG: directory for TQ put/restore sample hash JSON shards."},
     )
 
     def __post_init__(self):

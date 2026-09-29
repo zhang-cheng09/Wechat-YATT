@@ -237,7 +237,9 @@ def _model_key_to_disk_key(model_key: str) -> str:
     )
 
 
-def _split_per_expert(model_key: str, t: torch.Tensor) -> dict[str, torch.Tensor]:
+def _split_per_expert(model_key: str,
+                      t: torch.Tensor,
+                      expert_offset: int = 0) -> dict[str, torch.Tensor]:
     m = _EXPERT_STACKED_KEY_RE.match(model_key)
     if m is None:
         assert ".experts." not in model_key or ".shared_experts." in model_key, (
@@ -249,7 +251,7 @@ def _split_per_expert(model_key: str, t: torch.Tensor) -> dict[str, torch.Tensor
     n = t.shape[0]
     if w_kind == "down_proj":
         return {
-            f"{key_prefix}.{layer}.mlp.experts.{i}.w2.weight": t[i].contiguous()
+            f"{key_prefix}.{layer}.mlp.experts.{expert_offset + i}.w2.weight": t[i].contiguous()
             for i in range(n)
         }
 
@@ -260,8 +262,10 @@ def _split_per_expert(model_key: str, t: torch.Tensor) -> dict[str, torch.Tensor
     w1_stack, w3_stack = t.chunk(2, dim=1)
     out: dict[str, torch.Tensor] = {}
     for i in range(n):
-        out[f"{key_prefix}.{layer}.mlp.experts.{i}.w1.weight"] = w1_stack[i].contiguous()
-        out[f"{key_prefix}.{layer}.mlp.experts.{i}.w3.weight"] = w3_stack[i].contiguous()
+        out[f"{key_prefix}.{layer}.mlp.experts.{expert_offset + i}.w1.weight"] = w1_stack[
+            i].contiguous()
+        out[f"{key_prefix}.{layer}.mlp.experts.{expert_offset + i}.w3.weight"] = w3_stack[
+            i].contiguous()
     return out
 
 
@@ -283,9 +287,10 @@ def iter_disk_checkpoint_tensors(
     expert_dtype: Literal["fp4", "fp8"] = "fp4",
     is_sgl_ckpt_fmt: bool = False,
     include_mtp: bool = True,
+    expert_offset: int = 0,  # Global expert ID of the first row in this EP partition.
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert one model tensor into one-or-more disk-form checkpoint tensors."""
-    for mk, mv in _split_per_expert(model_key, tensor).items():
+    for mk, mv in _split_per_expert(model_key, tensor, expert_offset).items():
         if not include_mtp and mk.startswith("mtp."):
             continue
         disk_key = _model_to_disk_key(mk)
@@ -345,7 +350,6 @@ def _iter_deepseek_v4_gathered_state_dict(model: Module, ) -> Iterator[tuple[str
                 # 未经测试，但似乎正确。
                 local = local._tensor
             if is_expert_weight and ep_size > 1:
-                # Keep the same expert gather semantics as checkpoint.py:
                 # gather ep_fsdp shards first, then all_gather over ep ranks
                 # to recover experts in model order.
                 assert ep_group is not None and ep_fsdp_mesh is not None, (

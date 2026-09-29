@@ -49,7 +49,7 @@ training:
 >
 > shifted 类字段（logprobs、mask、entropy 等）长度为 `S-1` 或 `P-1`，因为自回归模型 N 个 token 只产生 N-1 个 next-token 预测。
 >
-> **Dynamic CP（GRPO）**：loss 侧 1D 字段会先 scatter 回未 pad 的 `[T-1]`（与 `pre_logprobs` / `advantages` 同下标），再 reverse-reroute 回原始 DP 后与 `expanded_rbs` zip（`dynamic_batch_train` 则为按 train-step flatten 后的 samples）。`dump_metrics_logprobs_topk`、`ppo_dump_moe_topk`、SFT dump 与 dyn-CP 暂不支持。
+> **Dynamic CP（GRPO）**：loss 侧字段会先 scatter 回未 pad 的 `[T-1, ...]`，再 reverse-reroute 回原始 DP 和样本顺序。top-k 字段为 `[T-1, K]`，只保留原始 `response_mask` 有效位置，其他位置分别填 `-inf` / `-1`。`ppo_dump_moe_topk` 和 SFT dump 暂不支持。
 
 #### 1.Rollout 相关metrics
 
@@ -75,8 +75,8 @@ training:
 |------|-------|-------|------|
 | `curr_logprobs` | `[S-1]` | bfloat16 | 当前 policy model（训练中）的 shifted logprobs |
 | `per_token_entropy` | `[S-1]` | bfloat16 | 每个 token 的 entropy（未 mask） |
-| `topk_logprobs` | `[S, topk]` | bfloat16 | 输出层 top-k logprobs，需要配置 `dump_metrics_logprobs_topk` |
-| `topk_token_ids` | `[S, topk]` | int32 | topk_logprobs 对应的 token-ids |
+| `topk_logprobs` | `[S, topk]`；dyn-CP 为 `[T-1, topk]` | bfloat16 | 输出层 top-k logprobs，需要配置 `dump_metrics_logprobs_topk` |
+| `topk_token_ids` | `[S, topk]`；dyn-CP 为 `[T-1, topk]` | int32 | topk_logprobs 对应的 token-ids |
 | `ppo_ratio_unclamped` | `[S-1]` | bfloat16 | clip 前的 ratio |
 | `is_ppo_ratio_clamped` | `[S-1]` | bool | 该 token 的 ratio 是否被 clip |
 | `mask` | `[S-1]` | bool | 训练 loss 使用的 response mask（`dump/mask`） |

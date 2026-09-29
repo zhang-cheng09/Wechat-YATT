@@ -1,5 +1,6 @@
 import collections
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, List, Optional, Union
 
@@ -35,6 +36,17 @@ class TrainingConfig(MappingProtocol):
         Maximum sequence length.
     recompute : bool
         Activation recomputation (gradient checkpointing).
+    selective_recompute : bool
+        For Qwen4-Exp, checkpoint the attention/GDN part of each decoder layer while
+        keeping the MoE path eager, avoiding a second replay of EP communication.
+    selective_recompute_max_layers : int or None
+        Maximum number of eligible Qwen4-Exp GDN layers that keep the selective
+        recompute path. ``None`` keeps the legacy all-eligible-layers behavior.
+    non_reentrant_recompute : bool
+        Set ``MEGATRON_NON_REENTRANT_RECOMPUTE=1`` for Megatron full-layer
+        checkpoint when this is ``True`` and ``TransformerConfig`` has
+        ``linear_cp_mode``. Default ``False``. Incompatible with
+        ``moe_shared_expert_overlap``.
     total_training_step : int or None
         ``None`` → derived from epochs and data size.
     total_eval_step : int
@@ -91,8 +103,6 @@ class TrainingConfig(MappingProtocol):
         ``"none"`` disables load balancing.
     moe_balance_loss_coef : float
         FSDP2 switch-style MoE load-balancing loss coefficient; ``0`` disables.
-    freeze_router_weight : bool
-        freeze MoE router weight (``requires_grad=False``).
     freeze_csa_indexer : bool
         ``True`` (default) freezes DeepSeek-V4 CSA Lightning Indexer params
         (``requires_grad=False``) so AdamW/Muon weight decay cannot shrink
@@ -112,12 +122,12 @@ class TrainingConfig(MappingProtocol):
     use_dynamic_mbs : bool
         Requires ``train_mbs == 1``.
     ppo_dump_metrics_interval : int
-        Dump every ``n`` PPO steps; ``-1`` disables. Not supported when
-        ``DistConfig.dynamic_context_parallel=True``.
+        Dump every ``n`` PPO steps; ``-1`` disables. mcore backend RL supports
+        Dynamic CP dump.
     ppo_dump_metrics_dir : str
     ppo_dump_per_token_entropy : bool
     dump_metrics_logprobs_topk : int
-        Dump top-k logprobs ``[b, s, topk]``; ``0`` disables.
+        Dump top-k logprobs; ``0`` disables.
     ppo_dump_gradient : bool
         When dumping metrics, also dump ``∂bwd_loss/∂actor_loss`` and
         ``∂bwd_loss/∂curr_log_probs`` (new loss path only). Default ``False``.
@@ -127,6 +137,17 @@ class TrainingConfig(MappingProtocol):
         Dump top-k MoE experts ``[b, s, topk]``; ``0`` disables.
     check_gbs_consistency : bool
         Assert actual batch size equals ``train_gbs * dp_size`` before each step.
+    use_legacy_loss : bool
+        Select legacy policy / finetune / value losses. Default ``True``.
+        ``False`` selects ``training_backend.loss`` for MCore policy, finetune
+        and value, and for FSDP2 RL policy (same ``ppo_loss`` functions, registered
+        on both ``mcore`` and ``fsdp2``).
+        FSDP2 SFT already uses the ``fsdp2`` registry regardless of this flag.
+        Explicit ``ppo.use_legacy_loss`` overrides this field for compatibility.
+    enable_torch_compile : bool
+        Whether to enable torch.compile. Default ``True``.
+    log_torch_recompiles: bool
+        Whether to log recompiles of torch.compile. Default ``False``.
     """
     # TODO add training dtype
     training_backend: str = field(
@@ -154,6 +175,32 @@ class TrainingConfig(MappingProtocol):
         default=False,
         metadata={"help": "Whether to recompute."},
     )
+    selective_recompute: bool = field(
+        default=False,
+        metadata={"help": "Whether to use selective activation recomputation."},
+    )
+    selective_recompute_max_layers: Optional[int] = field(
+        default=None,
+        metadata={
+            "help":
+                (
+                    "Maximum number of Qwen4-Exp GDN layers using selective recomputation; "
+                    "null keeps all eligible layers."
+                )
+        },
+    )
+    non_reentrant_recompute: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "Set MEGATRON_NON_REENTRANT_RECOMPUTE=1 so Megatron full-layer "
+                    "checkpoint uses the non-reentrant path. Only takes effect when "
+                    "TransformerConfig has linear_cp_mode. Incompatible with "
+                    "moe_shared_expert_overlap."
+                ),
+        },
+    )
     total_training_step: Optional[int] = field(
         default=None, metadata={"help": "Total training steps."}
     )
@@ -169,20 +216,22 @@ class TrainingConfig(MappingProtocol):
     disable_flash_attn_3: bool = field(
         default=False,
         metadata={
-            "help": (
-                "Disable TransformerEngine FlashAttention 3 (fall back to FA2). "
-                "Set automatically when apply_deterministic_mode and "
-                "attention_backend=flash."
-            ),
+            "help":
+                (
+                    "Disable TransformerEngine FlashAttention 3 (fall back to FA2). "
+                    "Set automatically when apply_deterministic_mode and "
+                    "attention_backend=flash."
+                ),
         },
     )
     disable_flash_attn_4: bool = field(
         default=False,
         metadata={
-            "help": (
-                "Disable TransformerEngine FlashAttention 4 (fall back to FA2). "
-                "Set automatically on NVIDIA RTX PRO 5000."
-            ),
+            "help":
+                (
+                    "Disable TransformerEngine FlashAttention 4 (fall back to FA2). "
+                    "Set automatically on NVIDIA RTX PRO 5000."
+                ),
         },
     )
     use_fast_tokenizer: bool = field(
@@ -296,10 +345,6 @@ class TrainingConfig(MappingProtocol):
         default=0.0,
         metadata={"help": "FSDP2 switch-style MoE load-balancing loss coefficient; 0 disables."},
     )
-    freeze_router_weight: bool = field(
-        default=False,
-        metadata={"help": "freeze MoE router weight (requires_grad=False)."},
-    )
     freeze_csa_indexer: bool = field(
         default=True,
         metadata={
@@ -348,9 +393,9 @@ class TrainingConfig(MappingProtocol):
         default=-1,
         metadata={
             "help":
-                "Dump train metrics every n ppo steps. GRPO + dyn-CP reverse-reroutes "
-                "1D per-token fields; SFT dump, MoE top-k, and vocab top-k with dyn-CP "
-                "are unsupported."
+                "Dump train metrics every n ppo steps. mcore backend RL + dyn-CP reverse-reroutes "
+                "per-token fields, including vocab top-k. SFT dump and MoE top-k with "
+                "dyn-CP are unsupported."
         }
     )
     ppo_dump_metrics_dir: str = field(
@@ -369,7 +414,7 @@ class TrainingConfig(MappingProtocol):
             "help":
                 "When dumping metrics (ppo_dump_metrics_interval > 0), also dump "
                 "token-level ∂bwd_loss/∂actor_loss and ∂bwd_loss/∂curr_log_probs. "
-                "Only effective with ppo.use_legacy_loss=False."
+                "Only effective with training.use_legacy_loss=False."
         },
     )
     im_end_metrics_enable: bool = field(
@@ -449,6 +494,10 @@ class TrainingConfig(MappingProtocol):
         default=False,
         metadata={"help": "Whether to tune the mtp layers (during rl or sft)."},
     )
+    enable_mtp_rollout: bool = field(
+        default=False,
+        metadata={"help": "Whether to use MTP for rollout."},
+    )
     mtp_loss_scaling_factor: float = field(
         default=0.1,
         metadata={"help": "Scaling factor for auxiliary MTP loss."},
@@ -462,18 +511,40 @@ class TrainingConfig(MappingProtocol):
         }
     )
     linear_ce_backend: str = field(
-        default="separate",
+        default="tilelang",
         metadata={
             "help":
-                "Backward method for linear cross entropy. Options: "
-                "'separate' (full d_logits buffer, native dtype, fastest & best memory, default), "
+                "Implementation and backward method for linear cross entropy. Options: "
+                "'separate' (full d_logits buffer, native dtype), "
                 "'fuse_mn' (single fused kernel, no intermediate d_logits but needs fp32 d_hidden/d_weight), "
-                "'split_n' (split d_logits along vocab dim, loop over splits, slowest)."
+                "'split_n' (split d_logits along vocab dim, loop over splits, slowest), "
+                "'tilelang' (TileLang fused implementation with adaptive vocab-chunked backward, default)."
         },
     )
     ce_compaction: bool = field(
         default=False,
-        metadata={"help": "Compact masked tokens before MCore output projection and CE."},
+        metadata={"help": "Compact masked tokens before output projection and CE."},
+    )
+    use_legacy_loss: bool = field(
+        default=True,
+        metadata={
+            "help":
+                (
+                    "Use legacy policy, finetune and value losses. False selects "
+                    "training_backend.loss for MCore and for FSDP2 RL policy "
+                    "(ppo_loss registered on both mcore and fsdp2). FSDP2 SFT "
+                    "always uses the fsdp2 registry. "
+                    "Explicit ppo.use_legacy_loss overrides this setting."
+                ),
+        },
+    )
+    enable_torch_compile: bool = field(
+        default=True,
+        metadata={"help": "Whether to enable torch.compile."},
+    )
+    log_torch_recompiles: bool = field(
+        default=False,
+        metadata={"help": "Whether to log recompiles of torch.compile."},
     )
 
     def resolve_moe_router_replay_shape(
@@ -526,6 +597,15 @@ class TrainingConfig(MappingProtocol):
 
     def __post_init__(self):
         assert self.training_backend in ["mcore", "fsdp2", "mlite"]
+        if self.online_mtp_sft or self.enable_mtp_rollout:
+            assert self.enable_mtp, (
+                "online_mtp_sft and enable_mtp_rollout require enable_mtp=True"
+            )
+        if self.non_reentrant_recompute:
+            from megatron.core.transformer.transformer_config import TransformerConfig
+            self.non_reentrant_recompute = hasattr(TransformerConfig, "linear_cp_mode")
+        if self.non_reentrant_recompute:
+            os.environ["MEGATRON_NON_REENTRANT_RECOMPUTE"] = "1"
         assert self.attention_backend in ["flash", "fused", "unfused", "local", "auto"]
         assert self.moe_token_dispatcher_type in ['allgather', 'alltoall', 'flex']
         assert not (self.enable_mtp and
@@ -549,9 +629,14 @@ class TrainingConfig(MappingProtocol):
             assert self.freeze_router_correction_bias, (
                 "DSpark P0 does not update router correction-bias buffers"
             )
-        assert self.linear_ce_backend in ["fuse_mn", "separate", "split_n"], (
+        assert self.linear_ce_backend in [
+            "fuse_mn",
+            "separate",
+            "split_n",
+            "tilelang",
+        ], (
             f"Unknown linear_ce_backend: '{self.linear_ce_backend}'. "
-            f"Choose from: ['fuse_mn', 'separate', 'split_n']"
+            f"Choose from: ['fuse_mn', 'separate', 'split_n', 'tilelang']"
         )
         if self.return_hidden_states_for_ce:
             assert self.dump_metrics_logprobs_topk == 0, (
@@ -582,7 +667,6 @@ class TrainingConfig(MappingProtocol):
             )
 
         if self.enable_self_heal:
-            import os
             assert os.environ.get("__SYS_TASK_RUNTIME_ID__"), (
                 "enable_self_heal=True but not running on Gemini platform "
                 "(__SYS_TASK_RUNTIME_ID__ missing)"
@@ -629,8 +713,9 @@ class FinetuneTrainingConfig(TrainingConfig):
     prefetch_num_gb : int or None
         Number of global batches to prefetch.
     loss_func : str
-        Loss function to use. One of ``"cross_entropy"``, ``"ce_with_kl"``, ``"custom"``,
-        ``"dpo"``, ``"square_averaging_cross_entropy"``.
+        Loss function to use. One of ``"cross_entropy"``, ``"ce_with_kl"``,
+        ``"ce_with_kl_eager"``, ``"custom"``, ``"dpo"``,
+        ``"square_averaging_cross_entropy"``.
     loss_func_py_path : str or None
         Path to the loss function.
     loss_func_py_name : str or None
@@ -693,16 +778,20 @@ class FinetuneTrainingConfig(TrainingConfig):
             raise ValueError("manual_gc_interval must be positive when manual_gc=True.")
 
         assert self.loss_func in [
-            "cross_entropy", "ce_with_kl", "custom", "dpo", "rm_bt",
+            "cross_entropy", "ce_with_kl", "ce_with_kl_eager", "custom", "dpo", "rm_bt",
             "square_averaging_cross_entropy", "grad_cache_loss"
         ], f"Invalid loss function: {self.loss_func}"
         if self.loss_func == "custom":
             assert self.loss_func_py_path is not None and self.loss_func_py_name is not None, "Custom loss function must be provided"
         if self.ce_compaction:
-            # TODO: support FSDP2 (SFT/GRPO/DSV4) via lm_head bypass gather before kernel.
-            assert self.training_backend == "mcore", (
-                "ce_compaction currently supports MCore SFT only"
+            assert self.training_backend in ("mcore", "fsdp2"), (
+                "ce_compaction currently supports MCore or FSDP2 SFT only"
             )
+            if self.training_backend == "fsdp2":
+                assert self.use_linear_ce, "FSDP2 ce_compaction requires use_linear_ce=True"
+                assert self.loss_func == "cross_entropy", (
+                    "FSDP2 ce_compaction supports SFT cross_entropy only"
+                )
             assert not self.apply_deterministic_mode, (
                 "ce_compaction has not been validated with apply_deterministic_mode=True"
             )
@@ -727,14 +816,12 @@ class EmbeddingTrainingConfig(FinetuneTrainingConfig):
 
     Attributes
     ----------
-    use_gbs_embedding_in_loss : bool
+    use_grad_cache : bool
         If True, gather embeddings across DP and compute the contrastive
         loss at global batch size. If False, compute loss on local
         micro-batch embeddings only.
     """
-    use_gbs_embedding_in_loss: bool = field(
-        default=False, metadata={"help": "Use gbs embedding in loss"}
-    )
+    use_grad_cache: bool = field(default=False, metadata={"help": "Use gbs embedding in loss"})
     gradcache_loss_py_path: Optional[str] = field(
         default=None, metadata={"help": "Path to calc grad cache loss."}
     )
@@ -777,7 +864,9 @@ class OffPolicyDistillTrainingConfig(FinetuneTrainingConfig):
     enable_teacher_rollout : bool
         Whether to use the teacher model for rollout generation.
     num_batches_per_execution : int
-        Number of micro-batches per forward execution.
+        Number of micro-batches per ``forward_backward_func`` call for teacher
+        fwd-only (static hidden/logits and dynamic-CP packed hidden/logprob).
+        ``1`` keeps peak activation lowest when PP=1.
     teacher_logits_dtype : str
         Data type of teacher logits: ``"bf16"`` or ``"fp32"``.
     """
@@ -789,7 +878,8 @@ class OffPolicyDistillTrainingConfig(FinetuneTrainingConfig):
     )
     enable_teacher_rollout: bool = field(default=True, metadata={"help": "Whether to use sampler."})
     num_batches_per_execution: int = field(
-        default=8, metadata={"help": "Number of batches per execution."}
+        default=8,
+        metadata={"help": "Teacher fwd-only microbatches per forward_backward_func call."},
     )
     teacher_logits_dtype: str = field(
         default="bf16", metadata={"help": "Data type of teacher logits."}
@@ -803,6 +893,23 @@ class OffPolicyDistillTrainingConfig(FinetuneTrainingConfig):
         assert self.teacher_logits_dtype in [
             "bf16", "fp32"
         ], f"Invalid teacher logits dtype: {self.teacher_logits_dtype}"
+
+
+@dataclass
+class EmbeddingOffPolicyDistillTrainingConfig(EmbeddingTrainingConfig):
+    """Embedding SFT training fields plus the OffPD knobs the in-process teacher reads."""
+    enable_teacher_kl_loss: bool = field(
+        default=True, metadata={"help": "Whether to enable KL loss from teacher."}
+    )
+    setup_teacher_in_independent_topo: bool = field(
+        default=False, metadata={"help": "Whether to setup teacher in independent topo"}
+    )
+    enable_teacher_rollout: bool = field(
+        default=False, metadata={"help": "Embedding offpd uses the dataloader, not sampler."}
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
 
 
 @dataclass
@@ -922,6 +1029,9 @@ class RLTrainingConfig(TrainingConfig):
         Names of metrics to report.
     ppo_max_epochs_2 : int
         Number of epochs to train on each rollout batch.
+    num_batches_per_execution : int or None
+        Maximum dynamic-CP forward-only microbatches per pipeline execution.
+        ``None`` preserves the unsplit GRPO execution behavior.
     use_bt_rm_reward : bool
         Whether to use batch reward model.
     use_gen_rm_reward : bool
@@ -1051,6 +1161,10 @@ class RLTrainingConfig(TrainingConfig):
     ppo_max_epochs_2: int = field(
         default=1, metadata={"help": "Number of epochs rollout batches training"}
     )
+    num_batches_per_execution: Optional[int] = field(
+        default=None,
+        metadata={"help": "Dynamic-CP forward-only microbatches per pipeline execution."},
+    )
     use_bt_rm_reward: bool = field(default=False, metadata={"help": "Whether to use bt reward."})
     use_gen_rm_reward: bool = field(
         default=False, metadata={"help": "Whether to use gen rm reward."}
@@ -1117,6 +1231,14 @@ class RLTrainingConfig(TrainingConfig):
     custom_compute_rollout_metrics_name: Optional[str] = field(
         default=None,
         metadata={"help": "Function name to import from custom_compute_rollout_metrics_path."},
+    )
+    custom_compute_eval_metrics_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the controller-side evaluation metrics hook."},
+    )
+    custom_compute_eval_metrics_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Function name to import from custom_compute_eval_metrics_path."},
     )
     rollout_max_staleness: int = field(
         default=0,
@@ -1254,10 +1376,11 @@ class RLTrainingConfig(TrainingConfig):
     def __post_init__(self):
         super().__post_init__()
         if self.ce_compaction:
-            # TODO: support FSDP2 (SFT/GRPO/DSV4) via lm_head bypass gather before kernel.
-            assert self.training_backend == "mcore", (
-                "ce_compaction currently supports MCore GRPO only"
+            assert self.training_backend in ("mcore", "fsdp2"), (
+                "ce_compaction currently supports MCore and FSDP2 GRPO/GSPO only"
             )
+            if self.training_backend == "fsdp2":
+                assert self.use_linear_ce, "FSDP2 ce_compaction requires use_linear_ce=True"
             assert not self.apply_deterministic_mode, (
                 "ce_compaction has not been validated with apply_deterministic_mode=True"
             )
@@ -1295,7 +1418,9 @@ class RLTrainingConfig(TrainingConfig):
             )
         if self.dynamic_batch_train:
             assert self.single_controller
-            assert self.training_backend == "mcore"
+            assert self.training_backend in ("mcore", "fsdp2"), (
+                "dynamic_batch_train currently supports training_backend='mcore' or 'fsdp2'"
+            )
             assert self.filter_sampling_stage == "pre"
             assert not self.ppo_filter_samplings_path or self.ppo_filter_samplings_name
             assert (
@@ -1315,6 +1440,10 @@ class RLTrainingConfig(TrainingConfig):
                 f"unknown dynamic_batch_rollout_filter_strategy entries {unknown}; "
                 f"built-ins: {sorted(_DYNAMIC_BATCH_FILTERS)}"
             )
+        assert (
+            (self.custom_compute_eval_metrics_path
+             is None) == (self.custom_compute_eval_metrics_name is None)
+        ), "custom_compute_eval_metrics_path and name must be configured together"
         assert self.rollout_over_dispatch_ratio >= 1.0, (
             f"rollout_over_dispatch_ratio must be >= 1.0, "
             f"got {self.rollout_over_dispatch_ratio}"
@@ -1450,7 +1579,7 @@ class T2iRlTrainingConfig(RLTrainingConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        assert not self.ce_compaction, ("ce_compaction currently supports text GRPO only")
+        assert not self.ce_compaction, ("ce_compaction currently supports text GRPO/GSPO only")
 
 
 @dataclass

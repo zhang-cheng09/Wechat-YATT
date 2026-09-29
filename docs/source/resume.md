@@ -21,6 +21,17 @@ Enabling these two flags will result in abandoning the storage of the optimizer 
 --no-save-rng \
 ```
 
+### FSDP2: DeepSeek V4 / Qwen4Exp
+
+`checkpoint.save_distributed_ep_shard` 默认 `false`，保留原有跨 EP gather 后保存专家权重的路径。设置为 `true` 后，各 EP 分区仅在自身 FSDP 组内还原并写出专家权重，减少跨 EP 通信和内存占用；保存目录必须由所有 rank 共享（如 CephFS）。此开关仅控制 HF 权重保存，不改变优化器保存、加载或推理侧权重更新。
+
+`checkpoint.save_distributed_ep_shard` defaults to `false`, preserving the original cross-EP gather path. Enable it to restore and save experts within each EP partition's FSDP group, reducing cross-EP communication and memory usage. All ranks must share the output directory (e.g. CephFS). This affects only HF weight saving, not optimizer saving, loading, or inference-side weight updates.
+
+```yaml
+checkpoint:
+  save_distributed_ep_shard: true
+```
+
 ## load checkpoint (start)
 
 从 dirA load checkpoint，通过 `--finetune` 放弃掉其中的（sft）训练进度，开始下一轮 post train。

@@ -181,7 +181,7 @@ G-Core 拥有完整的 **Agentic RL** 基础设施，支持：
 
 - **TrajEnvManager**：管理多轮交互式 trajectory 环境，支持 tool calling、代码沙箱执行等 agent 场景。
 - **多种 Env 类型**：
-  - `RetoolDapoEnv`：Math ReTool + 代码沙箱交互环境
+  - `RetoolEnv`：Math ReTool + 代码沙箱交互环境
   - `InteractiveCliEnv`：CLI 交互式环境
   - `MiniProgram Env`：小程序交互环境
   - `Sokoban Env`：推箱子游戏环境（用于 agent 能力评测）
@@ -190,7 +190,7 @@ G-Core 拥有完整的 **Agentic RL** 基础设施，支持：
 - **树形采样 (BETA)**：支持 agent 场景下的多步 tree search 采样策略。
 - **GrpoAgenticTrainActor**：专用的 agentic 训练 actor，支持 step-level reward、GAE advantage 估计、trajectory 级别的数据处理。
 
-相关代码：`gpatch_v4/agentic/`、`gpatch_v4/actor/grpo_agentic_train_actor.py`、`tasks/retool/agentic_rl/`
+相关代码：`gpatch_v4/agentic/`、`gpatch_v4/actor/grpo_agentic_train_actor.py`、`tasks/retool/async_agent_loop/`
 
 
 ---

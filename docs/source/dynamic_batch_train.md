@@ -288,12 +288,12 @@ def compute_advantage(config, samples):
 
 配置：
 
-`tasks/retool/async_agent_loop/retool_dapo_agentic_dynamic_batch.yaml`
+`tasks/retool/async_agent_loop/yaml/retool_dapo_agentic_dynamic_batch.yaml`
 
 启动：
 
 ```bash
-bash tasks/retool/async_agent_loop/run_retool_dapo_agentic_dynamic_batch.sh
+bash tasks/retool/async_agent_loop/scripts/run_retool_dapo_agentic_dynamic_batch.sh
 ```
 
 该 demo 在原 ReTool colocate 配置上开启：

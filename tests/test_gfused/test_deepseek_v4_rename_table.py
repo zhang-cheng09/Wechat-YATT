@@ -76,6 +76,29 @@ def _gather_disk_keys() -> tuple[list[str], str]:
 
 
 class TestRenameTableRoundTrip(unittest.TestCase):
+    def test_mtp_output_norm_is_not_renamed_to_kv_norm(self):
+        from transformers.conversion_mapping import _build_checkpoint_conversion_mapping
+        from transformers.core_model_loading import WeightRenaming, rename_source_key
+
+        from gpatch_v4.models.deepseek_v4.checkpoint import (
+            _restore_mtp_output_norm_target,
+        )
+
+        conversions = _build_checkpoint_conversion_mapping()["deepseek_v4"]
+        renamings = [item for item in conversions if isinstance(item, WeightRenaming)]
+        renamed_key, _ = rename_source_key(
+            "layers.43.norm.weight", renamings, [], None, None
+        )
+        renamed_key, source_pattern = _restore_mtp_output_norm_target(
+            "mtp.0.norm.weight",
+            "layers.43.norm.weight",
+            renamed_key,
+            None,
+        )
+
+        self.assertEqual(renamed_key, "layers.43.norm.weight")
+        self.assertIsNone(source_pattern)
+
     def test_round_trips_hf_forward(self):
         from transformers.conversion_mapping import _build_checkpoint_conversion_mapping
         from transformers.core_model_loading import WeightRenaming, rename_source_key

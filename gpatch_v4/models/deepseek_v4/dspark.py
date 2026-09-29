@@ -12,14 +12,17 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from .cp import _ring_all_to_all
 from .modeling_deepseek_v4 import (
     DeepseekV4Attention,
+    DeepseekV4Embedding,
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
+    DeepseekV4LMHead,
     DeepseekV4RMSNorm,
     DeepseekV4SparseMoeBlock,
     apply_rotary_pos_emb,
     fp8_qat_linear,
     fp8_simulate_qat,
     sparse_attn_tilelang,
+    hc_post,
 )
 from .mtp import config_for_synthetic_layer
 from .thd import PackedSeqParams
@@ -694,27 +697,24 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         if self.stage_idx == 0:
             target_hidden_states = self.project_target(target_hidden_states)
         dtype = hidden_states.dtype
-        post, comb, collapsed = self.attn_hc(hidden_states)
+        # NOTE: DeepseekV4HyperConnection 单独 fully_shard，有 FSDP hooks
+        # 不能 compile 到它的 __call__，需要把 norm 传进去 compile forward
+        post, comb, collapsed = self.attn_hc(hidden_states, self.input_layernorm)
         attention_output, _ = self.self_attn(
-            self.input_layernorm(collapsed),
+            collapsed,
             target_hidden_states=target_hidden_states,
             target_position_embeddings=target_position_embeddings,
             draft_position_embeddings=draft_position_embeddings,
             sparse_topk=sparse_topk,
         )
-        hidden_states = post.to(dtype).unsqueeze(-1
-                                                ) * attention_output.unsqueeze(-2) + torch.matmul(
-                                                    comb.to(dtype).transpose(-1, -2), hidden_states
-                                                )
+        hidden_states = hc_post(attention_output, hidden_states, post, comb)
 
-        post, comb, collapsed = self.ffn_hc(hidden_states)
+        post, comb, collapsed = self.ffn_hc(hidden_states, self.post_attention_layernorm)
         mlp_output = self.mlp(
-            self.post_attention_layernorm(collapsed),
+            collapsed,
             input_ids=input_ids,
         )
-        hidden_states = post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), hidden_states
-        )
+        hidden_states = hc_post(mlp_output, hidden_states, post, comb)
 
         if not hasattr(self, "hc_head"):
             return hidden_states, target_hidden_states, None, None, None
@@ -771,8 +771,8 @@ class DeepseekV4DSparkModule(nn.Module):
         target_hidden_states: torch.Tensor,
         target_last_hidden_states: torch.Tensor,
         batch: DSparkBatch,
-        embed_weight: torch.Tensor,
-        lm_head_weight: torch.Tensor,
+        embed_tokens: DeepseekV4Embedding,
+        lm_head: DeepseekV4LMHead,
         packed_seq_params: PackedSeqParams | None = None,
         cp_group=None,
     ) -> DSparkForwardOutput:
@@ -804,7 +804,7 @@ class DeepseekV4DSparkModule(nn.Module):
             anchor_tokens,
             self.noise_token_id,
         )
-        hidden_states = F.embedding(noise_ids, embed_weight.detach())
+        hidden_states = embed_tokens(noise_ids, detach_param=True)
         hidden_states = hidden_states.unsqueeze(2).expand(
             -1,
             -1,
@@ -887,7 +887,7 @@ class DeepseekV4DSparkModule(nn.Module):
             gather_indices.unsqueeze(-1).expand(-1, -1, self.hidden_size),
         )
         head_inputs = torch.cat([normalized_hidden, aligned_target_hidden], dim=1)
-        all_logits = F.linear(head_inputs, lm_head_weight.detach())
+        all_logits = lm_head(head_inputs, detach_param=True)
         draft_base_logits, target_logits = all_logits.split(
             normalized_hidden.shape[1],
             dim=1,

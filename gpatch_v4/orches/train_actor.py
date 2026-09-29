@@ -159,6 +159,16 @@ class BaseActor(RayBaseActor):
         from gpatch_v4.utils import debug_moe
         debug_moe.install(self.config)
 
+        # torch.compile related settings
+        if not infer_only_mode:
+            if self.config.training.enable_torch_compile:
+                torch.compiler.set_stance('default')
+                torch._logging.set_logs(
+                    recompiles=self.config.training.log_torch_recompiles,
+                )
+            else:
+                torch.compiler.set_stance('force_eager')
+
     def set_logging_basic_config(self):
         """Configure Python logging with a standard format."""
         log_role = get_actor_log_role(self.__class__.__name__)

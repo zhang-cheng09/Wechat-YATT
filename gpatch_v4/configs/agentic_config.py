@@ -48,6 +48,29 @@ class EnvTemplateConfig(MappingProtocol):
     max_tokens_per_step: Optional[int] = field(
         default=None, metadata={"help": "max_tokens_per_step"}
     )
+    context_compaction_reserve_tokens: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Request context compaction before generation when fewer than "
+                "this many sequence tokens remain; zero disables the reserve."
+            )
+        },
+    )
+    context_compaction_trigger_tokens: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional absolute context-compaction trigger for custom Agent managers."},
+    )
+    skip_compaction_summary_segment: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Exclude only the compaction-summary policy response from the "
+                "training loss while retaining it as context. False trains the "
+                "summary response and is the default."
+            )
+        },
+    )
     env_manager_cls: str = field(
         default=
         "gpatch_v4.agentic.env_manager.step_vl_traj_env_manager_sokoban.StepVLTrajEnvManager",

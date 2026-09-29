@@ -575,7 +575,7 @@ class TestDeepseekV4DSparkBshdVsThd(unittest.TestCase):
             )
         assert world_size % ep_size == 0
 
-        fake_seq_lens = [100, 80, 120]
+        fake_seq_lens = [200, 160, 240]
 
         pg = placement_group(
             [{"GPU": 1, "CPU": 1}] * world_size, strategy="PACK",

@@ -147,6 +147,7 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
             load_format=load_format,
             log_level='info',
             allow_auto_truncate=infer_engine_config.allow_auto_truncate,
+            enable_weights_cpu_backup=infer_engine_config.enable_weights_cpu_backup,
             enable_custom_logit_processor=False,
             attention_backend=config.infer_result.attention_backend
             if hasattr(config, 'infer_result') else infer_engine_config.attention_backend,
@@ -158,7 +159,9 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
             sgl_mamba_full_memory_ratio=infer_engine_config.sgl_mamba_full_memory_ratio,
             sgl_mamba_scheduler_strategy=infer_engine_config.sgl_mamba_scheduler_strategy,
             sgl_enable_spec_v2=infer_engine_config.sgl_enable_spec_v2,
-            return_original_logprob=config.ppo.use_original_logprob,
+            return_original_logprob=(
+                config.ppo.use_original_logprob if hasattr(config, "ppo") else False
+            ),
             model_override_args=infer_engine_config.model_override_args,
             enable_return_routed_experts=config.training.moe_router_replay
             if hasattr(config, 'training') else False,
@@ -166,11 +169,9 @@ class GrpoSamplerActor(BaseActor, TokenizerMixin):
             placement_type=config.placement_type,
             pg_bundle_indices=pg_bundle_indices,
             base_gpu_id=base_gpu_id,
-            enable_mtp=(
-                self.config.training.enable_mtp and
-                getattr(self.config.training, "online_mtp_sft", False)
-            ),
+            enable_mtp=self.config.training.enable_mtp_rollout,
             seed=infer_engine_config.engine_seed,
+            model_arch=self.model_arch,
             **extra_infer_engine_config,
         )
         self.build_tokenizer()

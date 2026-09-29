@@ -390,7 +390,9 @@ def test_compaction_model_scope(model_arch: str, use_linear_ce: bool) -> None:
 
 
 def test_compaction_rejects_unsupported_configuration() -> None:
-    assert not FinetuneTrainingConfig().ce_compaction
+    default_training = FinetuneTrainingConfig()
+    assert not default_training.ce_compaction
+    assert default_training.linear_ce_backend == "tilelang"
     training = FinetuneTrainingConfig(ce_compaction=True)
     assert not training.use_linear_ce
     assert training.return_hidden_states_for_ce
@@ -400,10 +402,9 @@ def test_compaction_rejects_unsupported_configuration() -> None:
             cross_entropy_loss_fusion=True,
             cross_entropy_fusion_impl="linear",
         )
-    with pytest.raises(AssertionError, match="MCore SFT only"):
+    with pytest.raises(AssertionError, match="requires use_linear_ce=True"):
         FinetuneTrainingConfig(
             training_backend="fsdp2",
-            use_linear_ce=True,
             ce_compaction=True,
         )
     with pytest.raises(AssertionError, match="has not been validated"):

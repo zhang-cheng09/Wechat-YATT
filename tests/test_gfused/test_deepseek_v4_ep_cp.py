@@ -830,12 +830,12 @@ class TestFsdpVsEpCp(unittest.TestCase):
         )
 
     def test_fsdp_vs_ep_cp(self):
-        """EP+CP fused attn vs baseline, seq_len=256."""
-        self._fsdp_vs_ep_cp_impl(seq_len=256, attn_backend="fused", indexer_backend="fused")
+        """EP+CP fused attn vs baseline, seq_len=512."""
+        self._fsdp_vs_ep_cp_impl(seq_len=512, attn_backend="fused", indexer_backend="fused")
 
     def test_fsdp_vs_ep_cp_eager(self):
-        """EP+CP eager attn + fused indexer vs baseline, seq_len=256."""
-        self._fsdp_vs_ep_cp_impl(seq_len=256, attn_backend="eager", indexer_backend="eager", ep_backend="eager",
+        """EP+CP eager attn + fused indexer vs baseline, seq_len=512."""
+        self._fsdp_vs_ep_cp_impl(seq_len=512, attn_backend="eager", indexer_backend="eager", ep_backend="eager",
                                   master_port_base=12600)
 
     def test_fsdp_vs_ep_cp_s512(self):

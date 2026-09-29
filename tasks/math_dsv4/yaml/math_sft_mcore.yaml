@@ -33,6 +33,7 @@ training:
   exit_step: 1000                   # full-43L smoke: 1 step + 1 save, kill after
   recompute: True
   enable_mtp: True
+  online_mtp_sft: True
   mtp_loss_scaling_factor: 0.1
 
 policy:

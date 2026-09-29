@@ -17,6 +17,10 @@ from gpatch_v4.models.deepseek_v4.dspark import (
     build_dspark_sparse_topk,
     prepare_dspark_batch,
 )
+from gpatch_v4.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4Embedding,
+    DeepseekV4LMHead,
+)
 from gpatch_v4.models.deepseek_v4.thd import pack_sequences
 from gpatch_v4.models.deepseek_v4.weight_export import (
     _classify_for_save,
@@ -670,6 +674,41 @@ def test_dspark_confidence_head_has_no_bias():
     assert DSparkConfidenceHead(8).proj.bias is None
 
 
+def test_dspark_embedding_branch_does_not_update_shared_weight():
+    embed_tokens = DeepseekV4Embedding(4, 3)
+    main_ids = torch.tensor([[0, 1, 1]])
+    dspark_ids = torch.tensor([[1, 2]])
+
+    loss = (
+        embed_tokens(main_ids).sum()
+        + embed_tokens(dspark_ids, detach_param=True).sum()
+    )
+    loss.backward()
+
+    expected_grad = torch.zeros_like(embed_tokens.weight)
+    expected_grad[0] = 1
+    expected_grad[1] = 2
+    torch.testing.assert_close(embed_tokens.weight.grad, expected_grad)
+
+
+def test_dspark_lm_head_branch_only_backpropagates_to_activation():
+    lm_head = DeepseekV4LMHead(3, 4, bias=False)
+    main_input = torch.randn(2, 3, requires_grad=True)
+    dspark_input = torch.randn(2, 3, requires_grad=True)
+    weight = lm_head.weight.detach().clone()
+
+    loss = (
+        lm_head(main_input).sum()
+        + lm_head(dspark_input, detach_param=True).sum()
+    )
+    loss.backward()
+
+    expected_weight_grad = main_input.detach().sum(dim=0).expand_as(lm_head.weight)
+    expected_dspark_input_grad = torch.ones(2, 4) @ weight
+    torch.testing.assert_close(lm_head.weight.grad, expected_weight_grad)
+    torch.testing.assert_close(dspark_input.grad, expected_dspark_input_grad)
+
+
 def test_dspark_post_init_keeps_joint_model_trainable():
     model = nn.Module()
     model.model = nn.Linear(2, 2)
@@ -677,9 +716,11 @@ def test_dspark_post_init_keeps_joint_model_trainable():
     model.mtp = nn.Linear(2, 2)
     config = SimpleNamespace(
         training=SimpleNamespace(
+            enable_mtp=False,
+            online_mtp_sft=False,
             enable_dspark=True,
             online_train_dspark=True,
-            freeze_router_weight=False,
+            freeze_moe_router=False,
             freeze_csa_indexer=False,
             freeze_router_correction_bias=True,
         )
@@ -698,9 +739,11 @@ def test_dspark_post_init_freezes_mtp_when_load_only():
     model.mtp = nn.Linear(2, 2)
     config = SimpleNamespace(
         training=SimpleNamespace(
+            enable_mtp=False,
+            online_mtp_sft=False,
             enable_dspark=True,
             online_train_dspark=False,
-            freeze_router_weight=False,
+            freeze_moe_router=False,
             freeze_csa_indexer=False,
             freeze_router_correction_bias=True,
         )

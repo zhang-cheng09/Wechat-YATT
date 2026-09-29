@@ -115,6 +115,8 @@ class PackedSeqParams:
 
     qkv_format : str
         Always ``"thd"``.
+    cp_partition_mode : str
+        Always ``"contiguous"``.
     split_sizes_cont_to_zz : list of int, optional
         Per-destination token counts for contiguous-to-zigzag all-to-all.
         Populated by ``cp_chunk_data`` on the rank-local copy.
@@ -131,6 +133,7 @@ class PackedSeqParams:
     max_seqlen_q: int  # TODO unused: 外部未读
     total_seqlen: int  # used: cp.py:cp_chunk_data
     qkv_format: str = "thd"  # TODO unused: 仅 __post_init__ assert，没人读字段值
+    cp_partition_mode: str = "contiguous"
     # Derived layout, computed by :func:`pack_sequences` (or
     # :func:`make_packed_seq_layout`) at construction. Default ``None``
     # exists only so test fixtures can build a bare PSP without the layout
@@ -148,6 +151,7 @@ class PackedSeqParams:
         assert self.cu_seqlens_q_padded.dtype == torch.int64
         assert self.cu_seqlens_q.device == self.cu_seqlens_q_padded.device
         assert self.qkv_format == "thd"
+        assert self.cp_partition_mode == "contiguous"
         assert isinstance(self.max_seqlen_q, int) and self.max_seqlen_q > 0
         assert isinstance(self.total_seqlen, int) and self.total_seqlen > 0
         assert (self.split_sizes_cont_to_zz is None) == (self.split_sizes_zz_to_cont is None)

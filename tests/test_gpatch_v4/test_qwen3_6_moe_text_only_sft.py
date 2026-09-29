@@ -7,7 +7,7 @@ Two test suites:
     with random 2k-token input, verifies logits and gradients are finite.
 
     - test_fwd_bwd:         TP=2, EP=4
-    - test_fwd_bwd_with_cp: TP=2, CP=2, EP=2  (FLA CP path in gated_delta_net)
+    - test_fwd_bwd_with_cp: TP=2, CP=2, EP=2  (GDN chunkwise CP path)
 
 **TestHFvsMegatron** — Qwen3.5-0.8B (dense, 2–3 GPUs)
     Compares HF transformers ground truth against mbridge/Megatron output for the
@@ -131,7 +131,7 @@ class TestQwen36MoETextOnlyFwd(unittest.TestCase):
         self._run(tp=2, ep=4)
 
     def test_fwd_bwd_with_cp(self):
-        """TP=2, CP=2, EP=2 — exercises FLA context-parallel path in gated_delta_net."""
+        """TP=2, CP=2, EP=2 — exercises GDN chunkwise context-parallel path."""
         self._run(tp=2, ep=2, cp=2, master_port=12356)
 
 
@@ -145,7 +145,8 @@ class TestHFvsMegatron(unittest.TestCase):
 
     Uses the small dense Qwen3.5-0.8B model (has GDN with
     ``full_attention_interval=4``) so both HF and Megatron sides can
-    run on a small number of GPUs.
+    run on a small number of GPUs. HF worker uses ``attn_implementation=eager``
+    to avoid cuDNN SDPA on this image.
     """
     def setUp(self):
         ray.init(address="auto")
@@ -287,7 +288,7 @@ class TestHFvsMegatron(unittest.TestCase):
         )
 
     def test_hf_vs_megatron_with_cp(self):
-        """HF vs mbridge TP=1, CP=2 — validates FLA context-parallel GDN path."""
+        """HF vs mbridge TP=1, CP=2 — validates GDN chunkwise context-parallel path."""
         total_gpus = int(ray.cluster_resources().get("GPU", 0))
         if total_gpus < 3:
             self.skipTest(f"need >= 3 GPUs (1 HF + 2 mcore CP=2), only {total_gpus}")

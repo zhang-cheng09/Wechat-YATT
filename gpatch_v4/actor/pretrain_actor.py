@@ -163,6 +163,23 @@ class PretrainActor(FinetuneActor):
             ]
             timers("get_batched_data").stop()
 
+            # ``pretrain_packed`` moves tensors to CUDA in-place. Collect in cpu
+            mfu_batch_seqlens = None
+            mfu_images_seqlens = None
+            mfu_audio_seqlens = None
+            if self.flops_counter is not None and (train_step + 1) % self.calc_mfu_freq == 0:
+                mfu_batch_seqlens = self._get_mfu_batch_seqlens(
+                    microbatches, training_config.seq_length
+                )
+                mfu_images_seqlens = self._get_mfu_images_seqlens(
+                    microbatches, self.image_grid_thw_name
+                )
+                mfu_audio_seqlens = []
+                for microbatch in microbatches:
+                    audio_feature_lengths = microbatch.get("audio_feature_lengths")
+                    if audio_feature_lengths is not None:
+                        mfu_audio_seqlens.extend(audio_feature_lengths.tolist())
+
             if self.config.debug.save_every_rollout_data or (
                 self.config.debug.save_first_rollout_data and train_step == 0
             ):
@@ -202,6 +219,9 @@ class PretrainActor(FinetuneActor):
                 microbatches,
                 metric["time_perf/train_step"],
                 metric.get("pretrain/seq_length", training_config.seq_length),
+                batch_seqlens=mfu_batch_seqlens,
+                images_seqlens=mfu_images_seqlens,
+                audio_seqlens=mfu_audio_seqlens,
             )
             if mfu is not None:
                 metric["pretrain/mfu"] = mfu

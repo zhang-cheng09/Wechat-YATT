@@ -43,10 +43,13 @@ def _build_hf_fwd_bwd_worker():
         ).cuda()
 
         print(f"[HF] loading {hf_model_path} ...")
+        # Default sdpa hits cuDNN CUDNN_ATTENTION on this image
+        # (CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH). FSDP2 Qwen3.5 uses eager.
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             hf_model_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+            attn_implementation="eager",
         ).cuda()
         model.train()
         print(f"[HF] model loaded, running forward + backward ...")

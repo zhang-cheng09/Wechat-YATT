@@ -5,6 +5,7 @@ from typing import Dict
 import ray
 import torch
 import torch.distributed
+from typing_extensions import override
 
 from megatron.core import mpu
 
@@ -14,6 +15,13 @@ from gpatch_v4.core.smart_pad_helper import (
     DPBalanceHelper,
     smart_pad_train_get_reorder_rollout_batches,
 )
+from gpatch_v4.transfer import init_tq_connector
+from gpatch_v4.transfer.sample_hash import (
+    assert_grpo_positional_groups,
+    maybe_dump_tq_sample_hashes,
+)
+from gpatch_v4.transfer.tq_connector import KVBatchMeta
+from gpatch_v4.transfer.transfer_queue_interface import TQInterface
 from gpatch_v4.utils import (
     BroadcastUtils,
     FilterSamplingRegistry,
@@ -29,6 +37,7 @@ from gpatch_v4.utils import (
     logging_memory_usage,
     logging_memory_usage_details,
     logging_rank0,
+    record_engine_lrs,
     record_time_to_metrics,
     reduce_metrics,
     save_data,
@@ -48,6 +57,12 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
     driver-side ``RolloutController``. This actor only handles GPU-bound
     processing on controller-provided rollout shards plus PPO training.
     """
+    @override
+    async def init(self, config):
+        await super().init(config)
+        if config.tq.enable:
+            init_tq_connector(config.tq)
+
     def validated_config(self):
         super().validated_config()
 
@@ -89,6 +104,12 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
             "prev_ppo_step": self.prev_ppo_step,
         }
 
+    def set_training_schedule(self, total_ppo_step: int, ppo_step_per_epoch: int) -> None:
+        if total_ppo_step <= 0 or ppo_step_per_epoch <= 0:
+            raise ValueError(f"invalid training schedule: {total_ppo_step=} {ppo_step_per_epoch=}")
+        self.config.training.total_ppo_step = total_ppo_step
+        self.config.training.ppo_step_per_epoch = ppo_step_per_epoch
+
     def get_overlap_stats(self):
         """Return recorded timestamps for overlap verification (testing purpose).
 
@@ -115,9 +136,9 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
         Parameters
         ----------
         ppo_step : int
-        dp_refs : list[ray.ObjectRef]
-            One ``ObjectRef`` per DP rank, each containing a list of
-            rollout-batch dicts for that rank.
+        dp_refs : list
+            One entry per DP rank: ``Envelope`` of field-major batches, or
+            ``tuple[KVBatchMeta, ...]`` when TransferQueue is enabled.
 
         Returns
         -------
@@ -148,7 +169,28 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
         # Each DP rank picks its own shard
         dp_rank = mpu.get_data_parallel_rank()
         if is_mp_and_cp_head():
-            rbs = ray.get(dp_refs[dp_rank].inner_data)
+            if self.config.tq.enable:
+                #TODO（xiaotaoliu）: 暂时先不让非 head 节点也来读，避免打爆热点节点的带宽。
+                # 后面再看看是否直接每个 rnak 直接 get
+                metas = dp_refs[dp_rank]
+                assert isinstance(metas, tuple)
+                assert all(isinstance(meta, KVBatchMeta) for meta in metas)
+                rbs = TQInterface.restore_kv_batches(metas)
+                if not training_config.dynamic_batch_train:
+                    assert_grpo_positional_groups(
+                        rbs,
+                        training_config.sampling_repeat_n,
+                    )
+                maybe_dump_tq_sample_hashes(
+                    self.config,
+                    rbs,
+                    stage="restore",
+                    ppo_step=ppo_step,
+                    shard=f"dp{dp_rank}",
+                    chunk_size=training_config.sampling_repeat_n,
+                )
+            else:
+                rbs = ray.get(dp_refs[dp_rank].inner_data)
         else:
             num_microbatches = (
                 self.get_num_rollout_micro_batches() * getattr(training_config, "rb_multiplier", 1)
@@ -339,8 +381,7 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
                         )
                         _metrics = self.critic_engine.rl_train_value(ppo_step_iters)
                         extend_value_to_dict(metrics, _metrics)
-                    lr = self.critic_engine.step_and_get_lr()
-                    metrics["value/lr"] = lr
+                    record_engine_lrs(metrics, self.critic_engine, "value")
                 cpu_barrier()
                 logging_rank0("train value model done")
 
@@ -368,8 +409,7 @@ class GrpoAsyncTrainActor(GrpoTrainActor):
                     self.compact_thread, training_config.ppo_dump_metrics_dir
                 )
 
-            lr = self.policy_engine.step_and_get_lr()
-            metrics["policy/lr"] = lr
+            record_engine_lrs(metrics, self.policy_engine, "policy")
             end_time = sync_cuda_and_get_time()
             metrics["time_perf/total_time"] = end_time - begin_time
 

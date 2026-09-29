@@ -232,6 +232,8 @@ class ExternalRewardConfig(MappingProtocol):
     Attributes
     ----------
     reward_info : list of ExternalRewardInfo or None
+    eval_reward_info : list of ExternalRewardInfo or None
+        Optional evaluation override, used only when training.use_external_reward is true.
     async_eval : bool
         Start evaluation reward requests asynchronously and report when
         ready (polled each train step; forced wait at the next eval / exit).
@@ -242,6 +244,7 @@ class ExternalRewardConfig(MappingProtocol):
         eval overlap).
     """
     reward_info: Optional[List[ExternalRewardInfo]] = field(default=None)
+    eval_reward_info: Optional[List[ExternalRewardInfo]] = field(default=None)
     async_eval: bool = field(
         default=False,
         metadata={

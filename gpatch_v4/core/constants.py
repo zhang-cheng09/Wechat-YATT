@@ -1,6 +1,8 @@
 # coding=utf-8
 # copyright (c) 2025 tencent inc. all rights reserved.
 
+from enum import Enum
+
 # Model arch 这个字段从 transformers 内获取，避免不规范的写法，例如 "qwen3moe" "qwen2p5vl" "qwen25vl"
 # https://github.com/huggingface/transformers/tree/main/src/transformers/models
 #
@@ -61,6 +63,8 @@ class MODEL_ARCH:
     WEMM3_EMBEDDING = 'wemm3_embedding'
     WEMM3_5_EMBEDDING = 'wemm3_5_embedding'
     WEMM3_5_MOE_EMBEDDING = 'wemm3_5_moe_embedding'
+    WEMM3_5_VIDEO_EMBEDDING = 'wemm3_5_video_embedding'
+    WEMM3_5_MOE_VIDEO_EMBEDDING = 'wemm3_5_moe_video_embedding'
 
     # diffusion
     STABLE_DIFFUSION_V1_5 = 'stable_diffusion_v1_5'  # https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5
@@ -72,3 +76,10 @@ class MODEL_ARCH:
     QWEN_IMAGE_EDIT = 'qwen_image_edit'
     # vae
     # 暂无特殊规则
+
+
+class PrepareDataRole(str, Enum):
+    """Which model ``PrepareDataForward`` is preparing data for."""
+
+    POLICY = "policy"
+    TEACHER = "teacher"

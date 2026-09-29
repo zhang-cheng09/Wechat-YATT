@@ -1,18 +1,22 @@
 import os
 import shutil
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import ray
 import torch
+from hydra import compose, initialize_config_dir
 
 from gpatch_v4.configs.config import RlConfig
+from gpatch_v4.configs.utils import merge_hydra_config
 from gpatch_v4.extended_model.welm_v4 import (
     WelmV4PrepareDataForwardLLM,
     _flatten_routed_experts_for_dynamic_cp,
     _restore_packed_routed_experts,
 )
-from gpatch_v4.training_backend.fsdp2_backend.mixin import ForwardStepMixin
+from gpatch_v4.training_backend.fsdp2_backend.mixin import RouterReplayMixin
 from gpatch_v4.training_backend.megatron_backend.mixin import (
     ForwardStepMixin as McoreForwardStepMixin,
 )
@@ -25,15 +29,29 @@ from gpatch_v4_test_helper import (
 )
 
 
+def _qwen4_exp_is_importable() -> bool:
+    try:
+        from transformers import Qwen4ExpForConditionalGeneration
+    except ImportError:
+        return False
+    return Qwen4ExpForConditionalGeneration is not None
+
+
+requires_qwen4_exp = unittest.skipUnless(
+    _qwen4_exp_is_importable(), "transformers does not support qwen4_exp"
+)
+
+
 class PackedRouterReplayUnitTest(unittest.TestCase):
-    @patch("gpatch_v4.training_backend.fsdp2_backend.mixin.mpu")
+    @patch("gpatch_v4.training_backend.fsdp2_backend.mixin.router_replay.mpu")
     def test_thd_replay_indices_follow_packed_cp_slice(self, mock_mpu):
         mock_mpu.get_context_parallel_world_size.return_value = 2
         mock_mpu.get_context_parallel_rank.return_value = 1
         mock_mpu.get_data_parallel_rank.return_value = 0
 
-        mixin = ForwardStepMixin.__new__(ForwardStepMixin)
-        mixin._topk_layer_indices = [0, 2]
+        mixin = RouterReplayMixin.__new__(RouterReplayMixin)
+        mixin.policy_config = SimpleNamespace(model_arch="deepseek_v4")
+        mixin.hf_config = SimpleNamespace(mlp_layer_types=["moe", "hash_moe", "moe"])
         routed0 = torch.arange(3 * 3 * 2).view(3, 3, 2)
         routed1 = 100 + torch.arange(3 * 3 * 2).view(3, 3, 2)
         batches = [
@@ -61,14 +79,15 @@ class PackedRouterReplayUnitTest(unittest.TestCase):
         self.assertTrue(torch.equal(per_layer[0], routed1[expected_rows, 0, :].long()))
         self.assertTrue(torch.equal(per_layer[1], routed1[expected_rows, 2, :].long()))
 
-    @patch("gpatch_v4.training_backend.fsdp2_backend.mixin.mpu")
+    @patch("gpatch_v4.training_backend.fsdp2_backend.mixin.router_replay.mpu")
     def test_thd_replay_cp_slice_can_start_inside_segment(self, mock_mpu):
         mock_mpu.get_context_parallel_world_size.return_value = 2
         mock_mpu.get_context_parallel_rank.return_value = 1
         mock_mpu.get_data_parallel_rank.return_value = 0
 
-        mixin = ForwardStepMixin.__new__(ForwardStepMixin)
-        mixin._topk_layer_indices = [0]
+        mixin = RouterReplayMixin.__new__(RouterReplayMixin)
+        mixin.policy_config = SimpleNamespace(model_arch="deepseek_v4")
+        mixin.hf_config = SimpleNamespace(mlp_layer_types=["moe"])
         routed0 = torch.arange(4 * 2).view(4, 1, 2)
         routed1 = 100 + torch.arange(6 * 2).view(6, 1, 2)
         batches = [
@@ -226,6 +245,34 @@ class DynamicCPRouterReplayUnitTest(unittest.TestCase):
         expected = routed_experts[torch.tensor([4, 5, 6, 7]), 1, :].long()
         self.assertTrue(torch.equal(captured[0][0], expected))
 
+    def test_mcore_packed_replay_uses_cp_local_routed_experts_length(self):
+        mixin = McoreForwardStepMixin.__new__(McoreForwardStepMixin)
+        mixin.get_router_replay_manager = lambda: SimpleNamespace(enabled=True)
+        captured = {}
+
+        def prepare_for_router_replay(batches, seqlen, *, packed_thd):
+            captured["batches"] = batches
+            captured["seqlen"] = seqlen
+            captured["packed_thd"] = packed_thd
+
+        mixin.prepare_for_router_replay = prepare_for_router_replay
+        batch = {
+            # Qwen3-VL keeps the full token stream for multimodal embedding.
+            "tokens": torch.arange(8).view(1, -1),
+            # Router metadata follows the CP-local hidden-state stream.
+            "routed_experts": torch.arange(4 * 3 * 2).view(4, 3, 2),
+        }
+
+        mixin.maybe_prepare_for_router_replay(
+            [batch],
+            seqlen=batch["tokens"].shape[-1],
+            packed_thd=True,
+        )
+
+        self.assertEqual(captured["batches"], [batch])
+        self.assertEqual(captured["seqlen"], 4)
+        self.assertTrue(captured["packed_thd"])
+
 
 class RouterReplayR3Test(unittest.IsolatedAsyncioTestCase):
     """End-to-end R3 (router replay) tests for SGLang and vLLM backends.
@@ -255,7 +302,8 @@ class RouterReplayR3Test(unittest.IsolatedAsyncioTestCase):
             trainer = GrpoTrainer()
             metrics = await trainer.launch_then_run_with_recovery(config)
         finally:
-            shutil.rmtree(config.checkpoint.save_ckpt_path, ignore_errors=True)
+            if os.getenv("GPATCH_KEEP_R3_LOGS") != "1":
+                shutil.rmtree(config.checkpoint.save_ckpt_path, ignore_errors=True)
         return metrics
 
     def _assert_metrics(self, metrics):
@@ -280,6 +328,38 @@ class RouterReplayR3Test(unittest.IsolatedAsyncioTestCase):
     @requires_sglang
     async def test_r3_sglang(self):
         config = load_config('test_math_rl_r3', RlConfig)
+        metrics = await self._run_r3_train(config)
+        self._assert_metrics(metrics)
+
+    @requires_sglang
+    @requires_qwen4_exp
+    async def test_qwen3_8_flash_next_r3_sglang(self):
+        if not ray.is_initialized():
+            try:
+                ray.init(address="auto")
+            except ConnectionError:
+                self.skipTest("requires an initialized Ray cluster with at least 64 GPUs")
+        gpu_count = ray.cluster_resources().get("GPU", 0)
+        if gpu_count < 64:
+            ray.shutdown()
+            self.skipTest(f"requires at least 64 GPUs, Ray cluster has {gpu_count}")
+        # Trainer/orches will call ray.init(); disconnect driver first.
+        ray.shutdown()
+
+        config_dir = Path(__file__).resolve().parents[2] / "tasks/qwen3_8_next/yaml"
+        with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+            config = merge_hydra_config(RlConfig, compose(config_name="grpo_fsdp2"))
+        config.data.data_pathes = ["tests/test_gpatch_v4/gsm8k_small"]
+        # gsm8k uses question/answer; production yaml points at dapo_dataset.
+        config.data.py_path = "tests/test_gpatch_v4/custom_py/simple_dataset.py"
+        config.data.fn_name = "get_dataset_and_dataloader"
+        config.checkpoint.load_ckpt_path = "load_qwen3_8_flash_next_r3_test"
+        config.checkpoint.save_ckpt_path = "save_qwen3_8_flash_next_r3_test"
+        config.training.auto_load_from_save_ckpt = False
+        config.training.exit_step = 1
+        config.debug.disable_save_checkpoint = True
+        config.debug.trainer_return_ppo_step_metrics = True
+
         metrics = await self._run_r3_train(config)
         self._assert_metrics(metrics)
 

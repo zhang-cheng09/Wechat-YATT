@@ -5,7 +5,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from gpatch_v4.configs.config import _resolve_legacy_loss
 from gpatch_v4.configs.ppo_config import PpoConfig
+from gpatch_v4.configs.training_config import TrainingConfig
 from gpatch_v4.training_backend.loss import (
     PolicyLossInput,
     get_loss_fn,
@@ -30,7 +32,9 @@ def _make_config(**overrides):
         ppo_logps_ratio_clamp=20.0,
     )
     kwargs.update(overrides)
-    return types.SimpleNamespace(ppo=PpoConfig(**kwargs))
+    config = types.SimpleNamespace(ppo=PpoConfig(**kwargs), training=TrainingConfig())
+    _resolve_legacy_loss(config.training, config.ppo)
+    return config
 
 
 def _make_loss_input(curr_log_probs: torch.Tensor, **overrides) -> PolicyLossInput:

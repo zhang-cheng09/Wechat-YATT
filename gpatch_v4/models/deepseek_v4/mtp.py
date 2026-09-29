@@ -14,6 +14,7 @@ from .modeling_deepseek_v4 import (
     DeepseekV4HyperHead,
     DeepseekV4RMSNorm,
     DeepseekV4SparseMoeBlock,
+    hc_post,
 )
 
 try:
@@ -288,25 +289,22 @@ class DeepseekV4MTPBlock(GradientCheckpointingLayer):
                 self._rotary_emb(embed_input, position_ids=position_ids, layer_type="compress"),
         }
 
-        dtype = hidden_states.dtype
-        post, comb, collapsed = self.attn_hc(hidden_states)
+        # NOTE: DeepseekV4HyperConnection 单独 fully_shard，有 FSDP hooks
+        # 不能 compile 到它的 __call__，需要把 norm 传进去 compile forward
+        post, comb, collapsed = self.attn_hc(hidden_states, self.input_layernorm)
         attn_output, _ = self.self_attn(
-            self.input_layernorm(collapsed),
+            collapsed,
             position_embeddings=position_embeddings,
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             **kwargs,
         )
-        hidden_states = post.to(dtype).unsqueeze(-1) * attn_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), hidden_states
-        )
+        hidden_states = hc_post(attn_output, hidden_states, post, comb)
 
-        post, comb, collapsed = self.ffn_hc(hidden_states)
-        mlp_output = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
-        hidden_states = post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), hidden_states
-        )
+        post, comb, collapsed = self.ffn_hc(hidden_states, self.post_attention_layernorm)
+        mlp_output = self.mlp(collapsed, input_ids=input_ids)
+        hidden_states = hc_post(mlp_output, hidden_states, post, comb)
 
         prediction_hidden = self.norm(self.hc_head(hidden_states))
         return hidden_states, prediction_hidden

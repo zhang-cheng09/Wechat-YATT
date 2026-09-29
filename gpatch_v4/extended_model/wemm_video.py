@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Tuple
 import torch
 from typing_extensions import override
 
+from megatron_datasets.utils import build_forbidden_token_ids
+
 from megatron.core import mpu, parallel_state
 from megatron.core.datasets.data_schedule_utils import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -13,7 +15,7 @@ try:
 except ImportError:
     qwen3vl_parallel_split = None
 
-from gpatch_v4.configs.config import FinetuneConfig
+from gpatch_v4.configs.config import FinetuneConfig, OffPolicyDistillConfig
 from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.extended_model.base import PrepareDataForward
 from gpatch_v4.extended_model.mtp_mixin import OnlineMtpSftMixin
@@ -33,6 +35,15 @@ from gpatch_v4.utils.dynamic_cp_utils import (
 
 
 class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
+    @property
+    def forbidden_token_ids(self):
+        # random padding 不能生成多模态占位 token，否则 mask 与 embeds 数量对不上
+        if not hasattr(self, "_forbidden_token_ids"):
+            self._forbidden_token_ids = (
+                build_forbidden_token_ids(self.role_config.hf_config) or None
+            )
+        return self._forbidden_token_ids
+
     def rl_train_cp_chunk_single_data(
         self,
         data: torch.Tensor,
@@ -62,7 +73,7 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         # not support padding image now
         hw_factor = 4
-        if self.config.policy.model_arch in [
+        if self.role_config.model_arch in [
             MODEL_ARCH.QWEN3_5, MODEL_ARCH.QWEN3_5_MOE, MODEL_ARCH.QWEN3_5_WEMM,
             MODEL_ARCH.QWEN3_5_MOE_WEMM
         ]:
@@ -401,7 +412,10 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         return batch, fwd_kwargs
 
     def _get_default_vision_type(self, config):
-        if isinstance(config, FinetuneConfig):
+        # OPD uses the SFT dataloader / collate (fp32 pixels). Dyn-CP pack
+        # only needs a homogeneous dtype that matches this contract; it does
+        # not require bf16.
+        if isinstance(config, (FinetuneConfig, OffPolicyDistillConfig)):
             return torch.float32
         return torch.bfloat16
 
@@ -426,6 +440,8 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         seq_len: int,
         pad_token_id: int,
         pad_with_random_token: bool = False,
+        vocab_size: int = 0,
+        forbidden_token_ids=None,
     ):
         # 先判断 labels 是否有被 shift 过
         assert tokens.shape == labels.shape, f"{tokens.shape=}, {labels.shape=}"
@@ -435,7 +451,12 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         if tokens.shape[-1] <= seq_len:
             # 多加一位是为了 shift
             tokens = pad_or_truncate_last_dim(
-                tokens, seq_len + 1, pad_token_id, pad_with_random_token=pad_with_random_token
+                tokens,
+                seq_len + 1,
+                pad_token_id,
+                pad_with_random_token=pad_with_random_token,
+                vocab_size=vocab_size,
+                forbidden_token_ids=forbidden_token_ids,
             )
             labels = pad_or_truncate_last_dim(labels, seq_len + 1, -100)
             tokens = tokens[:-1]
@@ -479,6 +500,8 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 seq_len,
                 pad_token_id,
                 pad_with_random_token,
+                vocab_size=kwargs.get("vocab_size", 0),
+                forbidden_token_ids=self.forbidden_token_ids,
             )
 
             tokens_l.append(tokens)
@@ -613,7 +636,7 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         cp_size = dp_cp_group.size() // dp_size
         assert cp_size == mpu.get_context_parallel_world_size()
 
-        dist_config = self.config.policy.dist_config
+        dist_config = self.role_config.dist_config
         scheduler_type = dist_config.dynamic_cp_scheduler_type
         scheduler_max_seqlen = kwargs.get(
             "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
@@ -676,6 +699,8 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 pad_len,
                 pad_token_id,
                 pad_with_random_token,
+                vocab_size=kwargs.get("vocab_size", 0),
+                forbidden_token_ids=self.forbidden_token_ids,
             )
 
             gbs_batches[i] = dict(
@@ -918,7 +943,7 @@ class WemmVideoPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         dp_size = dp_group.size()
         cp_size = dp_cp_group.size() // dp_size
 
-        dist_config = self.config.policy.dist_config
+        dist_config = self.role_config.dist_config
         scheduler_max_seqlen = kwargs.get(
             "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
         )

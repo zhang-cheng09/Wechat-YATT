@@ -24,7 +24,13 @@ class HpModelBuilder:
     def validate(self, engine: Any) -> None:
         return
 
-    def prepare_config(self, model_cls: type, hf_model_path: str, engine: Any) -> Any:
+    def prepare_config(
+        self,
+        model_cls: type,
+        hf_model_path: str,
+        engine: Any,
+        model_only_inference: bool,
+    ) -> Any:
         raise NotImplementedError
 
     def apply_hp(self, model: Module, engine: Any) -> Module:
@@ -38,7 +44,7 @@ class HpModelBuilder:
         model_only_inference: bool,
     ) -> Module:
         self.validate(engine)
-        cfg = self.prepare_config(model_cls, hf_model_path, engine)
+        cfg = self.prepare_config(model_cls, hf_model_path, engine, model_only_inference)
         model = meta_construct_fp32(model_cls, cfg)
         model = self.apply_hp(model, engine)
         model.load_checkpoint_hp(hf_model_path)

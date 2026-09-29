@@ -6,6 +6,7 @@ from gpatch_v4.training_backend.fsdp2_backend.hp_builder.base import HpModelBuil
 from gpatch_v4.training_backend.fsdp2_backend.hp_builder.deepseek_v4 import (
     DefaultHpBuilder,
 )
+from gpatch_v4.training_backend.fsdp2_backend.hp_builder.qwen3_5 import Qwen3_5HpBuilder
 from gpatch_v4.training_backend.fsdp2_backend.hp_builder.qwen4_exp import (
     Qwen4ExpHpBuilder,
 )
@@ -14,6 +15,7 @@ _DEFAULT_HP_BUILDER = DefaultHpBuilder()
 
 HP_BUILDER_MAP: dict[str, HpModelBuilder] = {
     MODEL_ARCH.DEEPSEEK_V4: _DEFAULT_HP_BUILDER,
+    MODEL_ARCH.QWEN3_5: Qwen3_5HpBuilder(),
     MODEL_ARCH.QWEN4_EXP: Qwen4ExpHpBuilder(),
 }
 
@@ -27,6 +29,7 @@ __all__ = [
     "DefaultHpBuilder",
     "HP_BUILDER_MAP",
     "HpModelBuilder",
+    "Qwen3_5HpBuilder",
     "Qwen4ExpHpBuilder",
     "get_hp_builder",
 ]

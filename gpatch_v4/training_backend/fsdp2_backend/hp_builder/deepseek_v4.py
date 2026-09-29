@@ -20,14 +20,20 @@ except ImportError:
 
 class DefaultHpBuilder(HpModelBuilder):
     """DSV4-style HP path (also the fallback for unregistered HpModule arches)."""
-    def prepare_config(self, model_cls: type, hf_model_path: str, engine: Any) -> Any:
+    def prepare_config(
+        self,
+        model_cls: type,
+        hf_model_path: str,
+        engine: Any,
+        model_only_inference: bool,
+    ) -> Any:
         cfg = model_cls.config_class.from_pretrained(hf_model_path, trust_remote_code=True)
 
         # HP Module 其实不用这个字段，写一个 'eager' fallback 下
         cfg._attn_implementation = 'eager'
 
-        enable_mtp = engine.training_config.enable_mtp
-        enable_dspark = engine.training_config.enable_dspark
+        enable_mtp = engine.training_config.enable_mtp and not model_only_inference
+        enable_dspark = engine.training_config.enable_dspark and not model_only_inference
         mtp_num_layers = int(cfg.num_nextn_predict_layers)
         if enable_dspark:
             assert cfg.dspark_block_size > 0

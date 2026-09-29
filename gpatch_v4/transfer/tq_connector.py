@@ -7,9 +7,11 @@ import subprocess
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence
 from urllib.parse import urlparse
 
+import torch
 from tensordict import TensorDict
 
 try:
@@ -19,16 +21,26 @@ except ImportError:
     tq = None
     KVBatchMeta = None
 
-from gpatch_v4.configs.tq_config import TqConfig
+from gpatch_v4.configs.tq_config import TransferQueueConfig
 from gpatch_v4.orches.utils import get_current_node_ip
 from gpatch_v4.utils import log
 
-__all__ = ["TqConnector"]
+__all__ = ["KVBatchMeta", "TqConnector"]
+
+
+def _td_nbytes(tensor_dict: TensorDict) -> int:
+    total = 0
+    for value in tensor_dict.values():
+        if torch.is_tensor(value):
+            total += value.numel() * value.element_size()
+        elif hasattr(value, "nbytes"):
+            total += int(value.nbytes)
+    return total
 
 
 class TqConnector:
     """Offload and restore payload data through TransferQueue."""
-    def __init__(self, tq_config: TqConfig) -> None:
+    def __init__(self, tq_config: TransferQueueConfig) -> None:
         self.tq_config = tq_config
         if not self.tq_config.partition_id:
             raise ValueError("tq.partition_id must be set before initializing TqConnector")
@@ -52,7 +64,7 @@ class TqConnector:
                 logging.getLogger(name).setLevel(level_name)
 
     def close(self) -> None:
-        """Close this process's TransferQueue runtime and its managed subprocesses."""
+        """Close the driver-owned TQ runtime and shared backend services."""
         tq.close()
         if self.tq_config.backend == "MooncakeStore":
             self._terminate_mooncake_processes()
@@ -98,17 +110,36 @@ class TqConnector:
         prefix = TqConnector._key_prefix(ppo_step)
         return [f"{prefix}{uuid.uuid4().hex}" for _ in range(count)]
 
-    async def async_set(
+    async def async_put(
         self,
         tensor_dict: TensorDict,
         key: str | Sequence[str],
         ppo_step: int,
+        schema_fields: Sequence[str] | None = None,
     ) -> KVBatchMeta:
-        """Store one or more TensorDict rows under caller-provided keys."""
+        """Upsert TensorDict rows while retaining their complete field schema.
+
+        Parameters
+        ----------
+        tensor_dict : TensorDict
+            Batch dimension must align one-to-one with ``key``.
+        key : str or Sequence[str]
+        ppo_step : int
+            Rollout-production step retained in backend tags.
+        schema_fields : Sequence[str], optional
+            Complete post-upsert schema; defaults to fields in ``tensor_dict``.
+
+        Returns
+        -------
+        KVBatchMeta
+            Backend metadata for the affected rows.
+        """
         keys = [key] if isinstance(key, str) else list(key)
         assert len(keys) == int(tensor_dict.batch_size[0])
-        field_names = sorted(str(name) for name in tensor_dict.keys())
-        return await tq.async_kv_batch_put(
+        put_fields = sorted(str(name) for name in tensor_dict.keys())
+        field_names = put_fields if schema_fields is None else sorted(set(schema_fields))
+        assert set(put_fields).issubset(field_names)
+        meta = await tq.async_kv_batch_put(
             keys=keys,
             partition_id=self.tq_config.partition_id,
             fields=tensor_dict,
@@ -117,42 +148,106 @@ class TqConnector:
                 "fields": field_names,
             }] * len(keys),
         )
-
-    async def async_get(self, key: str | Sequence[str]) -> TensorDict:
-        """Restore TensorDict rows by their user-provided keys."""
-        keys = [key] if isinstance(key, str) else list(key)
-        return await tq.async_kv_batch_get(
-            keys=keys,
-            partition_id=self.tq_config.partition_id,
+        log(
+            f"[TQ] put n_keys={len(keys)} fields={put_fields} "
+            f"schema_fields={field_names} "
+            f"nbytes={_td_nbytes(tensor_dict)} ppo_step={ppo_step} "
+            f"backend={self.tq_config.backend} "
+            f"partition_id={self.tq_config.partition_id}"
         )
+        return meta
 
-    def get(self, key: str | Sequence[str]) -> TensorDict:
-        """Synchronously restore TensorDict rows by user-provided keys."""
+    async def async_get(
+        self,
+        key: str | Sequence[str],
+        fields: Sequence[str] | None = None,
+    ) -> TensorDict:
+        """Restore TensorDict rows by keys, optionally restricted to ``fields``.
+
+        Parameters
+        ----------
+        key : str or Sequence[str]
+        fields : Sequence[str], optional
+            Column subset passed to TransferQueue as ``select_fields``.
+            ``None`` restores every stored field on those keys.
+        """
         keys = [key] if isinstance(key, str) else list(key)
-        return tq.kv_batch_get(
-            keys=keys,
-            partition_id=self.tq_config.partition_id,
+        kwargs: Dict[str, Any] = {
+            "keys": keys,
+            "partition_id": self.tq_config.partition_id,
+        }
+        if fields is not None:
+            kwargs["select_fields"] = list(fields)
+        tensor_dict = await tq.async_kv_batch_get(**kwargs)
+        field_names = list(fields) if fields is not None else "ALL"
+        log(
+            f"[TQ] get n_keys={len(keys)} fields={field_names} "
+            f"nbytes={_td_nbytes(tensor_dict)} "
+            f"backend={self.tq_config.backend} "
+            f"partition_id={self.tq_config.partition_id}"
+        )
+        return tensor_dict
+
+    def get(
+        self,
+        key: str | Sequence[str],
+        fields: Sequence[str] | None = None,
+    ) -> TensorDict:
+        """Synchronously restore TensorDict rows, optionally column-filtered."""
+        keys = [key] if isinstance(key, str) else list(key)
+        kwargs: Dict[str, Any] = {
+            "keys": keys,
+            "partition_id": self.tq_config.partition_id,
+        }
+        if fields is not None:
+            kwargs["select_fields"] = list(fields)
+        tensor_dict = tq.kv_batch_get(**kwargs)
+        field_names = list(fields) if fields is not None else "ALL"
+        log(
+            f"[TQ] get n_keys={len(keys)} fields={field_names} "
+            f"nbytes={_td_nbytes(tensor_dict)} "
+            f"backend={self.tq_config.backend} "
+            f"partition_id={self.tq_config.partition_id}"
+        )
+        return tensor_dict
+
+    async def async_clear(self, key: str | Sequence[str]) -> None:
+        """Clear caller-selected keys using their latest field schemas."""
+        keys = [key] if isinstance(key, str) else list(key)
+        partition_id = self.tq_config.partition_id
+        assert partition_id is not None
+        partition_info = await tq.async_kv_list(partition_id=partition_id)
+        key_meta = partition_info.get(partition_id, {})
+        for grouped_keys in self._group_keys_by_fields(key_meta, keys):
+            await tq.async_kv_clear(
+                keys=grouped_keys,
+                partition_id=partition_id,
+            )
+        log(
+            f"[TQ] clear n_keys={len(keys)} "
+            f"backend={self.tq_config.backend} "
+            f"partition_id={partition_id}"
         )
 
     @staticmethod
     def _group_keys_by_fields(
         key_meta: Dict[str, Any],
-        prefix: str,
+        keys: Sequence[str],
     ) -> List[List[str]]:
-        """Group listed keys that share the same TransferQueue field schema.
+        """Group selected keys by the latest TransferQueue field schema.
 
-        Mooncake/KV ``async_kv_clear`` only keeps fields present on every key
-        in one call. Prompt and hidden payloads have disjoint fields, so a
-        mixed clear produces empty ``field_names`` and fails.
+        ``async_kv_clear`` intersects fields across each call, so heterogeneous
+        schemas must be cleared separately to remove every stored field.
         """
+        missing_keys = [key for key in keys if key not in key_meta]
+        assert not missing_keys, f"TQ keys missing before clear: {missing_keys}"
         groups: dict[tuple[str, ...], List[str]] = defaultdict(list)
         ungrouped: List[str] = []
-        for key, meta in key_meta.items():
-            if not key.startswith(prefix):
-                continue
+        for key in keys:
+            meta = key_meta[key]
             fields = meta.get("fields") if isinstance(meta, dict) else None
             if fields:
-                groups[tuple(fields)].append(key)
+                groups[tuple(sorted(str(field) for field in fields))].append(key)
             else:
                 ungrouped.append(key)
         grouped_keys = list(groups.values())
@@ -165,11 +260,13 @@ class TqConnector:
         assert partition_id is not None
         partition_info = await tq.async_kv_list(partition_id=partition_id)
         prefix = self._key_prefix(ppo_step)
-        for keys in self._group_keys_by_fields(
-            partition_info.get(partition_id, {}),
-            prefix,
+        key_meta = partition_info.get(partition_id, {})
+        keys = [key for key in key_meta if key.startswith(prefix)]
+        for grouped_keys in self._group_keys_by_fields(
+            key_meta,
+            keys,
         ):
             await tq.async_kv_clear(
-                keys=keys,
+                keys=grouped_keys,
                 partition_id=partition_id,
             )

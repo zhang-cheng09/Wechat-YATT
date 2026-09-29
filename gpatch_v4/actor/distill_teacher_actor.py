@@ -9,12 +9,15 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 import torch.distributed
+from transformers import AutoConfig
+from typing_extensions import override
 
 from megatron.core import mpu
 from megatron.core import parallel_state as mcore_parallel_state
 
 from gpatch_v4.actor.mixin import RlTrainerMixin, TokenizerMixin
 from gpatch_v4.configs.dist_config import DistConfig
+from gpatch_v4.core.constants import PrepareDataRole
 from gpatch_v4.core.mappings import all_gather_from_context_parallel_region
 from gpatch_v4.core.parallel_state import (
     cpu_barrier,
@@ -28,11 +31,7 @@ from gpatch_v4.extended_model import PrepareDataForwardFactory
 from gpatch_v4.orches.train_actor import BaseActor
 from gpatch_v4.training_backend import TrainingEngineFactory
 from gpatch_v4.transfer import init_tq_connector
-from gpatch_v4.transfer.utils import (
-    TqPayloadType,
-    async_offload_to_tq,
-    async_restore_from_tq,
-)
+from gpatch_v4.transfer.transfer_queue_interface import TQInterface, TqPayloadType
 from gpatch_v4.utils import (
     BroadcastUtils,
     clear_memory,
@@ -72,16 +71,22 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
         self.computed = False
         self.batching_reqs: List[Dict[str, Any]] = []
         self.compute_logps_results: Dict[int, Dict[int, Dict]] = {}
+        self.streaming_reqs: List[Dict[str, Any]] = []
+        self.streaming_logps_results: Dict[str, Dict[str, Any]] = {}
         self.load_hf_config()
         self.teacher_engine.prepare_data = PrepareDataForwardFactory.get_prepare_data_fwd(
-            config, config.teacher.model_arch
+            config, config.teacher.model_arch, role=PrepareDataRole.TEACHER
         )
         logging_rank0(
             f"prepare_data={type(self.teacher_engine.prepare_data).__name__}, "
-            f"teacher.model_arch={self.config.teacher.model_arch}"
+            f"teacher.model_arch={self.config.teacher.model_arch}, "
+            f"role={self.teacher_engine.prepare_data.role}"
         )
-        if config.tq.enable:
-            init_tq_connector(config.tq)
+        # tq 只存在于 OffPolicyDistillConfig；本 actor 同时服务 on-policy
+        # (Agentic)OnPolicyDistillConfig，那条路径上没有这个字段。
+        tq_config = getattr(config, "tq", None)
+        if tq_config is not None and tq_config.enable:
+            init_tq_connector(tq_config)
 
     def validated_config(self):
         teacher_config = self.config.teacher
@@ -100,6 +105,15 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
             self.config.training.moe_router_replay = False
         assert teacher_config.without_ref is True, f"{teacher_config.without_ref=}"
         assert teacher_config.without_optim is True, f"{teacher_config.without_optim=}"
+
+    @override
+    def load_hf_config(self):
+        hf_config = AutoConfig.from_pretrained(
+            self.config.teacher.hf_model_path, trust_remote_code=True
+        )
+        assert not hasattr(self.config.teacher, "hf_config")
+        self.config.teacher.hf_config = hf_config
+        self.hf_config = hf_config
 
     async def setup_model(self):
         logging_rank0(f"begin setup_model...")
@@ -123,7 +137,10 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
         if mcore_parallel_state._GLOBAL_MEMORY_BUFFER is None:
             mcore_parallel_state._set_global_memory_buffer()
 
-    async def sleep(self):
+    async def sleep(self, req_dict=None):
+        # Support both direct no-arg calls and multicast RPC calls carrying an
+        # unused request dictionary.
+        del req_dict
         self.teacher_engine.offload_model()
         self._destroy_global_memory_buffer()
         if self._offload_process_group:
@@ -132,7 +149,9 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
         clear_memory()
         return {"ret": True}
 
-    async def wake_up(self):
+    async def wake_up(self, req_dict=None):
+        # See ``sleep``: lifecycle RPC payload is intentionally unused.
+        del req_dict
         if self._offload_process_group:
             reload_process_groups()
         self._ensure_global_memory_buffer()
@@ -154,6 +173,8 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
             self.teacher_engine.offload_model()
             self.batching_reqs = []
             self.compute_logps_results.clear()
+            self.streaming_reqs = []
+            self.streaming_logps_results.clear()
             self._destroy_global_memory_buffer()
 
             if self._offload_process_group:
@@ -170,6 +191,74 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
             else:
                 self.batching_reqs.append({})
         return {"ret": True}
+
+    async def stream_issue_calc_logps(self, req_dict: Dict[str, Any]):
+        """Append one request to the next controller-balanced streaming batch."""
+        async with self.lock:
+            if is_mp_and_cp_head():
+                self.streaming_reqs.append(req_dict)
+            else:
+                self.streaming_reqs.append({})
+        return {"ret": True}
+
+    async def stream_compute_pending(self, req_dict: Dict[str, Any]):
+        """Compute all requests currently queued on this teacher endpoint.
+
+        The rollout controller pads every endpoint queue to the same length,
+        preserving the lockstep forward count required by teacher EP collectives.
+        """
+        del req_dict
+        async with self.lock:
+            assert self.streaming_reqs, ("stream_compute_pending called with an empty queue")
+            queued_reqs = self.streaming_reqs
+            self.streaming_reqs = []
+            batched_data = BroadcastUtils.broadcast_object_within_mp_and_cp(
+                queued_reqs,
+                make_recursive_clone_in_case_of_view=True,
+            )
+            req_meta_data, real_data = split_dict_list_by_keys(
+                batched_data, ["request_id", "is_padding"]
+            )
+
+            try:
+                _, teacher_logps = self.teacher_engine.compute_log_probs(real_data)
+                assert len(real_data) == len(teacher_logps)
+
+                for batch_index, (batch, batch_teacher_logps) in enumerate(
+                    zip(req_meta_data, teacher_logps, strict=True)
+                ):
+                    request_id = batch["request_id"]
+                    for sample_idx, entry in enumerate(batch_teacher_logps):
+                        seq_len = real_data[batch_index]["sequence_lengths"][sample_idx]
+                        target_len = int(
+                            seq_len.item() if hasattr(seq_len, "item") else seq_len
+                        ) - 1
+                        assert entry.ndim == 1, (
+                            "streaming teacher logps must be label based, "
+                            f"got {entry.shape}"
+                        )
+                        batch_teacher_logps[sample_idx] = (entry[:target_len].detach().clone())
+                    if not batch["is_padding"]:
+                        self.streaming_logps_results[request_id] = {
+                            "teacher_logprobs": batch_teacher_logps
+                        }
+                computed = len(req_meta_data)
+                clear_memory()
+                return {"ret": True, "computed": computed}
+            except Exception as e:
+                log(f"streaming compute_log_probs error {e}", rank=0)
+                traceback.print_exc()
+                raise
+
+    async def stream_get_calc_logps_result(self, req_dict: Dict[str, Any]):
+        """Return and remove a result produced by ``stream_compute_pending``."""
+        request_id = req_dict["request_id"]
+        async with self.lock:
+            assert request_id in self.streaming_logps_results, (
+                f"missing streaming teacher result {request_id!r}; "
+                f"available={list(self.streaming_logps_results)}"
+            )
+            return self.streaming_logps_results.pop(request_id)
 
     async def get_calc_logps_result(self, req_dict: Dict[str, Any]):
         log(
@@ -302,7 +391,10 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
         )
         async with self.lock:
             self.batching_reqs.append(
-                (request_meta[0], asyncio.create_task(async_restore_from_tq(payload_batches[0])))
+                (
+                    request_meta[0],
+                    asyncio.create_task(TQInterface.async_restore_from_tq(payload_batches[0]))
+                )
             )
         return {"ret": True}
 
@@ -325,37 +417,73 @@ class DistillTeacherActor(BaseActor, TokenizerMixin, RlTrainerMixin):
         )
 
         publish_hidden = mpu.is_pipeline_last_stage() and is_tp_and_cp_head()
-        for metadata, payload_batch in zip(
-            request_meta,
-            payload_batches,
-            strict=True,
-        ):
-            samples = expand_rollout_batch(payload_batch)
-            _, teacher_outputs = self.teacher_engine.compute_hidden_states(samples)
-            if (mpu.is_pipeline_last_stage() and mpu.get_context_parallel_world_size() > 1):
-                teacher_outputs = [
-                    all_gather_from_context_parallel_region(hidden, gather_dim=0)
-                    for hidden in teacher_outputs
-                ]
-            if publish_hidden:
-                hidden_payload = await async_offload_to_tq(
-                    {
-                        "teacher_hidden_states":
-                            [hidden.detach().contiguous().cpu() for hidden in teacher_outputs],
-                    },
-                    int(metadata["ppo_step"]),
-                    TqPayloadType.DICT,
-                    fields=["teacher_hidden_states"],
-                )
-                actor_dp_rank = metadata["actor_dp_rank"]
-                ppo_step = metadata["ppo_step"]
-                sample_idx = metadata["sample_idx"]
-                step_results = self.compute_logps_results.setdefault(actor_dp_rank,
-                                                                     {}).setdefault(ppo_step, {})
-                step_results[sample_idx] = {
-                    "teacher_hidden_states": hidden_payload,
-                }
+        use_dyn_cp = bool(self.config.teacher.dist_config.dynamic_context_parallel)
+        if use_dyn_cp:
+            all_samples = []
+            payload_counts = []
+            for payload_batch in payload_batches:
+                samples = expand_rollout_batch(payload_batch)
+                payload_counts.append(len(samples))
+                all_samples.extend(samples)
+            _, teacher_outputs = self.teacher_engine.compute_hidden_states_dynamic_cp(all_samples)
+            idx = 0
+            for metadata, n in zip(request_meta, payload_counts, strict=True):
+                chunk = teacher_outputs[idx:idx + n]
+                idx += n
+                if publish_hidden:
+                    hidden_cpu = []
+                    for hidden in chunk:
+                        assert hidden is not None, "dyn-CP teacher hidden is missing after reverse reroute"
+                        hidden_cpu.append(hidden.detach().contiguous().cpu())
+                    hidden_payload = await TQInterface.async_offload_to_tq(
+                        {
+                            "teacher_hidden_states": hidden_cpu,
+                        },
+                        int(metadata["ppo_step"]),
+                        TqPayloadType.ONE_KEY_PER_DICT,
+                        fields=["teacher_hidden_states"],
+                    )
+                    actor_dp_rank = metadata["actor_dp_rank"]
+                    ppo_step = metadata["ppo_step"]
+                    sample_idx = metadata["sample_idx"]
+                    step_results = self.compute_logps_results.setdefault(actor_dp_rank,
+                                                                         {}).setdefault(ppo_step, {})
+                    step_results[sample_idx] = {
+                        "teacher_hidden_states": hidden_payload,
+                    }
             del teacher_outputs
+        else:
+            for metadata, payload_batch in zip(
+                request_meta,
+                payload_batches,
+                strict=True,
+            ):
+                samples = expand_rollout_batch(payload_batch)
+                _, teacher_outputs = self.teacher_engine.compute_hidden_states(samples)
+                if (mpu.is_pipeline_last_stage() and mpu.get_context_parallel_world_size() > 1):
+                    teacher_outputs = [
+                        all_gather_from_context_parallel_region(hidden, gather_dim=0)
+                        for hidden in teacher_outputs
+                    ]
+                if publish_hidden:
+                    hidden_payload = await TQInterface.async_offload_to_tq(
+                        {
+                            "teacher_hidden_states":
+                                [hidden.detach().contiguous().cpu() for hidden in teacher_outputs],
+                        },
+                        int(metadata["ppo_step"]),
+                        TqPayloadType.ONE_KEY_PER_DICT,
+                        fields=["teacher_hidden_states"],
+                    )
+                    actor_dp_rank = metadata["actor_dp_rank"]
+                    ppo_step = metadata["ppo_step"]
+                    sample_idx = metadata["sample_idx"]
+                    step_results = self.compute_logps_results.setdefault(actor_dp_rank,
+                                                                         {}).setdefault(ppo_step, {})
+                    step_results[sample_idx] = {
+                        "teacher_hidden_states": hidden_payload,
+                    }
+                del teacher_outputs
 
         # Last PP has TQ keys; MultiCast get() reads PP0. One gather after the batch.
         group = get_model_and_context_parallel_group_gloo()

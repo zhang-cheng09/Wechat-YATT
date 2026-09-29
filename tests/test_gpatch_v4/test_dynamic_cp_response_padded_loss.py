@@ -388,7 +388,7 @@ def test_response_padded_grpo_matches_pure_sequence_baseline(
 
 
 @patch(_REDUCE_METRICS)
-def test_response_padded_gspo_accepts_sequence_format(_mock_reduce, monkeypatch):
+def test_response_padded_gspo_without_ref_accepts_sequence_format(_mock_reduce, monkeypatch):
     baseline = _build_sequence_batch(seed=1)
     packed, cu_padded, cu = _pack_pieces(
         baseline["packed_pieces"],
@@ -413,8 +413,7 @@ def test_response_padded_gspo_accepts_sequence_format(_mock_reduce, monkeypatch)
         partition_indices=indices,
     )
     config = _make_config(loss_func="gspo", enable_tis=False)
-    # Must not raise the THD assert inside gspo_loss_func.
-    loss, _metrics = gspo_loss_func(
+    loss, metrics = gspo_loss_func(
         config,
         _make_input(
             curr=dyn["curr"],
@@ -422,12 +421,13 @@ def test_response_padded_gspo_accepts_sequence_format(_mock_reduce, monkeypatch)
             advantages=dyn["advantages"],
             mask=dyn["mask"],
             sample_mask=dyn["sample_mask"],
-            ref=dyn["prev"].detach(),
+            ref=None,
             cu_seqlens_padded=None,
             local_cp_size=1,
         ),
     )
     assert torch.isfinite(loss)
+    assert metrics["grpo_kl_loss"][0] == 0
 
 
 def test_tis_sequence_uses_masked_sum_expand_not_thd(monkeypatch):

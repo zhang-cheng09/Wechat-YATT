@@ -14,9 +14,11 @@ from gpatch_v4.configs.config import FinetuneConfig
 from gpatch_v4.utils.resumable_distributed_sampler import ResumableDistributedSampler
 
 
+
 def _deterministic_prompt_expansion_factor(seed: int, idx: int) -> int:
+    env_factor = os.environ.get("GPATCH_PROMPT_EXPANSION_FACTOR", 20)
     digest = hashlib.blake2b(f"{seed}:{idx}".encode(), digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="little") % 61 + 40
+    return int.from_bytes(digest, byteorder="little") % 61 + int(env_factor)
 
 
 def _expand_generation_prompt(
@@ -80,7 +82,7 @@ class SimpleDataset(Dataset):
         self.dataset = load_dataset('json', data_files=json_files, split=split)
         # dataset/smart-pad 要求每条样本都合法；超长样本在此过滤（num_proc=1 避免 Ray 内 fork）
         len_src = len(self.dataset)
-        self.dataset = self.dataset.filter(self._is_valid, num_proc=1)
+        # self.dataset = self.dataset.filter(self._is_valid, num_proc=1)
         print(f"filter out num: {len_src - len(self.dataset)}", flush=True)
 
     def _is_valid(self, example):
@@ -160,6 +162,7 @@ class SimpleDataset(Dataset):
                 messages,
                 tokenize=False,
                 add_generation_prompt=False,
+                enable_thinking=self.config.training.enable_thinking,
             )
             full_text = full_text.rstrip('\n')
         return prompt_text, full_text, messages

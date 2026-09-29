@@ -4,6 +4,7 @@ import inspect
 import time
 import traceback
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from transformers import AutoTokenizer
@@ -12,8 +13,50 @@ from gpatch_v4.client import GenRmClient, SamplerClient
 from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.reward.base_external_reward import stream_external_reward_declined_reason
 from gpatch_v4.rollout_generator.async_rollout.mixin import ColocateAgentMixin
+from gpatch_v4.transfer import init_tq_connector
+from gpatch_v4.transfer.sample_hash import maybe_dump_tq_sample_hashes
+from gpatch_v4.transfer.tq_connector import KVBatchMeta
+from gpatch_v4.transfer.transfer_queue_interface import TQInterface, TqSampleOperateType
 from gpatch_v4.utils import import_fn_from_path, log, log_debug
 from gpatch_v4.utils.data_manipulate_utils import ensure_sample_hierarchical_id
+from gpatch_v4.utils.training_utils import expand_rollout_batch
+
+EXT_REWARD_TIMING_KEY = "_ext_reward_timing"
+
+
+@dataclass
+class AgentLoopEvalResult:
+    rollout_batches: List[Dict[str, List[Any]]]
+    deferred_external_reward_indices: List[int]
+
+
+def pop_external_reward_timing_metrics(rbs: List[Dict[str, List[Any]]], ) -> Dict[str, float]:
+    """Pop per-call timing stamps from ``rbs`` and reduce them to scalars.
+
+    Each stamped rollout batch contributes one ``(t_fire, t_done, dur)``.
+    Returns an empty dict when no stamp is present.
+    """
+    fires: List[float] = []
+    dones: List[float] = []
+    durs: List[float] = []
+    for rb in rbs:
+        stamp = rb.pop(EXT_REWARD_TIMING_KEY, None)
+        if stamp is None:
+            continue
+        t_fire, t_done, dur = stamp[0]
+        fires.append(t_fire)
+        dones.append(t_done)
+        durs.append(dur)
+    if not fires:
+        return {}
+    return {
+        "time_perf/external_reward_span": max(dones) - min(fires),
+        "time_perf/external_reward_overhead": max(dones) - max(fires),
+        "time_perf/external_reward_call_mean": sum(durs) / len(durs),
+        "time_perf/external_reward_call_max": max(durs),
+        "time_perf/external_reward_call_min": min(durs),
+        "time_perf/external_reward_call_count": float(len(durs)),
+    }
 
 
 class BaseAgentLoopActor(ColocateAgentMixin, abc.ABC):
@@ -38,6 +81,8 @@ class BaseAgentLoopActor(ColocateAgentMixin, abc.ABC):
         self.config = config
         self.training_config = config.training
         self.worker_id = worker_id
+        if isinstance(config, RlConfig) and config.tq.enable:
+            init_tq_connector(config.tq)
         self._init_colocate_state()
         self._pause_event: asyncio.Event = asyncio.Event()
 
@@ -55,6 +100,33 @@ class BaseAgentLoopActor(ColocateAgentMixin, abc.ABC):
         """
         self._pause_event.set()
 
+    async def _maybe_put_rollout_batches_to_tq(
+        self,
+        rbs: List[Dict[str, List[Any]]],
+        ppo_step: int,
+    ) -> List[Dict[str, List[Any]] | KVBatchMeta]:
+        if not isinstance(self.config, RlConfig) or not self.config.tq.enable:
+            return rbs
+        maybe_dump_tq_sample_hashes(
+            self.config,
+            rbs,
+            stage="put",
+            ppo_step=ppo_step,
+            shard=f"w{self.worker_id}_{time.time_ns()}",
+            chunk_size=self.training_config.sampling_repeat_n,
+        )
+        return list(
+            await asyncio.gather(
+                *[
+                    TQInterface.async_put_samples(
+                        expand_rollout_batch(rb),
+                        TqSampleOperateType.FIRST_PUT,
+                        ppo_step=ppo_step,
+                    ) for rb in rbs
+                ]
+            )
+        )
+
     @abc.abstractmethod
     async def setup(self):
         """One-time async initialisation after the Ray actor is created."""
@@ -67,7 +139,8 @@ class BaseAgentLoopActor(ColocateAgentMixin, abc.ABC):
         ppo_step: int,
         microbatch_idx: int,
         sample_idx: int,
-    ) -> List[Dict[str, List[Any]]]:
+        is_eval: bool = False,
+    ) -> List[Dict[str, List[Any]] | KVBatchMeta] | AgentLoopEvalResult:
         """Execute the per-microbatch pipeline and return rollout data.
 
         Parameters
@@ -76,12 +149,13 @@ class BaseAgentLoopActor(ColocateAgentMixin, abc.ABC):
         ppo_step : int
         microbatch_idx : int
         sample_idx : int
+        is_eval : bool
 
         Returns
         -------
-        list[dict]
-            One or more rollout batches; each dict maps string keys to
-            equal-length lists.
+        list[dict or KVBatchMeta] or AgentLoopEvalResult
+            TQ mode returns ordered row references; otherwise each field-major
+            dict contains equal-length value lists.
         """
         ...
 
@@ -172,6 +246,12 @@ class AgentLoopActor(BaseAgentLoopActor):
             return True
         return "on_ready" in params
 
+    def _generate_batches_takes_is_eval(self) -> bool:
+        params = inspect.signature(self.generate_batches).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return True
+        return "is_eval" in params
+
     def _setup_external_reward(self):
         """Instantiate the external reward class from config."""
         external_reward_config = self.config.external_reward
@@ -199,6 +279,7 @@ class AgentLoopActor(BaseAgentLoopActor):
         sample_indices: List[int],
         use_colocate: bool,
         on_ready=None,
+        is_eval: bool = False,
     ) -> List[Dict[str, List[Any]]]:
         """Generate rollouts by firing all requests, then awaiting all results.
 
@@ -208,7 +289,10 @@ class AgentLoopActor(BaseAgentLoopActor):
         micro-batch index order either way.
         """
         sampler_idx = 0
-        repeat_n = self.training_config.sampling_repeat_n
+        repeat_n = (
+            self.training_config.eval_sampling_repeat_n
+            if is_eval else self.training_config.sampling_repeat_n
+        )
         if not cleaned_batches and not use_colocate:
             return []
 
@@ -223,6 +307,7 @@ class AgentLoopActor(BaseAgentLoopActor):
                         cleaned_data,
                         repeat_n,
                         load_aware=self.training_config.load_aware_sampler_routing,
+                        is_eval=is_eval,
                     ) for cleaned_data, sidx in zip(cleaned_batches, sample_indices)
                 ]
             )
@@ -303,10 +388,30 @@ class AgentLoopActor(BaseAgentLoopActor):
                 rb.update(result)
         return rbs
 
+    async def _calc_external_reward_with_timing(
+        self,
+        rb: Dict[str, List[Any]],
+        ppo_step: int,
+        is_eval: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Run one ``calc_external_reward`` and stamp fire/done/duration on the update."""
+        t_fire = time.time()
+        t0 = time.perf_counter()
+        updates = await self.external_reward.calc_external_reward([rb], ppo_step, is_eval=is_eval)
+        dur = time.perf_counter() - t0
+        t_done = time.time()
+        n = len(next(iter(rb.values())))
+        assert len(updates) == 1, (
+            f"calc_external_reward must return one update per input batch; got {len(updates)}"
+        )
+        updates[0][EXT_REWARD_TIMING_KEY] = [(t_fire, t_done, dur)] * n
+        return updates
+
     async def score_external_reward_batches(
         self,
         rbs: List[Dict[str, List[Any]]],
         ppo_step: int,
+        is_eval: bool = False,
     ) -> List[Dict[str, List[Any]]]:
         """Apply CPU external rewards for all rollout batches."""
         if self.external_reward is None:
@@ -314,7 +419,7 @@ class AgentLoopActor(BaseAgentLoopActor):
         t0 = time.time()
         log_debug(f"[external_reward] BEGIN worker_id={self.worker_id} ppo_step={ppo_step}")
         all_updates = await asyncio.gather(
-            *[self.external_reward.calc_external_reward([rb], ppo_step) for rb in rbs]
+            *[self._calc_external_reward_with_timing(rb, ppo_step, is_eval=is_eval) for rb in rbs]
         )
         for rb, updates in zip(rbs, all_updates):
             assert len(updates) == 1, (
@@ -333,6 +438,7 @@ class AgentLoopActor(BaseAgentLoopActor):
         ppo_step: int,
         sample_indices: List[int],
         use_colocate: bool,
+        is_eval: bool = False,
     ) -> List[Dict[str, List[Any]]]:
         """Shared reward pipeline for default single-turn rollouts."""
         rbs = await self.score_gen_rm_batches(
@@ -341,7 +447,7 @@ class AgentLoopActor(BaseAgentLoopActor):
             sample_indices,
             use_colocate=use_colocate,
         )
-        return await self.score_external_reward_batches(rbs, ppo_step)
+        return await self.score_external_reward_batches(rbs, ppo_step, is_eval=is_eval)
 
     async def _collect_streamed_external_rewards(
         self,
@@ -394,7 +500,8 @@ class AgentLoopActor(BaseAgentLoopActor):
         ppo_step: int,
         sample_indices: List[int],
         use_colocate: bool,
-    ) -> List[Dict[str, List[Any]]]:
+        is_eval: bool = False,
+    ) -> List[Dict[str, List[Any]] | KVBatchMeta] | AgentLoopEvalResult:
         """Shared default single-turn pipeline.
 
         ``use_colocate`` selects only the sampler dispatch style and
@@ -405,7 +512,7 @@ class AgentLoopActor(BaseAgentLoopActor):
         reward is submitted as that micro-batch lands, rather than all of them
         after the last one.
         """
-        stream = self._stream_external_reward
+        stream = self._stream_external_reward and not is_eval
         reward_futs: Dict[int, Any] = {}
         on_ready = None
         if stream:
@@ -418,10 +525,17 @@ class AgentLoopActor(BaseAgentLoopActor):
                     f"ppo_step={ppo_step} microbatch={rbi} t={time.time():.3f}"
                 )
                 _futs[rbi] = asyncio.ensure_future(
-                    self.external_reward.calc_external_reward([rb], ppo_step)
+                    self._calc_external_reward_with_timing(rb, ppo_step)
                 )
 
         gen_kwargs = {"on_ready": on_ready} if stream else {}
+        if is_eval:
+            if not self._generate_batches_takes_is_eval():
+                raise TypeError(
+                    f"{type(self).__name__}.generate_batches must accept is_eval "
+                    "for single-controller evaluation"
+                )
+            gen_kwargs["is_eval"] = True
         try:
             rbs = await self.generate_batches(
                 cleaned_batches,
@@ -438,6 +552,7 @@ class AgentLoopActor(BaseAgentLoopActor):
                     f"[AgentLoopActor-{self.worker_id}] "
                     f"_batch_loop done: {ppo_step=}, "
                     f"mode={'colocate' if use_colocate else 'disaggregated'}, "
+                    f"is_eval={is_eval}, "
                     f"num_microbatches={len(cleaned_batches)}, "
                     f"num_rollout_batches={len(rbs)}, "
                     f"stream_external_reward={stream}"
@@ -445,12 +560,24 @@ class AgentLoopActor(BaseAgentLoopActor):
             if stream:
                 # gen-RM is off on this path (see _resolve_stream_external_reward)
                 return await self._collect_streamed_external_rewards(rbs, reward_futs, ppo_step)
-            return await self.score_rollout_batches(
+            if is_eval:
+                rbs = await self.score_gen_rm_batches(
+                    rbs,
+                    ppo_step,
+                    sample_indices,
+                    use_colocate=use_colocate,
+                )
+                deferred_indices = (
+                    list(range(len(rbs))) if self.training_config.use_external_reward else []
+                )
+                return AgentLoopEvalResult(rbs, deferred_indices)
+            rbs = await self.score_rollout_batches(
                 rbs,
                 ppo_step,
                 sample_indices,
                 use_colocate=use_colocate,
             )
+            return await self._maybe_put_rollout_batches_to_tq(rbs, ppo_step)
         except BaseException:
             await self._cancel_stream_reward_futs(reward_futs)
             raise
@@ -462,7 +589,8 @@ class AgentLoopActor(BaseAgentLoopActor):
         microbatch_idx: int | List[int],
         sample_idx: int | List[int],
         use_colocate: bool = False,
-    ) -> List[Dict[str, List[Any]]]:
+        is_eval: bool = False,
+    ) -> List[Dict[str, List[Any]] | KVBatchMeta] | AgentLoopEvalResult:
         """Default single-turn entry for both disaggregated and colocate modes.
 
         Disaggregated callers pass one microbatch. Colocate callers pass this
@@ -483,6 +611,7 @@ class AgentLoopActor(BaseAgentLoopActor):
                 ppo_step,
                 sample_indices,
                 use_colocate=use_colocate,
+                is_eval=is_eval,
             )
         except Exception as e:
             traceback.print_exc()

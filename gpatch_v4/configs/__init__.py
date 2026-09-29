@@ -2,6 +2,7 @@ from .config import (
     AgenticRLTrainingConfig,
     DpoConfig,
     EmbeddingConfig,
+    EmbeddingOffPolicyDistillConfig,
     FinetuneConfig,
     OffPolicyDistillConfig,
     OnPolicyDistillConfig,
@@ -19,5 +20,6 @@ __all__ = [
     "AgenticRLTrainingConfig",
     "RewardConfig",
     "OffPolicyDistillConfig",
+    "EmbeddingOffPolicyDistillConfig",
     "EmbeddingConfig",
 ]

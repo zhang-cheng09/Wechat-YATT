@@ -57,7 +57,7 @@ def _install_stubs():
     _stub("gpatch_v4")
     _stub("gpatch_v4.client", GenRmClient=object, SamplerClient=object)
     _stub("gpatch_v4.configs")
-    _stub("gpatch_v4.configs.config", RlConfig=object)
+    _stub("gpatch_v4.configs.config", RlConfig=type("RlConfig", (), {}))
     _stub("gpatch_v4.rollout_generator")
     _stub("gpatch_v4.rollout_generator.async_rollout")
     _stub(
@@ -69,6 +69,14 @@ def _install_stubs():
     _stub("gpatch_v4.agentic")
     _stub("gpatch_v4.agentic.env", register_custom_env_for_agentic=lambda cfg: None)
     _stub("gpatch_v4.reward")  # placeholder for the package path
+    _stub("gpatch_v4.transfer", init_tq_connector=lambda *a, **k: None)
+    _stub("gpatch_v4.transfer.sample_hash", maybe_dump_tq_sample_hashes=lambda *a, **k: None)
+    _stub("gpatch_v4.transfer.tq_connector", KVBatchMeta=type("KVBatchMeta", (), {}))
+    _stub(
+        "gpatch_v4.transfer.transfer_queue_interface",
+        TQInterface=type("TQInterface", (), {}),
+        TqSampleOperateType=type("TqSampleOperateType", (), {}),
+    )
     _stub(
         "gpatch_v4.utils", **{
             "import_fn_from_path": lambda *a, **k: None,
@@ -78,6 +86,7 @@ def _install_stubs():
         }
     )
     _stub("gpatch_v4.utils.data_manipulate_utils")  # placeholder for the package path
+    _stub("gpatch_v4.utils.training_utils", expand_rollout_batch=lambda batch: batch)
 
 
 _install_stubs()
@@ -100,6 +109,7 @@ _eala = _load(
     "gpatch_v4/rollout_generator/async_rollout/env_agent_loop_actor.py",
 )
 AgentLoopActor = _ala.AgentLoopActor
+AgentLoopEvalResult = _ala.AgentLoopEvalResult
 EnvAgentLoopActor = _eala.EnvAgentLoopActor
 
 # --------------------------------------------------------------------------- #
@@ -127,10 +137,19 @@ class _FakeSampler:
     def __init__(self, delays, trace):
         self.delays = delays
         self.trace = trace
+        self.fire_calls = []
 
     async def fire_generate(
-        self, sampler_idx, ppo_step, sidx, cleaned_data, repeat_n, load_aware=False
+        self,
+        sampler_idx,
+        ppo_step,
+        sidx,
+        cleaned_data,
+        repeat_n,
+        load_aware=False,
+        is_eval=False,
     ):
+        self.fire_calls.append((repeat_n, is_eval))
         return {"_i": cleaned_data["_i"], "unique_id": cleaned_data["unique_id"]}
 
     async def await_generate(self, ref):
@@ -176,13 +195,22 @@ class _Cfg:
         self.use_gen_rm_reward = use_gen_rm
         self.use_external_reward = True
         self.sampling_repeat_n = repeat_n
+        self.eval_sampling_repeat_n = repeat_n + 1
         self.load_aware_sampler_routing = False
 
 
-def _make_actor(cls, delays, trace, stream=True, use_gen_rm=False, reward=None):
+def _make_actor(
+    cls,
+    delays,
+    trace,
+    stream=True,
+    use_gen_rm=False,
+    reward=None,
+    repeat_n=1,
+):
     actor = object.__new__(cls)
     actor.config = None
-    actor.training_config = _Cfg(stream, use_gen_rm=use_gen_rm)
+    actor.training_config = _Cfg(stream, use_gen_rm=use_gen_rm, repeat_n=repeat_n)
     actor.worker_id = 0
     actor.tokenizer = None
     actor.gen_rm_client = None
@@ -207,6 +235,23 @@ async def _old_signature_generate_batches(cleaned_batches, ppo_step, sample_indi
 
 
 class AgentLoopStreamingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_eval_uses_eval_sampling_and_defers_external_reward(self):
+        trace = _Trace()
+        actor = _make_actor(AgentLoopActor, [0.01, 0.02], trace, stream=True, repeat_n=2)
+
+        result = await actor._batch_loop(
+            _batches(2),
+            ppo_step=3,
+            sample_indices=[0, 1],
+            use_colocate=False,
+            is_eval=True,
+        )
+
+        self.assertIsInstance(result, AgentLoopEvalResult)
+        self.assertEqual(result.deferred_external_reward_indices, [0, 1])
+        self.assertEqual(actor.external_reward.calls, [])
+        self.assertEqual(actor.sampler_client.fire_calls, [(3, True), (3, True)])
+
     async def test_reward_fires_while_later_microbatches_still_generate(self):
         """mb0's reward starts before mb2 has finished generating."""
         trace = _Trace()
@@ -263,6 +308,8 @@ class AgentLoopStreamingTest(unittest.IsolatedAsyncioTestCase):
                                         use_colocate=False
                                     )
 
+        for rb in streamed + batched:
+            rb.pop(_ala.EXT_REWARD_TIMING_KEY)
         self.assertEqual(streamed, batched)
 
     async def test_hierarchical_ids_filled_before_the_reward_sees_the_batch(self):
@@ -430,11 +477,19 @@ class EnvAgentLoopStreamingTest(unittest.IsolatedAsyncioTestCase):
 
         # one manager per micro-batch; _merge_env_results is bypassed so the test
         # does not depend on torch-backed segment merging
-        actor._build_managers_for_step = lambda: [object()]
+        actor.manager_repeats = []
+
+        def _build_managers(repeat_n=None):
+            actor.manager_repeats.append(repeat_n)
+            return [object()] * repeat_n
+
+        actor._build_managers_for_step = _build_managers
+        actor.env_eval_flags = []
 
         delays = env_delay if isinstance(env_delay, list) else [env_delay] * n
 
-        async def _run_env(mgr, seed, ppo_step, cd):
+        async def _run_env(mgr, seed, ppo_step, cd, is_eval):
+            actor.env_eval_flags.append(is_eval)
             trace.record(("env_start", cd["_i"]))
             await asyncio.sleep(delays[cd["_i"]])
             trace.record(("env_done", cd["_i"]))
@@ -454,6 +509,23 @@ class EnvAgentLoopStreamingTest(unittest.IsolatedAsyncioTestCase):
         actor._merge_env_results = _merge
         actor.sampler_phase = None
         return actor
+
+    async def test_eval_uses_eval_repeat_and_defers_reward(self):
+        trace = _Trace()
+        actor = self._make_env_actor(1, trace)
+
+        result = await actor._batch_loop(
+            _batches(1),
+            ppo_step=4,
+            sample_indices=[0],
+            use_colocate=False,
+            is_eval=True,
+        )
+
+        self.assertIsInstance(result, AgentLoopEvalResult)
+        self.assertEqual(actor.manager_repeats, [2])
+        self.assertEqual(actor.env_eval_flags, [True, True])
+        self.assertEqual(actor.external_reward.calls, [])
 
     async def test_reward_of_one_microbatch_overlaps_the_next_env_run(self):
         """The win: mb0 scores while mb1's trajectories are still running."""

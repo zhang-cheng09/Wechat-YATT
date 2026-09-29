@@ -1,0 +1,4 @@
+{
+  "name": "retool_e2h_tiny",
+  "data_files": [{"fp": "data.jsonl"}]
+}

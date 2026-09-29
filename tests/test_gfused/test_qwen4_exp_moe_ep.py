@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+import gpatch_v4.models.qwen4_exp.moe as qwen4_exp_moe
 from gpatch_v4.models.qwen4_exp import Qwen4ExpTextConfig
 from gpatch_v4.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpTextExperts,
@@ -119,6 +120,190 @@ def test_empty_input_keeps_expert_params_in_graph() -> None:
     assert ours.down_proj.grad is not None
     assert torch.count_nonzero(ours.gate_up_proj.grad) == 0
     assert torch.count_nonzero(ours.down_proj.grad) == 0
+
+
+def test_deterministic_slot_reduce_matches_index_add_forward_backward() -> None:
+    recv_expert = torch.tensor([[0, 1], [-1, 2], [3, -1]], dtype=torch.long)
+    valid_flat_idx = (recv_expert.reshape(-1) >= 0).nonzero(as_tuple=True)[0]
+    row_idx = torch.div(valid_flat_idx, recv_expert.shape[1], rounding_mode="floor")
+    source = torch.randn(valid_flat_idx.numel(), HIDDEN)
+    deterministic_source = source.clone().requires_grad_(True)
+    index_add_source = source.clone().requires_grad_(True)
+
+    got = qwen4_exp_moe._deterministic_slot_reduce(
+        deterministic_source,
+        valid_flat_idx,
+        recv_expert,
+    )
+    expected = source.new_zeros(recv_expert.shape[0], HIDDEN)
+    expected.index_add_(0, row_idx, index_add_source)
+    torch.testing.assert_close(got, expected)
+
+    output_grad = torch.randn_like(got)
+    got.backward(output_grad)
+    expected.backward(output_grad)
+    torch.testing.assert_close(deterministic_source.grad, index_add_source.grad)
+
+
+def test_deepep_slot_expansion_matches_dense(monkeypatch) -> None:
+    torch.manual_seed(0)
+    config = _config()
+    reference = Qwen4ExpTextExperts(config)
+    experts = Qwen4ExpEPExperts(
+        config,
+        ep_backend="deepep",
+        deepep_async_finish=True,
+    )
+    reference.gate_up_proj.data.normal_(std=0.05)
+    reference.down_proj.data.normal_(std=0.05)
+    experts.load_state_dict(reference.state_dict())
+    experts.ep_size = 2
+    experts.ep_group = object()
+    experts._deterministic_deepep_reduce = True
+
+    handle = object()
+    dispatch_kwargs = {}
+    combine_kwargs = {}
+
+    def fake_dispatch(hidden_states, indices, weights, _num_experts, _group, **kwargs):
+        dispatch_kwargs.update(kwargs)
+        counts = torch.bincount(indices.reshape(-1), minlength=NUM_EXPERTS)
+        return hidden_states, indices, weights.float(), counts, handle
+
+    def fake_combine(outputs, _group, actual_handle, **kwargs):
+        combine_kwargs.update(kwargs)
+        assert actual_handle is handle
+        return outputs
+
+    monkeypatch.setattr(qwen4_exp_moe, "fused_dispatch", fake_dispatch)
+    monkeypatch.setattr(qwen4_exp_moe, "fused_combine", fake_combine)
+
+    hidden_states = torch.randn(7, HIDDEN, requires_grad=True)
+    indices, weights = _routing(config, hidden_states.detach(), seed=1)
+    weights = weights.clone().requires_grad_(True)
+    reference_hidden = hidden_states.detach().clone().requires_grad_(True)
+    reference_weights = weights.detach().clone().requires_grad_(True)
+
+    got = experts(hidden_states, indices, weights)
+    assert dispatch_kwargs["async_finish"] is True
+    assert combine_kwargs["async_finish"] is True
+    expected = reference(reference_hidden, indices, reference_weights)
+    torch.testing.assert_close(got, expected)
+
+    got.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(hidden_states.grad, reference_hidden.grad)
+    torch.testing.assert_close(weights.grad, reference_weights.grad)
+    torch.testing.assert_close(experts.gate_up_proj.grad, reference.gate_up_proj.grad)
+    torch.testing.assert_close(experts.down_proj.grad, reference.down_proj.grad)
+
+
+def test_deepep_ignores_misaligned_dispatch_counts(monkeypatch) -> None:
+    torch.manual_seed(0)
+    config = _config()
+    reference = Qwen4ExpTextExperts(config)
+    experts = Qwen4ExpEPExperts(config, ep_backend="deepep")
+    reference.gate_up_proj.data.normal_(std=0.05)
+    reference.down_proj.data.normal_(std=0.05)
+    experts.load_state_dict(reference.state_dict())
+    experts.ep_size = 2
+    experts.ep_group = object()
+    experts._deterministic_deepep_reduce = True
+
+    hidden_states = torch.randn(7, HIDDEN)
+    indices = torch.tensor(
+        [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [5, 7]],
+        dtype=torch.long,
+    )
+    weights = torch.full((7, TOP_K), 0.5)
+    correct_counts = torch.bincount(indices.reshape(-1), minlength=NUM_EXPERTS)
+    counts = correct_counts.roll(1)
+    assert counts.sum() == correct_counts.sum()
+    assert not torch.equal(counts, correct_counts)
+    handle = object()
+
+    def fake_dispatch(hidden_states, indices, weights, _num_experts, _group, **kwargs):
+        return hidden_states, indices, weights.float(), counts, handle
+
+    def fake_combine(outputs, _group, actual_handle, **kwargs):
+        assert actual_handle is handle
+        return outputs
+
+    monkeypatch.setattr(qwen4_exp_moe, "fused_dispatch", fake_dispatch)
+    monkeypatch.setattr(qwen4_exp_moe, "fused_combine", fake_combine)
+
+    got = experts(hidden_states, indices, weights)
+    expected = reference(hidden_states, indices, weights)
+    torch.testing.assert_close(got, expected)
+
+
+def test_deepep_empty_valid_slots_keep_autograd_edges(monkeypatch) -> None:
+    torch.manual_seed(0)
+    experts = Qwen4ExpEPExperts(_config(), ep_backend="deepep")
+    experts.gate_up_proj.data.normal_(std=0.05)
+    experts.down_proj.data.normal_(std=0.05)
+    experts.ep_size = 2
+    experts.ep_group = object()
+
+    handle = object()
+
+    def fake_dispatch(hidden_states, indices, weights, _num_experts, _group, **kwargs):
+        recv_expert = torch.full_like(indices, -1)
+        counts = torch.zeros(NUM_EXPERTS, dtype=torch.int32)
+        return hidden_states, recv_expert, weights.float(), counts, handle
+
+    def fake_combine(outputs, _group, actual_handle, **kwargs):
+        assert actual_handle is handle
+        return outputs
+
+    monkeypatch.setattr(qwen4_exp_moe, "fused_dispatch", fake_dispatch)
+    monkeypatch.setattr(qwen4_exp_moe, "fused_combine", fake_combine)
+
+    hidden_states = torch.randn(5, HIDDEN, requires_grad=True)
+    indices = torch.zeros(5, TOP_K, dtype=torch.long)
+    weights = torch.full((5, TOP_K), 0.5, requires_grad=True)
+    output = experts(hidden_states, indices, weights)
+
+    assert torch.count_nonzero(output) == 0
+    output.sum().backward()
+    assert hidden_states.grad is not None
+    assert weights.grad is not None
+    assert experts.gate_up_proj.grad is not None
+    assert experts.down_proj.grad is not None
+    assert torch.count_nonzero(hidden_states.grad) == 0
+    assert torch.count_nonzero(weights.grad) == 0
+    assert torch.count_nonzero(experts.gate_up_proj.grad) == 0
+    assert torch.count_nonzero(experts.down_proj.grad) == 0
+
+
+def test_deepep_combine_output_is_not_a_view(monkeypatch) -> None:
+    # FSDP2 对 view 输出会每步刷 warning，并可能丢掉 pre-backward hook。
+    torch.manual_seed(0)
+    experts = Qwen4ExpEPExperts(_config(), ep_backend="deepep")
+    experts.gate_up_proj.data.normal_(std=0.05)
+    experts.down_proj.data.normal_(std=0.05)
+    experts.ep_size = 2
+    experts.ep_group = object()
+
+    handle = object()
+
+    def fake_dispatch(hidden_states, indices, weights, _num_experts, _group, **kwargs):
+        counts = torch.bincount(indices.reshape(-1), minlength=NUM_EXPERTS)
+        return hidden_states, indices, weights.float(), counts, handle
+
+    def fake_combine(outputs, _group, actual_handle, **kwargs):
+        assert actual_handle is handle
+        return outputs
+
+    monkeypatch.setattr(qwen4_exp_moe, "fused_dispatch", fake_dispatch)
+    monkeypatch.setattr(qwen4_exp_moe, "fused_combine", fake_combine)
+
+    hidden_states = torch.randn(7, HIDDEN, requires_grad=True)
+    indices, weights = _routing(_config(), hidden_states.detach(), seed=3)
+    output = experts(hidden_states, indices, weights)
+
+    assert output.shape == hidden_states.shape
+    assert output._base is None
 
 
 # ---------------------------------------------------------------------------

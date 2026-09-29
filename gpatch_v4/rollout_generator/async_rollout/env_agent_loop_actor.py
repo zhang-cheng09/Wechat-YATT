@@ -7,6 +7,7 @@ and runs ``repeat_n`` trajectories concurrently in worker threads.
 import asyncio
 import contextvars
 import copy
+import inspect
 import itertools
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -93,7 +94,7 @@ class EnvAgentLoopActor(AgentLoopActor):
     def __init__(self, config: RlConfig, worker_id: int):
         super().__init__(config, worker_id)
         self._env_manager_cls: Type = None  # type: ignore[assignment]
-        self._env_entry_templates: List[Dict[str, Any]] = []
+        self._env_base_entry: Dict[str, Any] = {}
         self._env_run_sem: Optional[asyncio.Semaphore] = None
         self._env_per_actor_slots: int = 0
         self._env_executor: Optional[ThreadPoolExecutor] = None
@@ -135,13 +136,7 @@ class EnvAgentLoopActor(AgentLoopActor):
         )
         self._env_manager_cls = env_manager_cls
 
-        self._env_entry_templates = []
-        for i in range(repeat_n):
-            entry = deepcopy(base_entry)
-            entry["env_id"] = i
-            entry["group_id"] = self.worker_id
-            entry["tag"] = f"tag_{self.worker_id}"
-            self._env_entry_templates.append(entry)
+        self._env_base_entry = deepcopy(base_entry)
 
         total_cap = getattr(agentic_cfg, "max_concurrency", 0) or 0
         if total_cap > 0:
@@ -173,11 +168,16 @@ class EnvAgentLoopActor(AgentLoopActor):
             f"(agentic.max_concurrency={total_cap}, num_agent_loop_workers={num_workers})"
         )
 
-    def _build_managers_for_step(self) -> List[Any]:
+    def _build_managers_for_step(self, repeat_n: Optional[int] = None) -> List[Any]:
         """Construct one TrajEnvManager (or subclass) per repeat slot."""
+        if repeat_n is None:
+            repeat_n = self.training_config.sampling_repeat_n
         managers = []
-        for entry_template in self._env_entry_templates:
-            entry = deepcopy(entry_template)
+        for env_id in range(repeat_n):
+            entry = deepcopy(self._env_base_entry)
+            entry["env_id"] = env_id
+            entry["group_id"] = self.worker_id
+            entry["tag"] = f"tag_{self.worker_id}"
             entry["engine_index"] = next(self._engine_index_counter)
             mgr = self._env_manager_cls(
                 rl_config=self.config,
@@ -194,19 +194,26 @@ class EnvAgentLoopActor(AgentLoopActor):
         seed: int,
         ppo_step: int,
         cleaned_data: Dict[str, Any],
+        is_eval: bool,
     ) -> Dict[str, List[Any]]:
         """Run ``mgr.run`` in a worker thread, optionally under process-wide cap."""
         async with self._env_run_sem:
             loop = asyncio.get_running_loop()
             context = contextvars.copy_context()
-            executor_future = loop.run_in_executor(
-                self._env_executor,
-                context.run,
-                mgr.run,
-                seed,
-                ppo_step,
-                cleaned_data,
-            )
+            if is_eval:
+                params = inspect.signature(mgr.run).parameters
+                if (
+                    "is_eval" not in params and
+                    not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+                ):
+                    raise TypeError(
+                        f"{type(mgr).__name__}.run must accept is_eval "
+                        "for single-controller evaluation"
+                    )
+                run_fn = lambda: mgr.run(seed, ppo_step, cleaned_data, is_eval=True)
+            else:
+                run_fn = lambda: mgr.run(seed, ppo_step, cleaned_data)
+            executor_future = loop.run_in_executor(self._env_executor, context.run, run_fn)
             try:
                 return await asyncio.shield(executor_future)
             except asyncio.CancelledError:
@@ -242,9 +249,11 @@ class EnvAgentLoopActor(AgentLoopActor):
         cleaned_data: Dict[str, Any],
         sample_idx: int,
         ppo_step: int,
+        repeat_n: int,
+        is_eval: bool,
     ) -> Dict[str, List[Any]]:
-        managers = self._build_managers_for_step()
-        repeat_n = len(managers)
+        managers = self._build_managers_for_step(repeat_n)
+        assert len(managers) == repeat_n
         group_seed = ppo_step * 10000 + sample_idx * repeat_n
         started_at = time.time()
         log(
@@ -260,6 +269,7 @@ class EnvAgentLoopActor(AgentLoopActor):
                     group_seed,
                     ppo_step,
                     cleaned_data,
+                    is_eval,
                 ) for manager in managers
             ]
         )
@@ -286,6 +296,7 @@ class EnvAgentLoopActor(AgentLoopActor):
         sample_indices: List[int],
         use_colocate: bool,
         on_ready=None,
+        is_eval: bool = False,
     ) -> List[Dict[str, List[Any]]]:
         """Run env trajectories for all microbatches.
 
@@ -294,8 +305,19 @@ class EnvAgentLoopActor(AgentLoopActor):
         in completion order, not index order -- letting its reward overlap the
         groups still running.  The returned list stays in index order.
         """
+        repeat_n = (
+            self.training_config.eval_sampling_repeat_n
+            if is_eval else self.training_config.sampling_repeat_n
+        )
+
         async def run_group(rbi, cleaned_data, sample_idx):
-            merged = await self._run_prompt_group(cleaned_data, sample_idx, ppo_step)
+            merged = await self._run_prompt_group(
+                cleaned_data,
+                sample_idx,
+                ppo_step,
+                repeat_n,
+                is_eval,
+            )
             if on_ready is not None:
                 on_ready(rbi, merged)
             return merged

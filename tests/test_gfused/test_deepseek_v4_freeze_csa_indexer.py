@@ -136,12 +136,21 @@ def _trainable_params(model: nn.Module):
     return list(filter(lambda p: p.requires_grad, model.parameters()))
 
 
-def _training_ns(*, freeze_csa_indexer: bool) -> SimpleNamespace:
+def _training_ns(
+    *,
+    freeze_csa_indexer: bool,
+    enable_mtp: bool = False,
+    online_mtp_sft: bool = False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         training=SimpleNamespace(
             freeze_csa_indexer=freeze_csa_indexer,
-            freeze_router_weight=False,
+            freeze_moe_router=False,
             freeze_router_correction_bias=True,
+            enable_mtp=enable_mtp,
+            online_mtp_sft=online_mtp_sft,
+            enable_dspark=False,
+            online_train_dspark=False,
         )
     )
 
@@ -249,6 +258,26 @@ def test_freeze_helper_excludes_from_optimizer_and_blocks_wd():
 # ---------------------------------------------------------------------------
 # 2. DeepseekV4PostInitModel + real setup_optimizer wiring
 # ---------------------------------------------------------------------------
+
+
+def test_post_init_controls_mtp_training_state():
+    for online_mtp_sft in (False, True):
+        model = nn.Module()
+        model.mtp = nn.Linear(2, 2)
+        model._mtp_training_enabled = True
+        config = _training_ns(
+            freeze_csa_indexer=False,
+            enable_mtp=True,
+            online_mtp_sft=online_mtp_sft,
+        )
+
+        DeepseekV4PostInitModel(config)(model)
+
+        assert model._mtp_training_enabled is online_mtp_sft
+        assert all(
+            parameter.requires_grad is online_mtp_sft
+            for parameter in model.mtp.parameters()
+        )
 
 
 def test_post_init_freeze_on_then_setup_optimizer_skips_indexer():

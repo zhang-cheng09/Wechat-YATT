@@ -15,6 +15,7 @@ except ImportError:
     qwen3vl_parallel_split = None
 
 from megatron_datasets.utils import build_forbidden_token_ids
+
 try:
     from megatron.lite.model.qwen3_5.lite.vision import Qwen35VisionInputs
     from megatron.lite.runtime.contracts import LossContext, PackedBatch
@@ -26,7 +27,7 @@ except ImportError:
     PackedBatch = None
     build_mlite_finetune_source_batch = None
 
-from gpatch_v4.configs.config import FinetuneConfig
+from gpatch_v4.configs.config import FinetuneConfig, OffPolicyDistillConfig
 from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.extended_model.base import PrepareDataForward
 from gpatch_v4.extended_model.mtp_mixin import OnlineMtpSftMixin
@@ -44,6 +45,8 @@ from gpatch_v4.utils.dynamic_cp_utils import (
     compute_dyn_cp_response_span,
     dyn_cp_schedule_default,
     dyn_cp_schedule_smart_padding,
+    flatten_teacher_hidden_for_sft_pack,
+    restore_packed_teacher_hidden,
 )
 
 
@@ -60,7 +63,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         # Multimodal special token ids that must not be produced by random
         # padding. Walks nested Omni thinker/talker configs; None if empty.
         if not hasattr(self, "_forbidden_token_ids"):
-            hf_config = getattr(self.config.policy, "hf_config", None)
+            hf_config = getattr(self.role_config, "hf_config", None)
             self._forbidden_token_ids = build_forbidden_token_ids(hf_config) or None
         return self._forbidden_token_ids
 
@@ -72,7 +75,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         return local_data
 
     def _is_qwen3_omni_moe(self) -> bool:
-        return self.config.policy.model_arch == MODEL_ARCH.QWEN3_OMNI_MOE
+        return self.role_config.model_arch == MODEL_ARCH.QWEN3_OMNI_MOE
 
     def _omni_audio_cat_keys(self) -> Tuple[str, ...]:
         if not self._is_qwen3_omni_moe():
@@ -224,7 +227,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
         # not support padding image now
         hw_factor = 4
-        if self.config.policy.model_arch in [
+        if self.role_config.model_arch in [
             MODEL_ARCH.QWEN3_5, MODEL_ARCH.QWEN3_5_MOE, MODEL_ARCH.QWEN3_5_WEMM,
             MODEL_ARCH.QWEN3_5_MOE_WEMM
         ]:
@@ -576,7 +579,10 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         return batch, fwd_kwargs
 
     def _get_default_vision_type(self, config):
-        if isinstance(config, FinetuneConfig):
+        # OPD uses the SFT dataloader / collate (fp32 pixels). Dyn-CP pack
+        # only needs a homogeneous dtype that matches this contract; it does
+        # not require bf16.
+        if isinstance(config, (FinetuneConfig, OffPolicyDistillConfig)):
             return torch.float32
         return torch.bfloat16
 
@@ -1080,7 +1086,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         Packing happens in Energon, so this path only performs lazy H2D,
         tensor reshaping and static-CP forward construction.
         """
-        assert not self.config.policy.dist_config.dynamic_context_parallel, (
+        assert not self.role_config.dist_config.dynamic_context_parallel, (
             "pretrain_packed is incompatible with dynamic_context_parallel"
         )
         assert "cu_seqlens_padded" in batch, "packed batch missing cu_seqlens_padded"
@@ -1167,6 +1173,22 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         batch["padded_seq_len"] = padded_seq_len
         return batch, fwd_kwargs
 
+    def _sft_dyn_cp_sample_extras(
+        self,
+        orig_batch: Dict[str, Any],
+        pad_len: int,
+    ) -> Dict[str, Any]:
+        """Optional extra fields packed with SFT dyn-CP samples. Distill overrides."""
+        return {}
+
+    def _sft_dyn_cp_extra_pack_keys(self, batches: List[Dict[str, Any]]) -> List[str]:
+        """Extra ``packed_keys`` / gid-len keys. Distill adds teacher hidden."""
+        return []
+
+    def _sft_dyn_cp_restore_packed_sample(self, sample: Dict[str, Any]) -> None:
+        """Restore extra packed fields after schedule. Distill restores hidden."""
+        return
+
     @override
     def sft_reroute_data_for_dynamic_cp(
         self,
@@ -1174,7 +1196,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         pad_token_id: int,
         pad_with_random_token: bool = False,
         **kwargs,
-    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
+    ):
         dp_group = mpu.get_data_parallel_group()
         tp_group = mpu.get_tensor_model_parallel_group()
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1186,11 +1208,12 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         cp_size = dp_cp_group.size() // dp_size
         assert cp_size == mpu.get_context_parallel_world_size()
 
-        dist_config = self.config.policy.dist_config
+        dist_config = self.role_config.dist_config
         scheduler_type = dist_config.dynamic_cp_scheduler_type
         scheduler_max_seqlen = kwargs.get(
             "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
         )
+        need_routing_info = kwargs.get("need_routing_info", False)
         if scheduler_type == "smart_padding":
             dp_cp_pad = 2 * cp_size
         else:
@@ -1210,7 +1233,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             if batch.get("vision_data") is not None:
                 assert batch.get("vision_grid_thw") is not None
                 assert batch["vision_data"].dtype == dtype_map["vision_data"], (
-                    f"inconsistent vision_data dtype: {batch['vision_data'].dtype} vs {dtype_map['vision_data']}"
+                    f"inconsistent vision_data dtype: {batch['vision_data'].dtype} vs "
+                    f"{dtype_map['vision_data']}"
                 )
                 assert dtype_map["vision_grid_thw"] == batch["vision_grid_thw"].dtype
                 if batch["vision_data"].numel() > 0:
@@ -1237,6 +1261,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 vocab_size=_vocab_size,
                 forbidden_token_ids=self.forbidden_token_ids,
             )
+            extras = self._sft_dyn_cp_sample_extras(batch, pad_len)
 
             gbs_batches[i] = dict(
                 tokens=tokens,
@@ -1253,12 +1278,17 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 vision_grid_thw=batch["vision_grid_thw"].reshape(-1)
                 if batch.get("vision_grid_thw") is not None else None,
                 **self._flatten_omni_audio_for_dyn_cp(batch, dtype_map, mel_bins_box),
+                **extras,
             )
 
         # 2. 根据调度器类型执行不同的调度和 packing 策略
+        extra_pack_keys = self._sft_dyn_cp_extra_pack_keys(gbs_batches)
         dev = torch.cuda.current_device()
-        packed_keys = ["tokens", "labels", "loss_mask", "image_input_mask", "position_ids"]
+        packed_keys = [
+            "tokens", "labels", "loss_mask", "image_input_mask", "position_ids", *extra_pack_keys
+        ]
         cat_keys = ["vision_data", "vision_grid_thw", *self._omni_audio_cat_keys()]
+        routing_info = None
 
         if scheduler_type == "smart_padding":
             assert len(gbs_batches) % cp_size == 0, (
@@ -1290,8 +1320,9 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 "vision_grid_thw",
                 "position_ids",
                 *self._omni_audio_cat_keys(),
+                *extra_pack_keys,
             ]
-            new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, _ = (
+            new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info = (
                 dyn_cp_schedule_default(
                     gbs_batches,
                     dp_group,
@@ -1306,7 +1337,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                     global_id_seqlens_keys,
                     dtype_map,
                     max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
-                    need_routing_info=False,
+                    need_routing_info=need_routing_info,
                 )
             )
 
@@ -1331,8 +1362,11 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                     sample[k] = sample[k].reshape(-1, vision_data_last_dim)
                 elif k in ["vision_grid_thw"]:
                     sample[k] = sample[k].reshape(-1, 3)
+            self._sft_dyn_cp_restore_packed_sample(sample)
         self._restore_omni_audio_after_dyn_cp(new_samples, dp_cp_group, mel_bins_box[0])
 
+        if need_routing_info:
+            return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info
         return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
 
     @override
@@ -1466,7 +1500,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
         dp_size = dp_group.size()
         cp_size = dp_cp_group.size() // dp_size
 
-        dist_config = self.config.policy.dist_config
+        dist_config = self.role_config.dist_config
         scheduler_max_seqlen = kwargs.get(
             "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
         )
@@ -1524,7 +1558,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             if batch.get("vision_data") is not None:
                 assert batch.get("vision_grid_thw") is not None
                 assert batch["vision_data"].dtype == dtype_map["vision_data"], (
-                    f"inconsistent vision_data dtype: {batch['vision_data'].dtype} vs {dtype_map['vision_data']}"
+                    f"inconsistent vision_data dtype: {batch['vision_data'].dtype} vs "
+                    f"{dtype_map['vision_data']}"
                 )
                 assert dtype_map["vision_grid_thw"] == batch["vision_grid_thw"].dtype
                 if batch["vision_data"].numel() > 0:
@@ -1731,12 +1766,14 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             index = get_thd_partitioned_indices(
                 batch["cu_seqlens_padded"], total_tokens, cp_size, cp_rank
             )
-            # Qwen3-VL consumes full tokens/image_input_mask, while only the
-            # model label stream is CP-sharded. Keep rollout tensors replicated
-            # in the DCP subgroup for the verl-style loss reconstruction path.
+            # Qwen3-VL consumes full tokens/image_input_mask, while the model
+            # label and router streams are CP-sharded. Keep loss-only rollout
+            # tensors replicated for the verl-style loss reconstruction path.
             cp_split_keys = ["labels"]
             for key in cp_split_keys:
                 batch[key] = batch[key].index_select(0, index)
+            if "routed_experts" in batch:
+                batch["routed_experts"] = batch["routed_experts"].index_select(0, index)
             # position_ids is flattened mrope [3 * total_tokens]; reshape to the
             # token axis before slicing.
             pos_ids = batch["position_ids"].view(1, total_tokens, 3)
@@ -1761,7 +1798,7 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
                 )
             batch[key] = batch[key].view(1, total_tokens).contiguous()
         if "routed_experts" in batch:
-            assert batch["routed_experts"].shape[0] == total_tokens
+            assert batch["routed_experts"].shape[0] == cp_tokens
             assert batch["routed_experts"].ndim == 3
 
         cu_seqlens_padded = batch["cu_seqlens_padded"]
@@ -1803,6 +1840,8 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
             self._set_omni_audio_fwd_kwargs(
                 fwd_kwargs, batch["input_features"], batch["audio_feature_lengths"]
             )
+        # Store cp_group in batch so dyn-CP logprob / loss can bind and reconstruct.
+        batch["cp_group"] = cp_group
         return batch, fwd_kwargs
 
     @override
@@ -2000,6 +2039,78 @@ class Qwen3VLPrepareDataForward(OnlineMtpSftMixin, PrepareDataForward):
 
 
 class Qwen3VLOffPoilicyDistillPrepareDataForward(Qwen3VLPrepareDataForward):
+    @override
+    def _sft_dyn_cp_sample_extras(
+        self,
+        orig_batch: Dict[str, Any],
+        pad_len: int,
+    ) -> Dict[str, Any]:
+        hidden = orig_batch.get("teacher_hidden_states")
+        if hidden is None or not mpu.is_pipeline_last_stage():
+            return {}
+        return {
+            "teacher_hidden_states": flatten_teacher_hidden_for_sft_pack(hidden, pad_len),
+        }
+
+    @override
+    def _sft_dyn_cp_extra_pack_keys(self, batches: List[Dict[str, Any]]) -> List[str]:
+        if not mpu.is_pipeline_last_stage():
+            return []
+        has_hidden = any(b.get("teacher_hidden_states") is not None for b in batches)
+        if not has_hidden:
+            return []
+        assert all(b.get("teacher_hidden_states") is not None for b in batches), (
+            "teacher_hidden_states must be present on every last-PP sample when packing"
+        )
+        return ["teacher_hidden_states"]
+
+    @override
+    def _sft_dyn_cp_restore_packed_sample(self, sample: Dict[str, Any]) -> None:
+        restore_packed_teacher_hidden(sample)
+
+    @override
+    def sft_train_with_dynamic_cp(
+        self,
+        batches: List[Dict[str, Any]],
+        seq_len: int,
+        pad_token_id: int,
+        comput_attn_mask: bool = True,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        input_teacher_hidden_states = kwargs.get("input_teacher_hidden_states", False)
+        batch, fwd_kwargs = super().sft_train_with_dynamic_cp(
+            batches,
+            seq_len,
+            pad_token_id,
+            comput_attn_mask=comput_attn_mask,
+            pad_with_random_token=pad_with_random_token,
+            **kwargs,
+        )
+        if not input_teacher_hidden_states:
+            return batch, fwd_kwargs
+        if not mpu.is_pipeline_last_stage():
+            batch["teacher_hidden_states"] = None
+            return batch, fwd_kwargs
+
+        hidden = batch["teacher_hidden_states"]
+        total_tokens = int(batch["cu_seqlens_padded"][-1].item())
+        assert hidden.ndim == 2, f"teacher hidden must be [S, H], got {tuple(hidden.shape)}"
+        cp_group = batch["cp_group"]
+        cp_size = cp_group.size()
+        if cp_size > 1:
+            cp_rank = cp_group.rank()
+            index = get_thd_partitioned_indices(
+                batch["cu_seqlens_padded"], total_tokens, cp_size, cp_rank
+            )
+            hidden = hidden.index_select(0, index)
+        seq_cp = int(batch["labels"].size(-1))
+        assert hidden.shape[0] == seq_cp, (
+            f"teacher hidden CP shard {hidden.shape[0]} != labels {seq_cp}"
+        )
+        batch["teacher_hidden_states"] = hidden.view(1, seq_cp, -1).contiguous()
+        return batch, fwd_kwargs
+
     @override
     def sft_train(
         self,

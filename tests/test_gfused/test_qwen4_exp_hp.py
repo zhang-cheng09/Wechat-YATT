@@ -7,20 +7,25 @@
 - 激活重算跳过 Engram 所在层；
 - DSV4 专属的 flag 会明确报错而不是被静默忽略。
 """
+import builtins
 import pathlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import gpatch_v4.training_backend.fsdp2_backend.hp_builder.qwen4_exp as qwen4_exp_builder
+from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.models.qwen4_exp import (
     Qwen4ExpConfig,
-    Qwen4ExpForCausalLM,
+    Qwen4ExpHpForConditionalGeneration,
     Qwen4ExpTextConfig,
 )
 from gpatch_v4.models.qwen4_exp.engram import Qwen4ExpEngramEmbedding
 from gpatch_v4.models.qwen4_exp.hp import (
     _bind_cp,
+    _new_engram_process_group,
+    apply_hp,
     set_activation_checkpointing,
     shard_experts_for_ep,
     swap_parallel_modules,
@@ -32,6 +37,13 @@ from gpatch_v4.models.qwen4_exp.modeling_qwen4_exp import (
 )
 from gpatch_v4.models.qwen4_exp.moe import Qwen4ExpEPExperts
 from gpatch_v4.models.qwen4_exp.qsa import Qwen4ExpQSAAttention
+from gpatch_v4.training_backend.fsdp2_backend.hp_builder import get_hp_builder
+from gpatch_v4.training_backend.fsdp2_backend.hp_builder.deepseek_v4 import (
+    DefaultHpBuilder,
+)
+from gpatch_v4.training_backend.fsdp2_backend.hp_builder.qwen4_exp import (
+    Qwen4ExpHpBuilder,
+)
 from gpatch_v4.training_backend.fsdp2_backend.mixin import Fsdp2EngineMixin
 
 NUM_EXPERTS = 8
@@ -80,13 +92,21 @@ TINY_KWARGS = dict(
 )
 
 
-def _config(**overrides) -> Qwen4ExpTextConfig:
-    return Qwen4ExpTextConfig(**{**TINY_KWARGS, **overrides})
+def _config(**overrides) -> Qwen4ExpConfig:
+    text_config = Qwen4ExpTextConfig(**{**TINY_KWARGS, **overrides})
+    return Qwen4ExpConfig(
+        text_config=text_config,
+        vision_config=dict(
+            depth=1, hidden_size=32, intermediate_size=64, num_heads=4,
+            patch_size=2, spatial_merge_size=2, temporal_patch_size=1,
+            out_hidden_size=text_config.hidden_size, num_position_embeddings=16,
+        ),
+    )
 
 
-def _model(seed: int = 0) -> Qwen4ExpForCausalLM:
+def _model(seed: int = 0) -> Qwen4ExpHpForConditionalGeneration:
     torch.manual_seed(seed)
-    model = Qwen4ExpForCausalLM(_config())
+    model = Qwen4ExpHpForConditionalGeneration(_config())
     model.eval()
     return model
 
@@ -98,20 +118,21 @@ def test_swap_replaces_only_parallel_leaves_and_binds_cp() -> None:
     swap_parallel_modules(model, attn_backend="dense")
 
     assert set(model.state_dict()) == before
-    assert all(type(layer) is Qwen4ExpTextDecoderLayer for layer in model.model.layers)
-    assert all(layer.cp_size == 1 for layer in model.model.layers)
+    assert all(type(layer) is Qwen4ExpTextDecoderLayer for layer in model.model.language_model.layers)
+    assert all(layer.cp_size == 1 for layer in model.model.language_model.layers)
     sparse_indices = [i for i, t in enumerate(config.layer_types) if t == "qwen_sparse_attention"]
     assert sparse_indices == [3, 7]
-    for layer_idx, layer in enumerate(model.model.layers):
+    for layer_idx, layer in enumerate(model.model.language_model.layers):
         assert isinstance(layer.mlp.experts, Qwen4ExpEPExperts)
+        assert not layer.mlp.experts.ep_weight_before_combine
         if layer_idx in sparse_indices:
             assert isinstance(layer.self_attn, Qwen4ExpQSAAttention)
         else:
             assert not hasattr(layer, "self_attn")
             assert type(layer.linear_attn) is Qwen4ExpTextGatedDeltaNet
     # Engram 只在 layers.1（ple_layer_ids=[2] 是 1-based）
-    assert type(model.model.layers[1].ple) is Qwen4ExpTextPLELayer
-    assert isinstance(model.model.layers[1].ple.ple_embedding, Qwen4ExpEngramEmbedding)
+    assert type(model.model.language_model.layers[1].ple) is Qwen4ExpTextPLELayer
+    assert isinstance(model.model.language_model.layers[1].ple.ple_embedding, Qwen4ExpEngramEmbedding)
 
     cp_group = object()
     cp_mesh = SimpleNamespace(
@@ -124,15 +145,108 @@ def test_swap_replaces_only_parallel_leaves_and_binds_cp() -> None:
     assert model._cp_size == 2
     assert model._cp_rank == 1
     assert model._cp_mesh is cp_mesh
-    assert all(layer.cp_size == 2 for layer in model.model.layers)
+    assert all(layer.cp_size == 2 for layer in model.model.language_model.layers)
     with pytest.raises(RuntimeError, match="batch context is missing"):
         model(input_ids=torch.randint(0, config.vocab_size, (1, 20)))
+
+
+def test_engram_process_group_is_not_world(monkeypatch) -> None:
+    """Engram 与 FSDP2 必须使用不同的 NCCL communicator。"""
+    model = _model()
+    dedicated_group = object()
+    new_group_ranks = []
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        torch.distributed,
+        "new_group",
+        lambda *, ranks: new_group_ranks.append(ranks) or dedicated_group,
+    )
+
+    engram_group = _new_engram_process_group()
+    swap_parallel_modules(
+        model,
+        attn_backend="dense",
+        engram_group=engram_group,
+    )
+
+    table = model.model.language_model.layers[1].ple.ple_embedding.ngram_embedding
+    assert new_group_ranks == [[0, 1]]
+    assert table.process_group is dedicated_group
+    assert table.process_group is not torch.distributed.group.WORLD
+
+
+def test_swap_selects_deepep_experts() -> None:
+    model = _model()
+    swap_parallel_modules(model, attn_backend="dense", ep_backend="deepep")
+    assert all(
+        layer.mlp.experts.ep_backend == "deepep"
+        for layer in model.model.language_model.layers
+    )
+
+
+def test_swap_forwards_eager_weight_placement() -> None:
+    model = _model()
+    swap_parallel_modules(
+        model,
+        attn_backend="dense",
+        ep_weight_before_combine=True,
+    )
+    assert all(
+        layer.mlp.experts.ep_weight_before_combine
+        for layer in model.model.language_model.layers
+    )
+
+
+def test_unknown_ep_backend_is_rejected_before_sharding() -> None:
+    with pytest.raises(ValueError, match="unknown ep_backend"):
+        apply_hp(_model(), object(), attn_backend="dense", ep_backend="unknown")
+
+
+def test_hp_builder_forwards_apply_hp_settings(monkeypatch) -> None:
+    captured = {}
+    model = SimpleNamespace(config=_config())
+
+    def fake_apply_hp(actual_model, ep_2d_mesh, **kwargs):
+        captured["model"] = actual_model
+        captured["ep_2d_mesh"] = ep_2d_mesh
+        captured.update(kwargs)
+        return actual_model
+
+    monkeypatch.setattr(qwen4_exp_builder, "apply_hp_qwen4_exp", fake_apply_hp)
+    engine = SimpleNamespace(
+        ep_2d_mesh=object(),
+        cp_mesh_for_hp=object(),
+        training_config=SimpleNamespace(freeze_llm=False, freeze_vit=False, freeze_projector=False),
+        policy_config=SimpleNamespace(
+            attn_implementation="flex",
+            qsa_score_query_chunk_size=1024,
+                qsa_compile_score=True,
+                ep_backend="deepep",
+                deepep_num_sms=13,
+                deepep_async_finish=False,
+                ep_weight_before_combine=True,
+            ),
+    )
+
+    assert Qwen4ExpHpBuilder().apply_hp(model, engine) is model
+    assert captured["model"] is model
+    assert captured["ep_2d_mesh"] is engine.ep_2d_mesh
+    assert captured["cp_mesh"] is engine.cp_mesh_for_hp
+    assert captured["attn_backend"] == "flex"
+    assert captured["qsa_score_query_chunk_size"] == 1024
+    assert captured["qsa_compile_score"] is True
+    assert captured["ep_backend"] == "deepep"
+    assert captured["deepep_num_sms"] == 13
+    assert captured["deepep_async_finish"] is False
+    assert captured["ep_weight_before_combine"] is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_swap_preserves_logits() -> None:
     """替换后数值必须不变——三个替换件都是等价实现（EP 未开启、QSA 用 dense oracle）。"""
-    config = _config()
+    config = _config().text_config
     reference = _model(seed=3).to("cuda")
     swapped = _model(seed=3).to("cuda")
     swap_parallel_modules(swapped, attn_backend="dense")
@@ -150,7 +264,7 @@ def test_swap_on_meta_model_keeps_shapes() -> None:
     torch.set_default_dtype(torch.float32)
     try:
         with torch.device("meta"):
-            model = Qwen4ExpForCausalLM(_config())
+            model = Qwen4ExpHpForConditionalGeneration(_config())
     finally:
         torch.set_default_dtype(prev_dtype)
 
@@ -169,7 +283,7 @@ def test_expert_slicing_on_meta(ep_size: int) -> None:
     torch.set_default_dtype(torch.float32)
     try:
         with torch.device("meta"):
-            model = Qwen4ExpForCausalLM(_config())
+            model = Qwen4ExpHpForConditionalGeneration(_config())
     finally:
         torch.set_default_dtype(prev_dtype)
     swap_parallel_modules(model, attn_backend="flex")
@@ -181,7 +295,7 @@ def test_expert_slicing_on_meta(ep_size: int) -> None:
         def get_group(self):
             return None
 
-    experts = model.model.layers[0].mlp.experts
+    experts = model.model.language_model.layers[0].mlp.experts
     shard_experts_for_ep(experts, _FakeMesh())
 
     num_local = NUM_EXPERTS // ep_size
@@ -207,19 +321,87 @@ def test_expert_slicing_rejects_indivisible_ep_size() -> None:
             return None
 
     with pytest.raises(ValueError, match="not divisible"):
-        shard_experts_for_ep(model.model.layers[0].mlp.experts, _FakeMesh())
+        shard_experts_for_ep(model.model.language_model.layers[0].mlp.experts, _FakeMesh())
 
 
 def test_activation_checkpointing_skips_the_engram_layer() -> None:
     model = _model()
+    model.gradient_checkpointing_enable()
     set_activation_checkpointing(model, enabled=True)
-    flags = [layer.gradient_checkpointing for layer in model.model.layers]
+    flags = [layer.gradient_checkpointing for layer in model.model.language_model.layers]
     # 8 层里只有 layers.1（Engram 所在层）保持 eager
     assert flags == [True, False, True, True, True, True, True, True]
     assert sum(flags) == len(flags) - 1
 
     set_activation_checkpointing(model, enabled=False)
-    assert not any(layer.gradient_checkpointing for layer in model.model.layers)
+    assert not any(layer.gradient_checkpointing for layer in model.model.language_model.layers)
+
+
+def test_selective_activation_checkpointing_keeps_ep_communication_eager() -> None:
+    model = _model()
+    swap_parallel_modules(model, attn_backend="dense", ep_backend="deepep")
+    model.gradient_checkpointing_enable()
+    set_activation_checkpointing(model, enabled=True, selective_recompute=True)
+
+    full_flags = [layer.gradient_checkpointing for layer in model.model.language_model.layers]
+    selective_flags = [layer.selective_gradient_checkpointing for layer in model.model.language_model.layers]
+    assert full_flags == [False, False, False, True, False, False, False, True]
+    assert selective_flags == [True, False, True, False, True, True, True, False]
+
+    # The EP communication remains outside the checkpoint boundary; after the
+    # parallel leaves are installed, only local expert GEMMs are checkpointed.
+    expert_flags = [
+        layer.mlp.experts.selective_gradient_checkpointing
+        for layer in model.model.language_model.layers
+    ]
+    assert expert_flags == [True, True, True, False, True, True, True, False]
+    assert [layer.mlp.selective_gradient_checkpointing for layer in model.model.language_model.layers] == expert_flags
+
+    set_activation_checkpointing(model, enabled=False)
+    assert not any(layer.selective_gradient_checkpointing for layer in model.model.language_model.layers)
+    assert not any(layer.mlp.experts.selective_gradient_checkpointing for layer in model.model.language_model.layers)
+    assert not any(layer.mlp.selective_gradient_checkpointing for layer in model.model.language_model.layers)
+
+
+def test_selective_activation_checkpointing_can_bound_gdn_layers() -> None:
+    model = _model()
+    swap_parallel_modules(model, attn_backend="dense", ep_backend="deepep")
+    model.gradient_checkpointing_enable()
+    set_activation_checkpointing(
+        model,
+        enabled=True,
+        selective_recompute=True,
+        selective_recompute_max_layers=2,
+    )
+
+    assert [layer.selective_gradient_checkpointing for layer in model.model.language_model.layers] == [
+        True,
+        False,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert [layer.gradient_checkpointing for layer in model.model.language_model.layers] == [
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+    ]
+
+    with pytest.raises(ValueError, match="non-negative"):
+        set_activation_checkpointing(
+            model,
+            enabled=True,
+            selective_recompute=True,
+            selective_recompute_max_layers=-1,
+        )
 
 
 def test_layer_types_length_mismatch_is_rejected() -> None:
@@ -248,7 +430,6 @@ def test_unknown_layer_type_is_rejected() -> None:
         ("fp4_qat_indexer", True),
         ("fsdp_fp8_gather", True),
         ("moe_router_force_load_balancing", True),
-        ("dynamic_context_parallel", True),
     ],
 )
 def test_unsupported_policy_settings_are_rejected_not_ignored(
@@ -269,16 +450,142 @@ def test_unsupported_policy_settings_are_rejected_not_ignored(
     else:
         setattr(policy_config, flag, value)
     engine = SimpleNamespace(
-        training_config=SimpleNamespace(enable_mtp=False, enable_dspark=False),
+        training_config=SimpleNamespace(
+            enable_mtp=False,
+            online_mtp_sft=False,
+            enable_mtp_rollout=False,
+            enable_dspark=False,
+        ),
         policy_config=policy_config,
     )
+    # 这里只验证配置门禁，避免 build 继续构造和加载模型。
     with pytest.raises(NotImplementedError, match=flag):
-        Fsdp2EngineMixin._get_qwen4_exp_hp_model(engine, None, "", False)
+        get_hp_builder(MODEL_ARCH.QWEN4_EXP).validate(engine)
+
+
+def test_unified_arch_requires_vision_model(monkeypatch) -> None:
+    class StrictDataclassDefinitionError(RuntimeError):
+        pass
+
+    original_import = builtins.__import__
+
+    def import_with_broken_vision(name, *args, **kwargs):
+        if name == "gpatch_v4.models.qwen4_exp.vl":
+            raise StrictDataclassDefinitionError("broken optional vision class")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_broken_vision)
+    vision_engine = SimpleNamespace(policy_config=SimpleNamespace(model_arch="qwen4_exp"))
+    with pytest.raises(ImportError, match="Qwen4Exp vision support") as error:
+        Fsdp2EngineMixin.get_model_cls(vision_engine)
+    assert isinstance(error.value.__cause__, StrictDataclassDefinitionError)
+
+
+@pytest.mark.parametrize(
+    ("enable_mtp", "online_mtp_sft", "enable_mtp_rollout", "error"),
+    [
+        (False, False, False, None),
+        (True, False, True, None),
+        (True, True, True, NotImplementedError),
+    ],
+)
+def test_load_only_mtp_validation(
+    enable_mtp: bool,
+    online_mtp_sft: bool,
+    enable_mtp_rollout: bool,
+    error: type[Exception] | None,
+) -> None:
+    engine = SimpleNamespace(
+        training_config=SimpleNamespace(
+            enable_mtp=enable_mtp,
+            online_mtp_sft=online_mtp_sft,
+            enable_mtp_rollout=enable_mtp_rollout,
+            enable_dspark=False,
+        ),
+        policy_config=SimpleNamespace(
+            indexer_backend="eager",
+            fp8_qat=False,
+            fp4_qat=False,
+            fp4_qat_indexer=False,
+            fp8=False,
+            fsdp_fp8_gather=False,
+            moe_router_force_load_balancing=False,
+        ),
+    )
+    builder = get_hp_builder(MODEL_ARCH.QWEN4_EXP)
+    if error is None:
+        builder.validate(engine)
+    else:
+        with pytest.raises(error):
+            builder.validate(engine)
 
 
 RELEASED_CONFIG_DIR = pathlib.Path(
     "/mnt/ceph-hz1-csp/mm-base-plt2/user_edsonzhou/hf-hub/Qwen/Qwen3.8-Flash-Next"
 )
+
+
+@pytest.mark.parametrize("enable_mtp", [False, True])
+@pytest.mark.parametrize("model_only_inference", [False, True])
+def test_prepare_config_load_only_mtp_switch(
+    tmp_path, enable_mtp: bool, model_only_inference: bool,
+) -> None:
+    _config(
+        mtp={"layer_types": ["full_attention"], "num_hidden_layers": 1},
+        mtp_num_hidden_layers=1,
+    ).save_pretrained(tmp_path)
+    engine = SimpleNamespace(
+        training_config=SimpleNamespace(enable_mtp=enable_mtp),
+        config=SimpleNamespace(debug=SimpleNamespace(debug_truncate_num_hidden_layers=None)),
+    )
+    cfg = Qwen4ExpHpBuilder().prepare_config(
+        Qwen4ExpHpForConditionalGeneration, str(tmp_path), engine, model_only_inference,
+    )
+    with torch.device("meta"):
+        model = Qwen4ExpHpForConditionalGeneration(cfg)
+    expected = enable_mtp and not model_only_inference
+    text_config = cfg.get_text_config()
+    assert (model.mtp is not None) is expected
+    assert text_config.mtp_num_hidden_layers == int(expected)
+    assert bool([key for key in model.state_dict() if key.startswith("mtp.")]) is expected
+
+
+@pytest.mark.parametrize(
+    ("model_only_inference", "expected_mtp_layers"),
+    [(False, 1), (True, 0)],
+)
+def test_deepseek_prepare_config_skips_mtp_for_inference_only_model(
+    model_only_inference: bool,
+    expected_mtp_layers: int,
+) -> None:
+    class FakeConfig:
+        @classmethod
+        def from_pretrained(cls, _path, trust_remote_code=True):
+            return SimpleNamespace(
+                num_nextn_predict_layers=1,
+                to_dict=lambda: {},
+            )
+
+    class FakeModel:
+        config_class = FakeConfig
+
+    engine = SimpleNamespace(
+        training_config=SimpleNamespace(
+            enable_mtp=True,
+            enable_dspark=False,
+            mtp_loss_scaling_factor=0.1,
+        ),
+        config=SimpleNamespace(
+            debug=SimpleNamespace(debug_truncate_num_hidden_layers=None),
+        ),
+    )
+    config = DefaultHpBuilder().prepare_config(
+        FakeModel,
+        "unused",
+        engine,
+        model_only_inference,
+    )
+    assert config.num_nextn_predict_layers == expected_mtp_layers
 
 
 @pytest.mark.skipif(
@@ -299,5 +606,23 @@ def test_released_config_parses_to_expected_architecture() -> None:
     assert text_config.split_ngram_parts == 128
     assert (text_config.indexer_budget, text_config.indexer_compress_ratio) == (2048, 4)
     assert text_config.tie_word_embeddings is False
+    assert text_config.mtp_num_hidden_layers == 1
+    assert text_config.mtp_use_dedicated_embeddings is False
+    assert text_config.mtp["layer_types"] == ["full_attention"]
     sparse = [i for i, t in enumerate(text_config.layer_types) if t == "qwen_sparse_attention"]
     assert sparse == list(range(3, 48, 4))
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+@pytest.mark.parametrize("frozen", [False, True])
+def test_parallel_module_replacement_preserves_trainability(device: str, frozen: bool) -> None:
+    with torch.device(device):
+        model = Qwen4ExpHpForConditionalGeneration(_config())
+    model.requires_grad_(not frozen)
+    before = {name: param.requires_grad for name, param in model.named_parameters()}
+    swap_parallel_modules(model, attn_backend="dense")
+    expected = {
+        name: trainable and ".self_attn.indexer." not in name
+        for name, trainable in before.items()
+    }
+    assert {name: param.requires_grad for name, param in model.named_parameters()} == expected

@@ -1,3 +1,4 @@
+import math
 import uuid
 from typing import Any, Dict, List, Tuple
 
@@ -18,6 +19,7 @@ from gpatch_v4.utils import (
     BroadcastUtils,
     get_ltor_masks_and_position_ids,
     get_tensor_on_this_cp_rank,
+    log,
     metadata_scalar,
     pad_3d_seq_dim,
     pad_or_truncate_last_dim,
@@ -27,6 +29,8 @@ from gpatch_v4.utils.dynamic_cp_utils import (
     compute_dyn_cp_response_span,
     dyn_cp_schedule_default,
     dyn_cp_schedule_smart_padding,
+    flatten_teacher_hidden_for_sft_pack,
+    restore_packed_teacher_hidden,
 )
 
 
@@ -48,11 +52,20 @@ class SamplerGenerateFuncLLM(SamplerGenerateFunc):
         prompt_lens = batched_data["prompt_lens"]
         gt_label = batched_data["gt_label"]
 
+        infer_engine_cfg = config.sampler.infer_engine_configs[idx]
         sampling_params = infer_engine.get_sampling_params_from_config(
-            config.sampler.infer_engine_configs[idx],
+            infer_engine_cfg,
             tokenizer.eos_token_id,
             is_eval=is_eval,
         )
+        if is_eval:
+            log(
+                f"[GRPO EVAL SAMPLING] infer_engine_idx={idx} is_eval={is_eval} "
+                f"eval_generate_params={infer_engine_cfg.eval_generate_params} "
+                f"eval_sampling_repeat_n={config.training.eval_sampling_repeat_n} "
+                f"sampling_repeat_n={sampling_repeat_n} "
+                f"effective_sampling_params={sampling_params}"
+            )
         async_gens = []
         for i in range(len(prompt_token_ids)):
             for j in range(sampling_repeat_n):
@@ -77,14 +90,21 @@ class SamplerGenerateFuncLLM(SamplerGenerateFunc):
         unique_id_list = []
         rollout_log_probs_lst = []
 
-        infer_engine_cfg = config.sampler.infer_engine_configs[idx]
+        hf_cfg = config.policy.hf_config
+        # VL / qwen4_exp nest text under text_config; omni under thinker_config.
+        if hasattr(hf_cfg, "thinker_config") and hasattr(hf_cfg.thinker_config, "text_config"):
+            text_cfg = hf_cfg.thinker_config.text_config
+        elif getattr(hf_cfg, "text_config", None) is not None:
+            text_cfg = hf_cfg.text_config
+        else:
+            text_cfg = hf_cfg
         override_num_layers = infer_engine_cfg.model_override_args.get("num_hidden_layers", None)
         if override_num_layers is not None:
             num_layers = int(override_num_layers)
         else:
-            num_layers = config.policy.hf_config.num_hidden_layers
+            num_layers = text_cfg.num_hidden_layers
 
-        moe_router_topk = getattr(config.policy.hf_config, "num_experts_per_tok", None)
+        moe_router_topk = getattr(text_cfg, "num_experts_per_tok", None)
 
         for gi, gen_out in enumerate(gen_outputs):
             i = gi // sampling_repeat_n
@@ -114,6 +134,18 @@ class SamplerGenerateFuncLLM(SamplerGenerateFunc):
             rollout_log_probs_lst.append(full_lp)
 
             routed_experts = process_routed_experts(one_output, num_layers, moe_router_topk)
+            if config.training.moe_router_replay:
+                if routed_experts is None:
+                    raise RuntimeError(
+                        "moe_router_replay is enabled, but SGLang did not return "
+                        "routed_experts"
+                    )
+                expected_shape = (len(token), num_layers, int(moe_router_topk))
+                if tuple(routed_experts.shape) != expected_shape:
+                    raise ValueError(
+                        f"routed_experts shape {tuple(routed_experts.shape)} != "
+                        f"expected {expected_shape}"
+                    )
             routed_experts_list.append(routed_experts)
 
         rollout_batch = dict(
@@ -1053,13 +1085,26 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         )
         return batch, fwd_kwargs
 
+    def _sft_dyn_cp_sample_extras(
+        self,
+        orig_batch: Dict[str, Any],
+        pad_len: int,
+    ) -> Dict[str, Any]:
+        return {}
+
+    def _sft_dyn_cp_extra_pack_keys(self, batches: List[Dict[str, Any]]) -> List[str]:
+        return []
+
+    def _sft_dyn_cp_restore_packed_sample(self, sample: Dict[str, Any]) -> None:
+        return
+
     def sft_reroute_data_for_dynamic_cp(
         self,
         gbs_batches: List[Dict[str, Any]],
         pad_token_id: int,
         pad_with_random_token: bool = False,
         **kwargs,
-    ) -> Tuple[List[Dict[str, torch.Tensor]], int, float, float]:
+    ):
         dp_group = mpu.get_data_parallel_group()
         tp_group = mpu.get_tensor_model_parallel_group()
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1071,17 +1116,21 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         cp_size = dp_cp_group.size() // dp_size
         total_dyn_cp_gpus = dp_cp_group.size()
 
-        dist_config = self.config.policy.dist_config
+        dist_config = self.role_config.dist_config
         scheduler_type = dist_config.dynamic_cp_scheduler_type
         scheduler_max_seqlen = kwargs.get(
             "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
         )
+        need_routing_info = kwargs.get("need_routing_info", False)
         if scheduler_type == "smart_padding":
             dp_cp_pad = 2 * cp_size
         else:
             dp_cp_pad = 2 * dp_cp_size if dp_cp_size > 1 else 1
         tp_pad = tp_size if tp_size > 1 else 1
-        pad_div = dp_cp_pad * tp_pad
+        pad_div = math.lcm(
+            dp_cp_pad * tp_pad,
+            int(kwargs.get("pad_to_multiple_of", 1)),
+        )
 
         # 1. Shift labels and build clean sample dicts with the keys expected
         # by reroute_samples_to_dcp_ranks_by_keys / build_packed_microbatches.
@@ -1097,6 +1146,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                 vocab_size,
                 pad_with_random_token,
             )
+            extras = self._sft_dyn_cp_sample_extras(batch, pad_len)
             gbs_batches[i] = dict(
                 tokens=tokens,
                 labels=labels,
@@ -1106,12 +1156,15 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                 ),
                 original_seq_len=torch.tensor([actual_len], dtype=torch.int32),
                 padded_seq_len=torch.tensor([tokens.shape[-1]], dtype=torch.int32),
+                **extras,
             )
 
         # 2. 根据调度器类型执行不同的调度和 packing 策略
+        extra_pack_keys = self._sft_dyn_cp_extra_pack_keys(gbs_batches)
         dev = torch.cuda.current_device()
-        packed_keys = ["tokens", "labels", "loss_mask", "position_ids"]
+        packed_keys = ["tokens", "labels", "loss_mask", "position_ids", *extra_pack_keys]
         cat_keys = []
+        routing_info = None
 
         if scheduler_type == "smart_padding":
             assert len(gbs_batches) % cp_size == 0, (
@@ -1134,10 +1187,10 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
             assert scheduler_type == "default"
             global_id_seqlens_keys = [
                 "tokens", "labels", "loss_mask", "position_ids", "original_seq_len",
-                "padded_seq_len"
+                "padded_seq_len", *extra_pack_keys
             ]
             dtype_map = {}
-            new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, _ = (
+            new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info = (
                 dyn_cp_schedule_default(
                     gbs_batches,
                     dp_group,
@@ -1152,10 +1205,14 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     global_id_seqlens_keys,
                     dtype_map,
                     max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
-                    need_routing_info=False,
+                    need_routing_info=need_routing_info,
                 )
             )
 
+        for sample in new_samples:
+            self._sft_dyn_cp_restore_packed_sample(sample)
+        if need_routing_info:
+            return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info
         return new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum
 
     @override
@@ -1174,12 +1231,15 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
         tp_size = tp_group.size()
         dp_cp_pad = 2 * dp_cp_size if dp_cp_size > 1 else 1
         tp_pad = tp_size if tp_size > 1 else 1
-        pad_div = dp_cp_pad * tp_pad
+        pad_div = math.lcm(
+            dp_cp_pad * tp_pad,
+            int(kwargs.get("pad_to_multiple_of", 1)),
+        )
 
         dp_size = dp_group.size()
         cp_size = dp_cp_group.size() // dp_size
 
-        dist_config = self.config.policy.dist_config
+        dist_config = self.role_config.dist_config
         scheduler_max_seqlen = kwargs.get(
             "max_seqlen_per_dp_cp_rank", dist_config.max_seqlen_per_dp_cp_rank
         )
@@ -1210,6 +1270,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
 
         rl_key_map = [(src, dst) for src, dst in _optional_rl_keys if src in first]
         has_sample_mask = first.get("sample_mask") is not None
+        has_routed_experts = first.get("routed_experts") is not None
 
         # Shift each sample before packing (input = tokens[:-1], target =
         # tokens[1:]); a post-pack roll(-1) would leak labels across sub-sequence
@@ -1259,6 +1320,22 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                     sm = sm.unsqueeze(0)
                 sm = sm.expand(actual_len).to(torch.float32).contiguous()
                 sample["sample_mask"] = pad_or_truncate_last_dim(sm, pad_len, 0)
+            if has_routed_experts:
+                routed_experts = batch["routed_experts"]
+                assert routed_experts.ndim == 3
+                assert routed_experts.shape[0] == actual_len + 1
+                routed_experts = routed_experts[:-1]
+                route_index = torch.arange(
+                    pad_len,
+                    device=routed_experts.device,
+                ) % actual_len
+                padded_routes = routed_experts[route_index]
+                sample["routed_experts"] = padded_routes.reshape(-1)
+                sample["routed_experts_shape"] = torch.tensor(
+                    [routed_experts.shape[1], routed_experts.shape[2]],
+                    dtype=torch.int32,
+                    device=routed_experts.device,
+                )
             gbs_batches[i] = sample
 
         # Schedule and pack with default dynamic CP scheduler.
@@ -1277,8 +1354,12 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                 packed_keys.append("ref_log_probs")
         if has_sample_mask:
             packed_keys.append("sample_mask")
+        cat_keys = []
+        if has_routed_experts:
+            packed_keys.append("routed_experts")
+            cat_keys.append("routed_experts_shape")
 
-        global_id_seqlens_keys = packed_keys + ["original_seq_len", "padded_seq_len"]
+        global_id_seqlens_keys = (packed_keys + cat_keys + ["original_seq_len", "padded_seq_len"])
         need_routing_info = kwargs.get("need_routing_info", True)
         new_samples, num_micro_batches, seqlen_sum, seqlen_sq_sum, routing_info = (
             dyn_cp_schedule_default(
@@ -1291,7 +1372,7 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
                 dist_config,
                 dev,
                 packed_keys=packed_keys,
-                cat_keys=[],
+                cat_keys=cat_keys,
                 global_id_seqlens_keys=global_id_seqlens_keys,
                 dtype_map={},
                 max_seqlen_per_dp_cp_rank=scheduler_max_seqlen,
@@ -1429,6 +1510,78 @@ class PrepareDataForwardLLM(OnlineMtpSftMixin, PrepareDataForward):
 
 class OffPoilicyDistillPrepareDataForwardLLM(PrepareDataForwardLLM):
     @override
+    def _sft_dyn_cp_sample_extras(
+        self,
+        orig_batch: Dict[str, Any],
+        pad_len: int,
+    ) -> Dict[str, Any]:
+        hidden = orig_batch.get("teacher_hidden_states")
+        if hidden is None or not mpu.is_pipeline_last_stage():
+            return {}
+        return {
+            "teacher_hidden_states": flatten_teacher_hidden_for_sft_pack(hidden, pad_len),
+        }
+
+    @override
+    def _sft_dyn_cp_extra_pack_keys(self, batches: List[Dict[str, Any]]) -> List[str]:
+        if not mpu.is_pipeline_last_stage():
+            return []
+        has_hidden = any(b.get("teacher_hidden_states") is not None for b in batches)
+        if not has_hidden:
+            return []
+        assert all(b.get("teacher_hidden_states") is not None for b in batches
+                  ), ("teacher_hidden_states must be present on every last-PP sample when packing")
+        return ["teacher_hidden_states"]
+
+    @override
+    def _sft_dyn_cp_restore_packed_sample(self, sample: Dict[str, Any]) -> None:
+        restore_packed_teacher_hidden(sample)
+
+    @override
+    def sft_train_with_dynamic_cp(
+        self,
+        batches: List[Dict[str, Any]],
+        seq_len: int,
+        pad_token_id: int,
+        comput_attn_mask: bool = True,
+        pad_with_random_token: bool = False,
+        **kwargs,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        input_teacher_hidden_states = kwargs.get("input_teacher_hidden_states", False)
+        batch, fwd_kwargs = super().sft_train_with_dynamic_cp(
+            batches,
+            seq_len,
+            pad_token_id,
+            comput_attn_mask=comput_attn_mask,
+            pad_with_random_token=pad_with_random_token,
+            **kwargs,
+        )
+        if not input_teacher_hidden_states:
+            return batch, fwd_kwargs
+        if not mpu.is_pipeline_last_stage():
+            batch["teacher_hidden_states"] = None
+            return batch, fwd_kwargs
+
+        hidden = batch["teacher_hidden_states"]
+        total_tokens = int(batch["cu_seqlens_padded"][-1].item())
+        assert hidden.ndim == 2, f"teacher hidden must be [S, H], got {tuple(hidden.shape)}"
+        cp_group = batch["cp_group"]
+        cp_size = cp_group.size()
+        if cp_size > 1:
+            # LLM slices tokens with labels; recompute the same THD index.
+            cp_rank = cp_group.rank()
+            index = get_thd_partitioned_indices(
+                batch["cu_seqlens_padded"], total_tokens, cp_size, cp_rank
+            )
+            hidden = hidden.index_select(0, index)
+        seq_cp = int(batch["labels"].size(-1))
+        assert hidden.shape[0] == seq_cp, (
+            f"teacher hidden CP shard {hidden.shape[0]} != labels {seq_cp}"
+        )
+        batch["teacher_hidden_states"] = hidden.view(1, seq_cp, -1).contiguous()
+        return batch, fwd_kwargs
+
+    @override
     def sft_train(
         self,
         batches: List[Dict[str, Any]],
@@ -1468,9 +1621,7 @@ class OffPoilicyDistillPrepareDataForwardLLM(PrepareDataForwardLLM):
                     )
                 else:
                     teacher_output = teacher_output[:seq_len]
-                teacher_output = get_tensor_on_this_cp_rank(
-                    teacher_output, seq_dim=0
-                )
+                teacher_output = get_tensor_on_this_cp_rank(teacher_output, seq_dim=0)
                 assert seq_len_shard_by_cp == teacher_output.shape[0], (
                     f"{seq_len_shard_by_cp=} != {teacher_output.shape[0]}"
                 )

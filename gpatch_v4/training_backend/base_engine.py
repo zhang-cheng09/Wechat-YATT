@@ -100,3 +100,17 @@ class BaseEngine(ABC):
     def set_model_train(self):
         """Set the model to training mode."""
         ...
+
+    def get_param_group_lrs(self) -> Dict[str, float]:
+        """Named optimizer learning rates for logging.
+
+        Returns
+        -------
+        dict of str to float
+            Mapping from group name to current lr. Empty if the backend
+            does not split parameter groups. Splits that share the same
+            scheduled lr collapse to one key. The canonical ``default``
+            key is reported as ``{prefix}/lr``; other keys as
+            ``{prefix}/lr/{name}``.
+        """
+        return {}

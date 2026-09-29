@@ -28,6 +28,8 @@ training:
   metrics_report:
     - "acc_reward"
     - "fmt_reward"
+  enable_torch_compile: True
+  log_torch_recompiles: False
 
 
 checkpoint:

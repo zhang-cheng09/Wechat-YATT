@@ -109,10 +109,16 @@ class ApplySamplingRolloutAttrMultiModal(ApplySamplingRolloutAttrBase):
         for rollout_batch in rollout_batches:
             assert "unique_id" in rollout_batch
             uniq_ids = rollout_batch.pop("unique_id")
-            for unique_id in uniq_ids:
-                assert unique_id in self.mm_data_cache, f"error: {unique_id=} {self.mm_data_cache.keys()=}"
-                self.mm_data_used.add(unique_id)
-                for k, v in self.mm_data_cache[unique_id].items():
+            parent_uid_list = rollout_batch.pop("parent_unique_id", None)
+            for idx, unique_id in enumerate(uniq_ids):
+                lookup_id = unique_id
+                if lookup_id not in self.mm_data_cache and parent_uid_list is not None:
+                    lookup_id = parent_uid_list[idx]
+                assert lookup_id in self.mm_data_cache, (
+                    f"error: {unique_id=} {lookup_id=} {self.mm_data_cache.keys()=}"
+                )
+                self.mm_data_used.add(lookup_id)
+                for k, v in self.mm_data_cache[lookup_id].items():
                     if k not in rollout_batch:
                         rollout_batch[k] = []
                     rollout_batch[k].append(v)
@@ -139,9 +145,15 @@ class ApplySamplingRolloutAttrMultiModal(ApplySamplingRolloutAttrBase):
         for rollout_batch in rollout_batches:
             assert "unique_id" in rollout_batch
             uniq_ids = rollout_batch["unique_id"]
-            for unique_id in uniq_ids:
-                assert unique_id in self.mm_data_cache, f"error: {unique_id=} {self.mm_data_cache.keys()=}"
-                for k, v in self.mm_data_cache[unique_id].items():
+            parent_uid_list = rollout_batch.get("parent_unique_id")
+            for idx, unique_id in enumerate(uniq_ids):
+                lookup_id = unique_id
+                if lookup_id not in self.mm_data_cache and parent_uid_list is not None:
+                    lookup_id = parent_uid_list[idx]
+                assert lookup_id in self.mm_data_cache, (
+                    f"error: {unique_id=} {lookup_id=} {self.mm_data_cache.keys()=}"
+                )
+                for k, v in self.mm_data_cache[lookup_id].items():
                     if k not in rollout_batch:
                         rollout_batch[k] = []
                     rollout_batch[k].append(v)

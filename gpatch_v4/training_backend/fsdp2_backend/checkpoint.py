@@ -21,6 +21,34 @@ from torch.distributed.checkpoint.stateful import Stateful
 from gpatch_v4.core.parallel_state import cpu_barrier
 from gpatch_v4.utils import copy_cached_hf_metadata_files, log
 
+_EP_PARAMETER_SUFFIXES = (
+    ".mlp.experts.gate_up_proj",
+    ".mlp.experts.down_proj",
+)
+
+
+def _map_ep_optimizer_parameter_names(
+    optimizer_state_dict: dict[str, Any],
+    ep_rank: int,
+    add_prefix: bool,
+) -> None:
+    # Each EP rank keeps different experts under the same parameter name; DCP would merge them and overwrite Adam.
+    prefix = f"__ep_{ep_rank}__."
+
+    def map_name(name: str) -> str:
+        if add_prefix and name.endswith(_EP_PARAMETER_SUFFIXES):
+            return f"{prefix}{name}"
+        if not add_prefix and name.startswith(prefix):
+            return name.removeprefix(prefix)
+        return name
+
+    optimizer_state_dict["state"] = {
+        map_name(name): state
+        for name, state in optimizer_state_dict["state"].items()
+    }
+    for group in optimizer_state_dict["param_groups"]:
+        group["params"] = [map_name(name) for name in group["params"]]
+
 
 def _fill_missing_optim_state(optimizer):
     """Fill zero state for params without gradients, so DCP save/load doesn't miss keys.
@@ -86,20 +114,26 @@ class ModelState(Stateful):
 
 class OptimizerState(Stateful):
     """Wrapper for optimizer state only."""
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, ep_rank: int | None = None):
         self.model = model
         self.optimizer = optimizer
+        self.ep_rank = ep_rank
 
     def state_dict(self):
         _, optimizer_state_dict = get_state_dict(self.model, optimizers=self.optimizer)
+        if self.ep_rank is not None:
+            _map_ep_optimizer_parameter_names(optimizer_state_dict, self.ep_rank, add_prefix=True)
         return {"optim": optimizer_state_dict}
 
     def load_state_dict(self, state_dict):
+        optimizer_state_dict = state_dict["optim"]
+        if self.ep_rank is not None:
+            _map_ep_optimizer_parameter_names(optimizer_state_dict, self.ep_rank, add_prefix=False)
         set_state_dict(
             self.model,
             optimizers=self.optimizer,
             model_state_dict=None,
-            optim_state_dict=state_dict["optim"]
+            optim_state_dict=optimizer_state_dict,
         )
 
 
@@ -115,7 +149,15 @@ class LRSchedulerState(Stateful):
         self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
 
 
-def load_checkpoint(config, model, optimizer=None, lr_scheduler=None, global_step: int = 0):
+def load_checkpoint(
+    config,
+    model,
+    optimizer=None,
+    lr_scheduler=None,
+    global_step: int = 0,
+    load_dcp_model: bool = True,
+    ep_rank: int | None = None,
+):
     checkpoint_config = config.checkpoint
     assert global_step is not None, \
         f"fail to read training step from dir {checkpoint_config.load_ckpt_path}/latest_checkpointed_iteration.txt"
@@ -126,20 +168,21 @@ def load_checkpoint(config, model, optimizer=None, lr_scheduler=None, global_ste
     optimizer_dir = checkpoint_dir / "optimizer"
     lr_scheduler_dir = checkpoint_dir / "lr_scheduler"
 
-    if not model_dir.exists():
+    if load_dcp_model and not model_dir.exists():
         log(f"[FSDP] Model checkpoint {model_dir} not found; skipping load.", rank=0)
         return None
 
     log(f"loading checkpoint from {checkpoint_dir}", rank=0)
 
-    model_state = ModelState(model)
-    state_dict = {"model_state": model_state}
-    try:
-        dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir))
-    except Exception as e:
-        log(f"[FSDP] Failed to load model from {model_dir}: {e}")
-        traceback.print_exc()
-        raise e
+    if load_dcp_model:
+        model_state = ModelState(model)
+        state_dict = {"model_state": model_state}
+        try:
+            dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir))
+        except Exception as e:
+            log(f"[FSDP] Failed to load model from {model_dir}: {e}")
+            traceback.print_exc()
+            raise e
 
     if not checkpoint_config.no_load_optim:
         if not optimizer_dir.exists():
@@ -152,7 +195,7 @@ def load_checkpoint(config, model, optimizer=None, lr_scheduler=None, global_ste
         if optimizer is not None:
             _init_optim_state(optimizer)
             _fill_missing_optim_state(optimizer)
-            optimizer_state = OptimizerState(model, optimizer)
+            optimizer_state = OptimizerState(model, optimizer, ep_rank=ep_rank)
             optim_state_dict = {"optim_state": optimizer_state}
             try:
                 dcp.load(state_dict=optim_state_dict, checkpoint_id=str(optimizer_dir))
@@ -179,7 +222,15 @@ def load_checkpoint(config, model, optimizer=None, lr_scheduler=None, global_ste
     return global_step
 
 
-def save_checkpoint(config, model, optimizer=None, lr_scheduler=None, global_step: int = 0):
+def save_checkpoint(
+    config,
+    model,
+    optimizer=None,
+    lr_scheduler=None,
+    global_step: int = 0,
+    save_dcp_model: bool = True,
+    ep_rank: int | None = None,
+):
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     checkpoint_config = config.checkpoint
@@ -191,20 +242,22 @@ def save_checkpoint(config, model, optimizer=None, lr_scheduler=None, global_ste
     lr_scheduler_dir = checkpoint_dir / "lr_scheduler"
     if dist.get_rank() == 0:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        model_dir.mkdir(parents=True, exist_ok=True)
+        if save_dcp_model:
+            model_dir.mkdir(parents=True, exist_ok=True)
         optimizer_dir.mkdir(parents=True, exist_ok=True)
         lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
     cpu_barrier()
     log(f"saving checkpoint to {checkpoint_dir}", rank=0)
 
-    model_state = ModelState(model)
-    state_dict = {"model_state": model_state}
-    dcp.save(state_dict, checkpoint_id=str(model_dir))
+    if save_dcp_model:
+        model_state = ModelState(model)
+        state_dict = {"model_state": model_state}
+        dcp.save(state_dict, checkpoint_id=str(model_dir))
 
     if not checkpoint_config.no_save_optim:
         if optimizer is not None:
             _fill_missing_optim_state(optimizer)
-            optimizer_state = OptimizerState(model, optimizer)
+            optimizer_state = OptimizerState(model, optimizer, ep_rank=ep_rank)
             optim_state_dict = {"optim_state": optimizer_state}
             dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir))
 

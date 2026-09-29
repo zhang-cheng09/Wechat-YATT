@@ -46,6 +46,9 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         config: OnPolicyDistillConfig | OffPolicyDistillConfig,
         teacher_name: str | None,
         teacher_config,
+        dp_rank: int | None = None,
+        dp_size: int | None = None,
+        standalone_lifecycle: bool = False,
     ):
         self.config = config
         self.teacher_name = teacher_name
@@ -56,8 +59,9 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         self.timeout = policy_config.teacher_client.rpc_timeout
         self.rpc_type = policy_config.teacher_client.rpc_type
 
-        self.dp_rank = mpu.get_data_parallel_rank()
-        self.dp_size = mpu.get_data_parallel_world_size()
+        self.dp_rank = mpu.get_data_parallel_rank() if dp_rank is None else dp_rank
+        self.dp_size = mpu.get_data_parallel_world_size() if dp_size is None else dp_size
+        self.standalone_lifecycle = standalone_lifecycle
 
         ray_actor_pname = ("teacher" if teacher_name is None else f"teacher_{teacher_name}")
 
@@ -75,7 +79,14 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
             log(f"Teacher client [{ray_actor_pname}] {dp_size=} {mp_cp_size=}", rank=0)
 
             rpc_client = self.build_rpc_client(
-                self.rpc_type, None, None, dp_size, mp_cp_size, ray_actor_pname=ray_actor_pname
+                self.rpc_type,
+                None,
+                None,
+                dp_size,
+                mp_cp_size,
+                ray_actor_pname=ray_actor_pname,
+                dp_rank=self.dp_rank,
+                dp_size=self.dp_size,
             )
             svr_cluster = dp_size
         else:
@@ -84,12 +95,31 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         self.rpc_client = rpc_client
         self.svr_cluster = svr_cluster
 
-        self._check_rollout_gbs_covers_all_teacher_ep_ranks(dist_config, svr_cluster)
+        if not self.standalone_lifecycle:
+            self._check_rollout_gbs_covers_all_teacher_ep_ranks(dist_config, svr_cluster)
+
+    def _is_lifecycle_caller(self) -> bool:
+        """Whether this client instance owns teacher wake/sleep broadcasts."""
+        if self.standalone_lifecycle:
+            return True
+        return torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
 
     def _check_rollout_gbs_covers_all_teacher_ep_ranks(self, dist_config, server_dp_size):
         """Assert that rollout_gbs is large enough so every teacher EP group is
         either fully active or fully idle.  A partially-active EP group will
-        deadlock on the all_reduce inside get_max_seqlen_within_ep."""
+        deadlock on the all_reduce inside get_max_seqlen_within_ep.
+
+        Only applies to on-policy distillation, which is the only mode with a
+        ``ppo`` config section and a ``training.rollout_gbs``.
+        """
+        ppo_config = getattr(self.config, "ppo", None)
+        if ppo_config is None:
+            # Off-policy distillation has no rollout_gbs / EP-activation coupling.
+            return
+        if ppo_config.g_opd_compute_only_routed_teacher_logps:
+            # Routed modes use actual per-step, per-teacher counts and pad all
+            # endpoint queues to an equal forward count at runtime.
+            return
         ep_size = getattr(dist_config, 'expert_model_parallel_size', 1)
         if ep_size <= 1:
             return
@@ -143,7 +173,7 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
 
     @override
     async def mark_ppo_step_begin(self, teacher_idx, ppo_step):
-        if torch.distributed.get_rank() == 0:
+        if self._is_lifecycle_caller():
             req_dict = {
                 'ppo_step': ppo_step,
                 'actor_dp_rank': self.dp_rank,
@@ -152,7 +182,7 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
 
     @override
     async def mark_ppo_step_end(self, teacher_idx, ppo_step):
-        if torch.distributed.get_rank() == 0:
+        if self._is_lifecycle_caller():
             req_dict = {
                 'ppo_step': ppo_step,
                 'actor_dp_rank': self.dp_rank,
@@ -161,15 +191,21 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
 
     @override
     async def wake_up(self, teacher_idx, tag_names=None):
-        if torch.distributed.get_rank() == 0:
+        if self._is_lifecycle_caller():
             await self._batch_rpc_call(teacher_idx, 'wake_up', {})
 
     @override
     async def sleep(self, teacher_idx):
-        if torch.distributed.get_rank() == 0:
+        if self._is_lifecycle_caller():
             await self._batch_rpc_call(teacher_idx, 'sleep', {})
 
-    async def issue_calc_logps(self, batched_data: Dict[str, List[Any]], ppo_step, sample_idx):
+    async def issue_calc_logps(
+        self,
+        batched_data: Dict[str, List[Any]],
+        ppo_step,
+        sample_idx,
+        endpoint_idx: int = None,
+    ):
         """Submit a log-probability computation request to the teacher.
 
         Parameters
@@ -183,7 +219,9 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         dict
             Response with ``ret=True`` on success.
         """
-        target_ep = self.rpc_client.get_target_endpoint(sample_idx=sample_idx, ep_idx=None)
+        target_ep = self.rpc_client.get_target_endpoint(
+            sample_idx=sample_idx, ep_idx=endpoint_idx
+        )
         req_dict = {
             "actor_dp_rank": self.dp_rank,
             "sample_idx": sample_idx,
@@ -196,7 +234,9 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         assert resp["ret"] is True
         return resp
 
-    async def get_calc_logps_result(self, ppo_step, sample_idx) -> Dict[str, Any]:
+    async def get_calc_logps_result(
+        self, ppo_step, sample_idx, endpoint_idx: int = None
+    ) -> Dict[str, Any]:
         """Retrieve teacher log-probability results.
 
         Parameters
@@ -209,7 +249,9 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         dict[str, Any]
             Teacher log-prob results.
         """
-        target_ep = self.rpc_client.get_target_endpoint(sample_idx=sample_idx, ep_idx=None)
+        target_ep = self.rpc_client.get_target_endpoint(
+            sample_idx=sample_idx, ep_idx=endpoint_idx
+        )
         req_dict = {
             "actor_dp_rank": self.dp_rank,
             "sample_idx": sample_idx,
@@ -217,6 +259,40 @@ class TeacherClient(BaseClientAbc, TeacherClientMixin):
         }
         resp = await self.rpc_client.call(target_ep, "get_calc_logps_result", req_dict)
         return resp
+
+    async def stream_issue_calc_logps(
+        self,
+        batched_data: Dict[str, List[Any]],
+        request_id: str,
+        endpoint_idx: int,
+        is_padding: bool = False,
+    ):
+        """Queue one request for a controller-managed streaming teacher batch."""
+        target_ep = self.rpc_client.get_target_endpoint(sample_idx=0, ep_idx=endpoint_idx)
+        req_dict = {
+            "request_id": request_id,
+            "is_padding": is_padding,
+        }
+        req_dict.update(batched_data)
+        resp = await self.rpc_client.call(target_ep, "stream_issue_calc_logps", req_dict)
+        assert resp["ret"] is True
+        return resp
+
+    async def stream_compute_pending(self, endpoint_idx: int):
+        """Run one previously balanced streaming batch on an endpoint."""
+        target_ep = self.rpc_client.get_target_endpoint(sample_idx=0, ep_idx=endpoint_idx)
+        resp = await self.rpc_client.call(target_ep, "stream_compute_pending", {})
+        assert resp["ret"] is True
+        return resp
+
+    async def stream_get_calc_logps_result(self, request_id: str, endpoint_idx: int):
+        """Fetch and remove one streaming teacher result."""
+        target_ep = self.rpc_client.get_target_endpoint(sample_idx=0, ep_idx=endpoint_idx)
+        return await self.rpc_client.call(
+            target_ep,
+            "stream_get_calc_logps_result",
+            {"request_id": request_id},
+        )
 
     async def issue_calc_hidden_states(
         self, batched_data: Dict[str, List[Any]], ppo_step, sample_idx

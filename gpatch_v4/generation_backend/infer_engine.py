@@ -3,6 +3,7 @@
 
 import asyncio
 import copy
+import dataclasses
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import torch
 from packaging import version
 
 from gpatch_v4.configs.infer_engine_config import InferEngineConfig
+from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.core.device import preprocess_before_build_sgl_engine
 from gpatch_v4.orches.flashinfer_cudart_fix import patch_ctypes_for_cudart_stub
 from gpatch_v4.utils.common_utils import log
@@ -432,6 +434,7 @@ class InferEngine:
         enable_mtp: bool = False,
         seed: int = None,
         model_override_args: Optional[Dict] = None,
+        model_arch: Optional[str] = None,
         **extra_infer_engine_config
     ):
         """Factory method to create an InferEngine from engine arguments.
@@ -624,13 +627,25 @@ class InferEngine:
             if sgl_enable_spec_v2:
                 os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
 
+            if placement_type != "disaggregated" and not enforce_eager:
+                memory_saver_cuda_graph = os.environ.get("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+                assert (
+                    memory_saver_cuda_graph is None or
+                    memory_saver_cuda_graph.lower() in ("0", "false", "1", "true")
+                ), (
+                    "SGLANG_MEMORY_SAVER_CUDA_GRAPH must be a boolean value, got "
+                    f"{memory_saver_cuda_graph!r}"
+                )
+                if memory_saver_cuda_graph is None:
+                    os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
+
             preprocess_before_build_sgl_engine()
 
             import sglang as sgl
 
             assert version.parse(sgl.__version__
                                 ) >= version.parse('0.5.3'), f"{sgl.__version__=} must be >= 0.5.3"
-            assert enable_weights_cpu_backup, "enable_weights_cpu_backup must be True in sglang"
+            # assert enable_weights_cpu_backup, "enable_weights_cpu_backup must be True in sglang"
             if sgl.__version__ in ['0.5.4.post3', '0.5.7']:
                 patch_import_processors()
 
@@ -681,7 +696,12 @@ class InferEngine:
                 ), "enable_return_routed_experts is only supported by 0.5.7 and later version"
                 extra_args["enable_return_routed_experts"] = True
                 # router is not captured for trt-llm backend
-                extra_args["moe_runner_backend"] = "cutlass"
+                if version.parse(sgl.__version__) >= version.parse('0.5.19') and model_arch == MODEL_ARCH.DEEPSEEK_V4:
+                    # cutlass backend has some impl errors for dsv4, use deep_gemm + deepep instead
+                    extra_args["moe_runner_backend"] = "deep_gemm"
+                    extra_args["moe_a2a_backend"] = "deepep"
+                else:
+                    extra_args["moe_runner_backend"] = "cutlass"
 
             nnodes = int(math.ceil(tensor_parallel_size / num_gpus_per_node))
             node_rank = tp_rank // num_gpus_per_node
@@ -696,7 +716,6 @@ class InferEngine:
                 assert version.parse(sgl.__version__) >= version.parse(
                     '0.5.4'
                 ), f"mlp weights update is not supported before sglang 0.5.4, now is {sgl.__version__}"
-                # mtp is suitable for EAGLE
                 # TODO(hessianliu): pass spec config in
                 extra_args.update(
                     {
@@ -720,6 +739,18 @@ class InferEngine:
                     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
                 else:
                     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+
+            # 新 SGLang 默认 prefill CUDA graph backend=breakable，和
+            # enable_memory_saver=True 不兼容；关掉 prefill graph，decode graph 保留。
+            if dataclasses.is_dataclass(sgl.ServerArgs):
+                server_arg_names = {f.name for f in dataclasses.fields(sgl.ServerArgs)}
+            else:
+                server_arg_names = set(sgl.ServerArgs.__annotations__)
+
+            if "disable_prefill_cuda_graph" in server_arg_names:
+                extra_args["disable_prefill_cuda_graph"] = extra_args.get(
+                    "disable_prefill_cuda_graph", True
+                )
 
             sgl_server_args = dict(
                 model_path=model_path,
@@ -748,6 +779,12 @@ class InferEngine:
             )
             if model_override_args:
                 sgl_server_args["json_model_override_args"] = json.dumps(model_override_args)
+            if model_arch == MODEL_ARCH.QWEN4_EXP and "custom_weight_loader" in server_arg_names:
+                from gpatch_v4.generation_backend.sglang_model_specific.sglang_weight_update_qwen4_exp import (  # noqa: E501
+                    install_packed_weight_loader,
+                )
+
+                install_packed_weight_loader(sgl_server_args)
             server_args = sgl.ServerArgs(**sgl_server_args)
             if engine_idx == 0:
                 log(

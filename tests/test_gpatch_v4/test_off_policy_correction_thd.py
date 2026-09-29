@@ -18,6 +18,8 @@ def _make_config(level: str, veto_threshold=None):
             off_policy_correction_upper_bound=10.0,
             off_policy_correction_lower_bound=None,
             off_policy_correction_veto_threshold=veto_threshold,
+            off_policy_correction_rs=None,
+            off_policy_correction_rs_threshold=None,
         )
     )
 

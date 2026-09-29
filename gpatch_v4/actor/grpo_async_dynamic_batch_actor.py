@@ -14,6 +14,8 @@ from gpatch_v4.core.dynamic_batch_advantage import (
     register_custom_dynamic_advantage,
 )
 from gpatch_v4.core.parallel_state import cpu_barrier, is_last_rank, is_mp_and_cp_head
+from gpatch_v4.transfer.tq_connector import KVBatchMeta
+from gpatch_v4.transfer.transfer_queue_interface import TQInterface
 from gpatch_v4.utils import (
     BroadcastUtils,
     TimerSingleton,
@@ -21,12 +23,14 @@ from gpatch_v4.utils import (
     clear_memory,
     extend_value_to_dict,
     logging_rank0,
+    record_engine_lrs,
     record_time_to_metrics,
     reduce_metrics,
     save_data,
     sync_cuda_and_get_time,
 )
 from gpatch_v4.utils.common_utils import compress_ppo_save_train_data
+from gpatch_v4.utils.training_utils import expand_rollout_batch
 
 from .grpo_async_train_actor import GrpoAsyncTrainActor
 from .mixin import OnloadManager
@@ -41,7 +45,7 @@ class DynBatchGrpoAsyncTrainActor(GrpoAsyncTrainActor):
     def validated_config(self):
         super().validated_config()
         assert self.config.training.dynamic_batch_train
-        assert not self.config.ppo.use_legacy_loss
+        assert not self.config.training.use_legacy_loss
         # TODO(@yeazhao): Remove this guard after the dynamic-batch PPO path is covered by tests.
         assert self.config.ppo.advantage_type != "ppo", (
             "dynamic-batch PPO is not supported because this path has not been tested"
@@ -117,9 +121,20 @@ class DynBatchGrpoAsyncTrainActor(GrpoAsyncTrainActor):
 
         timers = TimerSingleton.get_timer()
         dp_rank = mpu.get_data_parallel_rank()
-        samples_by_train_step = (
-            ray.get(dp_refs[dp_rank].inner_data) if is_mp_and_cp_head() else None
-        )
+        if is_mp_and_cp_head():
+            if self.config.tq.enable:
+                #TODO（xiaotaoliu）: 暂时先不让非 head 节点也来读，避免打爆热点节点的带宽。
+                # 后面再看看是否直接每个 rnak 直接 get
+                metas = dp_refs[dp_rank]
+                assert isinstance(metas, tuple)
+                assert all(isinstance(meta, KVBatchMeta) for meta in metas)
+                samples_by_train_step = [
+                    expand_rollout_batch(rb) for rb in TQInterface.restore_kv_batches(metas)
+                ]
+            else:
+                samples_by_train_step = ray.get(dp_refs[dp_rank].inner_data)
+        else:
+            samples_by_train_step = None
         samples_by_train_step = BroadcastUtils.broadcast_rollout_batch(samples_by_train_step)
         assert isinstance(samples_by_train_step, list) and samples_by_train_step
         assert all(
@@ -203,7 +218,7 @@ class DynBatchGrpoAsyncTrainActor(GrpoAsyncTrainActor):
                 for _ in range(training_config.ppo_max_epochs_2):
                     value_metrics = self.critic_engine.rl_train_value(iter(samples_by_train_step))
                     extend_value_to_dict(metrics, value_metrics)
-                metrics["value/lr"] = self.critic_engine.step_and_get_lr()
+                record_engine_lrs(metrics, self.critic_engine, "value")
             cpu_barrier()
             self.policy_engine.onload_model()
 
@@ -231,7 +246,7 @@ class DynBatchGrpoAsyncTrainActor(GrpoAsyncTrainActor):
                 self.compact_thread, training_config.ppo_dump_metrics_dir
             )
 
-        metrics["policy/lr"] = self.policy_engine.step_and_get_lr()
+        record_engine_lrs(metrics, self.policy_engine, "policy")
         end_time = sync_cuda_and_get_time()
         metrics["time_perf/total_time"] = end_time - begin_time
         output_metrics = reduce_metrics(metrics)

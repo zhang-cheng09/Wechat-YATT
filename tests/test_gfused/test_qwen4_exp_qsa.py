@@ -9,6 +9,7 @@ import math
 import pytest
 import torch
 
+import gpatch_v4.models.qwen4_exp.qsa as qsa_module
 from gpatch_v4.models.qwen4_exp import Qwen4ExpTextConfig
 from gpatch_v4.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpTextQSAIndexer,
@@ -17,6 +18,7 @@ from gpatch_v4.models.qwen4_exp.modeling_qwen4_exp import (
 from gpatch_v4.models.qwen4_exp.qsa import (
     Qwen4ExpQSAAttention,
     Qwen4ExpQSAIndexer,
+    _membership_flat_offset,
     dense_sparse_gqa_attention,
     flex_sparse_gqa_attention,
     select_qsa_membership,
@@ -122,7 +124,10 @@ def _selected_blocks(membership_row, num_blocks, ratio):
     "seed, batch_size, q_len, seq_lens",
     [(0, 2, 37, None), (1, 3, 29, [29, 21, 9])],
 )
-def test_vectorized_selection_agrees_with_upstream_loop(seed, batch_size, q_len, seq_lens) -> None:
+@pytest.mark.parametrize("score_query_chunk_size", [None, 7])
+def test_vectorized_selection_agrees_with_upstream_loop(
+    seed, batch_size, q_len, seq_lens, score_query_chunk_size
+) -> None:
     """核心 parity。
 
     分数是 ``relu(q·k).sum(heads)``，所有 index head 的点积都为负时分数**恰好为 0**，
@@ -136,7 +141,9 @@ def test_vectorized_selection_agrees_with_upstream_loop(seed, batch_size, q_len,
     block_topk = config.indexer_budget // ratio
 
     upstream = Qwen4ExpTextQSAIndexer(config, layer_idx=3).eval()
-    ours = Qwen4ExpQSAIndexer(config, layer_idx=3).eval()
+    ours = Qwen4ExpQSAIndexer(
+        config, layer_idx=3, score_query_chunk_size=score_query_chunk_size
+    ).eval()
     ours.load_state_dict(upstream.state_dict())
 
     hidden_states = torch.randn(batch_size, q_len, config.hidden_size)
@@ -188,7 +195,15 @@ def test_vectorized_selection_agrees_with_upstream_loop(seed, batch_size, q_len,
     assert tied_rows > 0
 
 
-def _membership_for(q_len: int, budget: int, ratio: int, n_heads: int = 4, head_dim: int = 16):
+def _membership_for(
+    q_len: int,
+    budget: int,
+    ratio: int,
+    n_heads: int = 4,
+    head_dim: int = 16,
+    score_query_chunk_size: int | None = None,
+    compile_score: bool = False,
+):
     torch.manual_seed(7)
     k_layernorm = torch.nn.Identity()
     index_q = torch.randn(1, q_len, n_heads, head_dim)
@@ -196,7 +211,16 @@ def _membership_for(q_len: int, budget: int, ratio: int, n_heads: int = 4, head_
     cos, sin = _rope_cos_sin(q_len, head_dim)
     visible = _causal_bool_mask(1, q_len).squeeze(1)
     return select_qsa_membership(
-        index_q, raw_k, visible, cos, sin, k_layernorm, ratio, budget // ratio
+        index_q,
+        raw_k,
+        visible,
+        cos,
+        sin,
+        k_layernorm,
+        ratio,
+        budget // ratio,
+        score_query_chunk_size,
+        compile_score,
     ), visible
 
 
@@ -216,6 +240,96 @@ def test_first_sparse_row_is_2051_for_released_budget() -> None:
 def test_below_budget_selection_equals_plain_causal_mask() -> None:
     membership, visible = _membership_for(q_len=16, budget=2048, ratio=4)
     torch.testing.assert_close(membership, visible, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("q_len", [16, 64, 65])
+@pytest.mark.parametrize("chunk_size", [1, 7, 128])
+def test_score_query_chunking_matches_unchunked(q_len: int, chunk_size: int) -> None:
+    chunked, _ = _membership_for(
+        q_len=q_len,
+        budget=16,
+        ratio=4,
+        score_query_chunk_size=chunk_size,
+    )
+    unchunked, _ = _membership_for(
+        q_len=q_len,
+        budget=16,
+        ratio=4,
+        score_query_chunk_size=None,
+    )
+    torch.testing.assert_close(chunked, unchunked, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 128])
+def test_membership_preserves_inputs_and_handles_rectangular_mask(chunk_size: int | None) -> None:
+    torch.manual_seed(19)
+    index_q = torch.randn(2, 9, 4, 16, requires_grad=True)
+    raw_k = torch.randn(2, 37, 16, requires_grad=True)
+    cos, sin = _rope_cos_sin(37, 16)
+    cos, sin = cos.expand(2, -1, -1), sin.expand(2, -1, -1)
+    prefix_len = torch.tensor([[0, 1, 3, 4, 16, 17, 20, 36, 37], [0, 0, 1, 2, 4, 5, 8, 9, 12]])
+    key_ids = torch.arange(37)
+    visible = key_ids < prefix_len.unsqueeze(-1)
+    inputs = (index_q, raw_k, visible, cos, sin)
+    originals = tuple(tensor.detach().clone() for tensor in inputs)
+
+    membership = select_qsa_membership(
+        *inputs, torch.nn.Identity(), 4, 4, score_query_chunk_size=chunk_size
+    )
+
+    for tensor, original in zip(inputs, originals):
+        torch.testing.assert_close(tensor, original, rtol=0, atol=0)
+    assert not membership.requires_grad
+    assert not (membership & ~visible).any()
+    expected_counts = (prefix_len // 4).clamp(max=4) * 4 + prefix_len % 4
+    torch.testing.assert_close(membership.sum(-1), expected_counts, rtol=0, atol=0)
+    tail = (key_ids >= (prefix_len // 4 * 4).unsqueeze(-1)) & visible
+    assert membership[tail].all()
+    membership.zero_()
+    torch.testing.assert_close(visible, originals[2], rtol=0, atol=0)
+
+
+def test_score_query_chunk_limits_einsum_rows(monkeypatch) -> None:
+    query_lengths = []
+    original_einsum = torch.einsum
+
+    def record_einsum(equation, *operands):
+        if equation == "bqhd,bnd->bqhn":
+            query_lengths.append(operands[0].shape[1])
+        return original_einsum(equation, *operands)
+
+    monkeypatch.setattr(torch, "einsum", record_einsum)
+    _membership_for(
+        q_len=65,
+        budget=16,
+        ratio=4,
+        score_query_chunk_size=7,
+    )
+
+    assert len(query_lengths) > 1
+    assert max(query_lengths) <= 7
+
+
+def test_score_query_chunk_size_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="score_query_chunk_size must be positive"):
+        _membership_for(
+            q_len=16,
+            budget=8,
+            ratio=4,
+            score_query_chunk_size=0,
+        )
+
+
+def test_attention_configures_score_selection() -> None:
+    attention = Qwen4ExpQSAAttention(
+        _config(),
+        layer_idx=3,
+        attn_backend="dense",
+        score_query_chunk_size=7,
+        compile_score=True,
+    )
+    assert attention.indexer.score_query_chunk_size == 7
+    assert attention.indexer.compile_score is True
 
 
 def test_sparse_membership_respects_budget_tail_and_causality() -> None:
@@ -325,7 +439,62 @@ def test_attention_rejects_kv_cache() -> None:
         )
 
 
+@pytest.mark.parametrize("batch_idx, query_idx, kv_idx, query_length, kv_length", [
+    (0, 65535, 65535, 65536, 65536),
+    (1, 0, 0, 65536, 32768),
+])
+def test_membership_offset_past_int32(
+    batch_idx: int, query_idx: int, kv_idx: int, query_length: int, kv_length: int,
+) -> None:
+    offset = _membership_flat_offset(
+        torch.tensor(batch_idx, dtype=torch.int32),
+        torch.tensor(query_idx, dtype=torch.int32),
+        torch.tensor(kv_idx, dtype=torch.int32),
+        query_length,
+        kv_length,
+    )
+    assert offset.dtype == torch.int64
+    assert offset.item() == (batch_idx * query_length + query_idx) * kv_length + kv_idx
+    assert offset.item() > torch.iinfo(torch.int32).max
+
+
+def test_membership_offset_matches_direct_indexing() -> None:
+    membership = torch.arange(70).reshape(2, 5, 7)
+    batch_idx, query_idx, kv_idx = torch.meshgrid(
+        torch.arange(2), torch.arange(5), torch.arange(7), indexing="ij"
+    )
+    offsets = _membership_flat_offset(batch_idx, query_idx, kv_idx, 5, 7)
+    torch.testing.assert_close(membership.reshape(-1)[offsets], membership)
+
+
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
+
+
+@requires_cuda
+def test_compiled_score_chunk_matches_eager_on_cuda() -> None:
+    torch.manual_seed(11)
+    query_states = torch.rand(1, 7, 4, 16, device="cuda")
+    pooled_keys = torch.rand(1, 17, 16, device="cuda")
+    visible_blocks = torch.full((1, 7), 17, device="cuda", dtype=torch.int64)
+    block_ids = torch.arange(17, device="cuda")
+
+    expected = qsa_module._select_qsa_blocks_chunk(
+        query_states,
+        pooled_keys,
+        visible_blocks,
+        block_ids,
+        4,
+        0.25,
+    )
+    got = qsa_module._compiled_select_qsa_blocks_chunk()(
+        query_states,
+        pooled_keys,
+        visible_blocks,
+        block_ids,
+        4,
+        0.25,
+    )
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
 @requires_cuda

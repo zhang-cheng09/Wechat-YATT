@@ -10,8 +10,11 @@ import torch.distributed as dist
 
 try:
     from deep_ep import Buffer
-    from deep_ep.utils import EventHandle, EventOverlap
-
+    from deep_ep.utils import EventHandle
+    try:
+        from deep_ep.utils import EventOverlap
+    except ImportError:
+        from deep_ep.utils.event import EventOverlap
     HAVE_DEEP_EP = True
 except ImportError:
     Buffer = None

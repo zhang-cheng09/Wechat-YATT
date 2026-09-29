@@ -1,7 +1,15 @@
 # V4 自定义 Policy Loss
 
-本文档描述 **Megatron / mcore** 路径下自定义 policy loss 的注册方式与输入输出约定。
-按 `ppo.use_legacy_loss` 分为两套接口，**请勿混用**。
+本文档描述 **mcore 与 FSDP2 RL** 路径下自定义 policy loss 的注册方式与输入输出约定。
+按 `training.use_legacy_loss` 分为两套接口，**请勿混用**。
+
+推荐使用 `training.use_legacy_loss`（默认 `true`）。旧字段 `ppo.use_legacy_loss`
+显式设置时优先覆盖 training；设为 `false` 会切换：
+
+- MCore：policy、finetune、value 到 `training_backend.loss`
+- FSDP2 RL：policy 到同一套新实现（`ppo_loss` 同时挂在 `mcore` 和 `fsdp2` registry）
+
+FSDP2 SFT 本来就走 `fsdp2` registry，不受此开关影响。
 
 ## `use_legacy_loss=True`（legacy，后续计划弃用）
 
@@ -20,22 +28,25 @@
 在配置中给 loss 指定一个未注册的名字，并提供 Python 文件的绝对路径和函数名：
 
 ```yaml
-ppo:
+training:
   use_legacy_loss: false
+
+ppo:
   loss_func: my_loss
   loss_func_py_path: /abs/path/to/my_loss.py
   loss_func_py_name: my_loss_fn
 ```
 
-`GrpoTrainActor` 初始化时按下面的顺序处理：
+`GrpoTrainActor` 在 `training_backend` 为 `mcore` 或 `fsdp2` 时按下面的顺序处理：
 
-1. 查询 `("mcore", ppo.loss_func)` 是否已经注册。
+1. 查询 `(training_backend, ppo.loss_func)` 是否已经注册。内置 GRPO/GSPO 等
+  同时挂在 `mcore` 和 `fsdp2` 上。
 2. 已注册时直接使用注册表中的函数，忽略 `loss_func_py_path` 和
   `loss_func_py_name`。
-3. 未注册时从 `loss_func_py_path` 导入 `loss_func_py_name`，再以
-  `backend="mcore"`、`loss_name=ppo.loss_func` 注册。
+3. 未注册时从 `loss_func_py_path` 导入 `loss_func_py_name`，再以当前
+  `training_backend`、`loss_name=ppo.loss_func` 注册。
 
-因此，自定义名字不要与当前 MCore 内置 loss 重名。通过配置加载的自定义
+因此，自定义名字不要与当前内置 policy loss 重名。通过配置加载的自定义
 Python 文件只需导出普通函数，**不要再给该函数添加** `@register_loss` **装饰器**，
 否则导入模块时会提前注册，随后自动注册将因重名失败。
 
@@ -45,7 +56,7 @@ Python 文件只需导出普通函数，**不要再给该函数添加** `@regist
 from gpatch_v4.training_backend.loss import register_custom_loss_fn
 
 register_custom_loss_fn(
-    backend="mcore",
+    backend="mcore",  # FSDP2 用 "fsdp2"
     loss_name="my_loss",
     py_path="/abs/path/to/my_loss.py",
     fn_name="my_loss_fn",
@@ -57,7 +68,7 @@ register_custom_loss_fn(
 ```python
 from gpatch_v4.training_backend.loss import register_loss
 
-@register_loss(backends=("mcore",), loss_name="my_loss")
+@register_loss(backends=("mcore", "fsdp2"), loss_name="my_loss")
 def my_loss_fn(config, loss_input):
     ...
 ```
@@ -91,13 +102,13 @@ def my_loss_fn(
 
 ### 输入：`PolicyLossInput`
 
-进入新版 loss 前，MCore engine 会将当前策略输出和 rollout 数据整理为以
+进入新版 loss 前，mcore / FSDP2 engine 会将当前策略输出和 rollout 数据整理为以
 response 为单位的 padded tensor。静态 CP 的结果已 all-gather；dyn-CP/THD
 数据也会先重建并转换成 `[B, S]`，因此自定义 loss 不处理 CP shard 或 THD
 pack。
 
 
-| 字段                                               | 类型              | 当前 MCore policy 路径中的含义                                                                             |
+| 字段                                               | 类型              | 当前 mcore / FSDP2 policy 路径中的含义                                                                      |
 | ------------------------------------------------ | --------------- | -------------------------------------------------------------------------------------------------- |
 | `advantages`                                     | `Tensor`        | 优势，通常为 `[B, S]`。自定义 top-k 算法可以使用额外维度，但传给 `agg` 前必须归约成 `[B, S]`                                     |
 | `prev_log_probs`                                 | `Tensor | None` | 旧策略 logprob `[B, S]`；`ppo.skip_prev_logps=True` 时可能为 `None`                                        |
@@ -136,7 +147,7 @@ bwd_loss, bwd_count, metrics
 - `bwd_loss`：需要反向传播的 0-D `Tensor`，必须是**未做 GBS 或全局
 token/sample 归一化的局部 sum**。
 - `bwd_count`：0-D `Tensor`，表示与 `bwd_loss` 对应的局部 token 数或有效
-sample 数。当前 MCore caller 会解包该字段，但梯度归一化使用 engine
+sample 数。当前 mcore / FSDP2 caller 会解包该字段，但梯度归一化使用 engine
 自己维护的 token count / alive GBS；不要依赖 caller 用
 `bwd_count` 缩放 `bwd_loss`。
 - `metrics`：`dict`。参与日志聚合的 tensor 应 `detach()`，避免保留计算图。
@@ -256,12 +267,12 @@ def my_loss_fn(
 `(bwd_loss, bwd_count, metrics)`。
 - 新版 loss 只接收 response-padded `[B, S]` 数据；dyn-CP/THD 的重建由
 engine 在调用 loss 前完成。
-- 新路径当前没有注册 legacy 中的 `opd`、`fipo` 实现；需要这些算法时应继续
-使用 legacy，或按本文接口自行实现。
-- 新路径的内置 GRPO 支持 `ppo.ppo_entropy_regularization_type`；
-以 GRPO 为基底的 STEER 也会应用相同的 entropy regularization，GSPO 暂不支持。
+- 新路径已注册 `opd`（2D 与 `log_prob_top_k > 0` 的 3D top-K）。`fipo` 仍未注册；
+需要 FIPO 时应继续使用 legacy，或按本文接口自行实现。
+- 新路径的内置 GRPO / 2D OPD 支持 `ppo.ppo_entropy_regularization_type`；
+以 GRPO 为基底的 STEER 也会应用相同的 entropy regularization。GSPO 暂不支持；
+`opd` + top-K 与 entropy regularization 不兼容，config 会直接报错。
 新路径实现在 `gpatch_v4/training_backend/loss/ppo_loss.py`，legacy 路径保留
 `loss_factory.py` 中原有实现。
 - 当前自定义 policy loss 注册仅覆盖 MCore actor 训练路径；FSDP2 RL 仍走
 legacy `loss_factory.py`。
-

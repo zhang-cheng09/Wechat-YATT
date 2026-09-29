@@ -19,6 +19,8 @@ from torch import distributed as dist
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from gpatch_v4.core.dynamic_cp import DynamicCPState, bind_dynamic_cp_model
+
 from .checkpoint import _load_checkpoint_hp, _save_checkpoint_hp
 from .fp8_tensor import _FP8_BLOCK_SIZE, Fp8TensorAg, _new_hook_stats
 
@@ -31,6 +33,7 @@ except ImportError:
 
 __all__ = [
     "apply_hp",
+    "bind_dynamic_cp",
 ]
 
 # ---------------------------------------------------------------------------
@@ -366,6 +369,10 @@ def apply_hp(
             fully_shard(sub, mp_policy=fp32_keep_mp_policy)
             sub.set_gradient_divide_factor(grad_divide_factor)
 
+    fully_shard(model.model.embed_tokens, mp_policy=mp_policy)
+    model.model.embed_tokens.set_gradient_divide_factor(grad_divide_factor)
+    fully_shard(model.lm_head, mp_policy=mp_policy)
+    model.lm_head.set_gradient_divide_factor(grad_divide_factor)
     fully_shard(model, mp_policy=mp_policy)
     model.set_gradient_divide_factor(grad_divide_factor)
 
@@ -413,25 +420,53 @@ def _bind_cp(
     cp_size = cp_mesh.size()
     cp_rank = cp_mesh.get_local_rank()
 
-    # Outer wrapper attrs (for the test code & general introspection).
+    _set_cp_group(model, cp_group, cp_size, cp_rank)
+    model._cp_mesh = cp_mesh
+
+
+def _set_cp_group(
+    model: nn.Module,
+    cp_group: Optional[dist.ProcessGroup],
+    cp_size: int,
+    cp_rank: int,
+) -> None:
     model._cp_group = cp_group
     model._cp_size = cp_size
     model._cp_rank = cp_rank
-    model._cp_mesh = cp_mesh
-
-    # Inner DeepseekV4Model needs these for ``forward`` to know to slice
-    # input_ids / position_ids and pass causal_mask=None down to attention.
     inner = model.model
     inner.cp_group = cp_group
     inner.cp_size = cp_size
     inner.cp_rank = cp_rank
 
-    # Every attention block: CP comm primitives read these.
     layers = _get_layers(model)
     for layer in layers:
         layer.self_attn.cp_group = cp_group
         layer.self_attn.cp_size = cp_size
         layer.self_attn.cp_rank = cp_rank
+
+
+def bind_dynamic_cp(
+    model: nn.Module,
+    cp_group: dist.ProcessGroup,
+):
+    return bind_dynamic_cp_model(
+        model,
+        cp_group,
+        _get_dynamic_cp_state,
+        _set_dynamic_cp_state,
+    )
+
+
+def _get_dynamic_cp_state(model: nn.Module) -> DynamicCPState:
+    return DynamicCPState(
+        getattr(model, "_cp_group", None),
+        getattr(model, "_cp_size", 1),
+        getattr(model, "_cp_rank", 0),
+    )
+
+
+def _set_dynamic_cp_state(model: nn.Module, state: DynamicCPState) -> None:
+    _set_cp_group(model, state.group, state.size, state.rank)
 
 
 # ---------------------------------------------------------------------------

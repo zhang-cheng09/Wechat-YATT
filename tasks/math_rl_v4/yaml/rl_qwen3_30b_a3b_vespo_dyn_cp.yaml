@@ -90,7 +90,7 @@ policy:
     recompute_method: uniform
     recompute_num_layers: 1
     calculate_per_token_loss: true
-    linear_cp_comm_type: fla
+    linear_cp_mode: headwise
 
 sampler:
   backend: sglang

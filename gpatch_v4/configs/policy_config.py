@@ -26,10 +26,25 @@ class BasePolicyConfig(MappingProtocol):
         For DeepSeek-V4 HpModule this is passed to ``apply_hp(..., attn_backend=)``.
     indexer_backend : str
         DeepSeek-V4 indexer backend: ``"eager"`` / ``"fused"``.
+    qsa_score_query_chunk_size : int or None
+        Qwen4-Exp QSA query rows scored together. ``None`` uses the full query length.
+    qsa_compile_score : bool
+        Compile Qwen4-Exp QSA score selection.
     ep_backend : str
         Training-side MoE expert dispatch backend: ``"eager"`` / ``"deepep"``.
+    fsdp_linear_cp_mode : str
+        Qwen3.5 GDN context-parallel path for FSDP2: ``"headwise"`` /
+        ``"chunkwise"``. Counterpart of Megatron
+        ``TransformerConfig.linear_cp_mode``. Only consumed by the FSDP2
+        HpModule builder.
     deepep_num_sms : int
         Number of SMs assigned to DeepEP kernels.
+    deepep_async_finish : bool
+        Whether DeepEP dispatch/combine uses asynchronous communication completion.
+    ep_weight_before_combine : bool
+        Eager EP routing-weight placement; ``False`` preserves the original
+        combine-then-weight path. DeepEP always applies weights before its
+        fused combine.
     fp8_qat : bool
         Enable FP8 activation/weight fake-quant (QAT) via ``apply_hp``.
     fp4_qat : bool
@@ -108,11 +123,36 @@ class BasePolicyConfig(MappingProtocol):
     indexer_backend: str = field(
         default="eager", metadata={"help": "DSV4 indexer backend: eager, fused"}
     )
+    qsa_score_query_chunk_size: Optional[int] = field(
+        default=None,
+        metadata={"help": "Qwen4-Exp QSA score query chunk size; None uses full query length"},
+    )
+    qsa_compile_score: bool = field(
+        default=False,
+        metadata={"help": "Compile Qwen4-Exp QSA score selection"},
+    )
     ep_backend: str = field(
         default="eager", metadata={"help": "Training MoE EP backend: eager, deepep"}
     )
+    fsdp_linear_cp_mode: str = field(
+        default="headwise",
+        metadata={"help": "Qwen3.5 GDN CP path for FSDP2: headwise, chunkwise"},
+    )
     deepep_num_sms: int = field(
         default=24, metadata={"help": "Number of SMs used by DeepEP kernels"}
+    )
+    deepep_async_finish: bool = field(
+        default=False,
+        metadata={"help": "Use asynchronous DeepEP dispatch/combine completion"},
+    )
+    ep_weight_before_combine: bool = field(
+        default=False,
+        metadata={
+            "help":
+                (
+                    "Apply eager EP routing weights before reverse all-to-all instead of after combine"
+                )
+        },
     )
     fp8_qat: bool = field(
         default=False, metadata={"help": "Enable FP8 activation/weight fake-quant (QAT)"}

@@ -262,6 +262,327 @@ class CpMappingsWorker:
         max_diff = (cp_entropy - gt_entropy).abs().max().item()
         return [max_diff]
 
+    # ------------------------------------------------------------------
+    # Test 5: gather → unpack → GSPO → reduce-scatter AVG
+    # ------------------------------------------------------------------
+
+    def test_gather_unpack_gspo_backward(self) -> List[float]:
+        """CP all-gather → unpack ``[B, R]`` → GSPO 的 local grad 应等于 full packed grad 的 chunk。"""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from gpatch_v4.configs.debug_config import DebugConfig
+        from gpatch_v4.configs.ppo_config import PpoConfig
+        from gpatch_v4.core.mappings import all_gather_from_context_parallel_region_no_zigzag
+        from gpatch_v4.training_backend.fsdp2_backend.fsdp2_engine_lm import Fsdp2EngineLm
+        from gpatch_v4.training_backend.fsdp2_backend.mixin import (
+            response_pad_fsdp2_thd_loss_tensors,
+        )
+
+        cu_padded = torch.tensor([0, 4, 8], device=self.device, dtype=torch.int32)
+        response_starts = torch.tensor([1, 0], device=self.device, dtype=torch.int32)
+        response_lengths = torch.tensor([2, 2], device=self.device, dtype=torch.int32)
+        prev = torch.tensor(
+            [[-1.0, -2.0, -3.0, 0.0, -4.0, -5.0, 0.0, 0.0]],
+            device=self.device,
+        )
+        mask = torch.tensor(
+            [[0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]],
+            device=self.device,
+        )
+        advantages = torch.tensor(
+            [[0.1, 0.2, 0.3, 0.0, 0.4, 0.5, 0.0, 0.0]],
+            device=self.device,
+        )
+        ref = torch.tensor(
+            [[-1.1, -2.1, -3.1, 0.0, -4.1, -5.1, 0.0, 0.0]],
+            device=self.device,
+        )
+        rollout = torch.tensor(
+            [[-1.2, -2.2, -3.2, 0.0, -4.2, -5.2, 0.0, 0.0]],
+            device=self.device,
+        )
+        packed_values = prev + 0.05
+        config = SimpleNamespace(
+            ppo=PpoConfig(
+                loss_func="gspo",
+                ppo_entropy_bonus=0.0,
+                grpo_kl_loss_beta=0.0,
+                enable_off_policy_correction=False,
+                ppo_ratio_eps=0.2,
+            ),
+            debug=DebugConfig(),
+        )
+        _reduce_factory = (
+            "gpatch_v4.training_backend.loss_factory.reduce_metrics_across_data_parallel_group"
+        )
+        _reduce_new = (
+            "gpatch_v4.training_backend.loss.ppo_loss.reduce_metrics_across_data_parallel_group"
+        )
+
+        def _gspo_on_packed(curr: torch.Tensor, use_legacy: bool) -> torch.Tensor:
+            padded = response_pad_fsdp2_thd_loss_tensors(
+                {
+                    "curr_log_probs": curr,
+                    "per_token_entropy": torch.zeros_like(curr),
+                    "mask": mask,
+                    "advantages": advantages,
+                    "prev_log_probs": prev,
+                    "ref_log_probs": ref,
+                    "rollout_log_probs": rollout,
+                },
+                cu_padded,
+                response_starts,
+                response_lengths,
+            )
+            loss_fn, _ = Fsdp2EngineLm._resolve_fsdp2_policy_loss(
+                SimpleNamespace(
+                    training_config=SimpleNamespace(use_legacy_loss=use_legacy),
+                    ppo_config=SimpleNamespace(loss_func="gspo"),
+                )
+            )
+            loss_input_cls = Fsdp2EngineLm._fsdp2_policy_loss_input_cls(use_legacy)
+            with patch(_reduce_factory), patch(_reduce_new):
+                loss, _, _ = Fsdp2EngineLm._call_fsdp2_policy_loss(
+                    loss_fn,
+                    config,
+                    loss_input_cls(
+                        advantages=padded["advantages"],
+                        prev_log_probs=padded["prev_log_probs"],
+                        ref_log_probs=padded["ref_log_probs"],
+                        curr_log_probs=padded["curr_log_probs"],
+                        response_mask=padded["mask"],
+                        scaled_entropy=torch.tensor(0.0, device=self.device),
+                        rollout_log_probs=padded["rollout_log_probs"],
+                        per_token_entropy=padded["per_token_entropy"],
+                        cu_seqlens_padded=None,
+                        local_cp_size=1,
+                    ),
+                    use_legacy,
+                )
+            return loss
+
+        results = []
+        for use_legacy in (True, False):
+            full_curr = packed_values.clone().requires_grad_(True)
+            with torch.enable_grad():
+                full_loss = _gspo_on_packed(full_curr, use_legacy)
+                full_loss.backward()
+            expected_local_grad = self._cp_chunk_non_zigzag(full_curr.grad)
+
+            local = self._cp_chunk_non_zigzag(packed_values).clone().requires_grad_(True)
+            with torch.enable_grad():
+                gathered = all_gather_from_context_parallel_region_no_zigzag(local, gather_dim=1)
+                cp_loss = _gspo_on_packed(gathered, use_legacy)
+                cp_loss.backward()
+            torch.cuda.synchronize()
+
+            max_diff = (local.grad - expected_local_grad).abs().max().item()
+            grad_abs_sum = local.grad.abs().sum().item()
+            label = "legacy" if use_legacy else "new"
+            print(
+                f"[CP gather+unpack+GSPO {label}] rank={self.rank} cp_rank={self.cp_rank} "
+                f"loss_full={full_loss.item():.6f} loss_cp={cp_loss.item():.6f}\n"
+                f"  local.grad={local.grad.detach().cpu().tolist()}\n"
+                f"  expected_local_grad={expected_local_grad.detach().cpu().tolist()}"
+            )
+            results.extend([max_diff, grad_abs_sum])
+        return results
+
+    # ------------------------------------------------------------------
+    # Test 6: real prepare + FSDP2 helper + unpack + GRPO/GSPO
+    # ------------------------------------------------------------------
+
+    def test_prepare_gather_unpack_policy_loss(self) -> List[float]:
+        """真实 ``_grpo_fsdp2_train_thd`` + CP 穿 segment + FSDP2 logprob helper。
+
+        CP=2 的 local-logit 梯度应对齐 CP=1（full logits）路径的对应 chunk。
+        """
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from gpatch_v4.configs.debug_config import DebugConfig
+        from gpatch_v4.configs.ppo_config import PpoConfig
+        from gpatch_v4.extended_model.deepseek_v4 import DeepseekV4PrepareDataForwardLLM
+        from gpatch_v4.models.deepseek_v4.thd import count_cross_cp_segments
+        from gpatch_v4.training_backend.fsdp2_backend.mixin import (
+            ForwardStepMixin,
+            response_pad_fsdp2_thd_loss_tensors,
+            thd_response_spans_from_samples,
+        )
+        from gpatch_v4.training_backend.fsdp2_backend.mixin.forward import (
+            selective_log_softmax_raw,
+        )
+        from gpatch_v4.training_backend.fsdp2_backend.fsdp2_engine_lm import Fsdp2EngineLm
+
+        batches = [
+            {
+                "tokens": torch.tensor([1, 2, 3, 4], device=self.device),
+                "sequence_lengths": torch.tensor(4, device=self.device),
+                "advantages": torch.tensor([0.1, 0.2, 0.3], device=self.device),
+                "mask": torch.ones(3, device=self.device),
+                "logprobs": torch.tensor([-1.0, -2.0, -3.0], device=self.device),
+                "ref_logprobs": torch.tensor([-1.1, -2.1, -3.1], device=self.device),
+                "rollout_log_probs": torch.tensor([-1.2, -2.2, -3.2, 99.0], device=self.device),
+            },
+            {
+                "tokens": torch.tensor([10, 11, 12, 13, 14, 15], device=self.device),
+                "sequence_lengths": torch.tensor(6, device=self.device),
+                "advantages": torch.tensor([1.0, 1.1, 1.2, 1.3, 1.4], device=self.device),
+                "mask": torch.ones(5, device=self.device),
+                "logprobs": torch.tensor([-4.0, -5.0, -6.0, -7.0, -8.0], device=self.device),
+                "ref_logprobs": torch.tensor([-4.1, -5.1, -6.1, -7.1, -8.1], device=self.device),
+                "rollout_log_probs":
+                    torch.tensor([-4.2, -5.2, -6.2, -7.2, -8.2, 88.0], device=self.device),
+            },
+        ]
+        prepare = DeepseekV4PrepareDataForwardLLM.__new__(DeepseekV4PrepareDataForwardLLM)
+        prepare.config = SimpleNamespace(policy=SimpleNamespace(ppo_pack_seq=True))
+        prepare._model_config = SimpleNamespace(
+            compress_rates={
+                "compressed_sparse_attention": 2,
+                "heavily_compressed_attention": 4,
+            },
+            sliding_window=4,
+        )
+        prepare._pad_each_doc_to_multi_of = 4
+        packed, fwd_kwargs = prepare._grpo_fsdp2_train_thd(
+            batches,
+            seq_len=8,
+            pad_token_id=0,
+            include_rl_fields=True,
+        )
+        cu_padded = packed["cu_seqlens_padded"]
+        total_tokens = int(cu_padded[-1].item())
+        assert total_tokens % self.cp_size == 0
+        assert count_cross_cp_segments(cu_padded, self.cp_size) > 0
+        if self.cp_rank == 1:
+            local_start = (total_tokens // self.cp_size) * self.cp_rank
+            assert int(cu_padded[1].item()) < local_start < int(cu_padded[2].item())
+            assert fwd_kwargs["input_ids"].shape[1] == total_tokens // self.cp_size
+
+        mixin = ForwardStepMixin.__new__(ForwardStepMixin)
+        mixin.prepare_data = prepare
+        mixin.training_config = SimpleNamespace(use_linear_ce=False)
+
+        vocab = 32
+        generator = torch.Generator(device=self.device).manual_seed(123)
+        full_logits = torch.randn(
+            1, total_tokens, vocab, device=self.device, generator=generator
+        )
+        target = packed["target"]
+        assert int(target.max().item()) < vocab
+        full_logits.scatter_add_(
+            -1,
+            target.unsqueeze(-1),
+            torch.full((1, total_tokens, 1), 4.0, device=self.device),
+        )
+        starts, lengths = thd_response_spans_from_samples(batches, device=self.device)
+        _reduce_factory = (
+            "gpatch_v4.training_backend.loss_factory.reduce_metrics_across_data_parallel_group"
+        )
+        _reduce_new = (
+            "gpatch_v4.training_backend.loss.ppo_loss.reduce_metrics_across_data_parallel_group"
+        )
+
+        def _unpack(curr, entropy):
+            return response_pad_fsdp2_thd_loss_tensors(
+                {
+                    "curr_log_probs": curr,
+                    "per_token_entropy": entropy,
+                    "mask": packed["mask"],
+                    "advantages": packed["advantages"],
+                    "prev_log_probs": packed["prev_log_probs"],
+                    "ref_log_probs": packed["ref_log_probs"],
+                    "rollout_log_probs": packed["rollout_log_probs"],
+                },
+                cu_padded,
+                starts,
+                lengths,
+            )
+
+        def _loss(loss_name, use_legacy, curr, entropy):
+            padded = _unpack(curr, entropy)
+            config = SimpleNamespace(
+                ppo=PpoConfig(
+                    loss_func=loss_name,
+                    ppo_entropy_bonus=0.0,
+                    grpo_kl_loss_beta=0.0,
+                    enable_off_policy_correction=False,
+                    ppo_ratio_eps=0.2,
+                ),
+                debug=DebugConfig(),
+            )
+            loss_fn, _ = Fsdp2EngineLm._resolve_fsdp2_policy_loss(
+                SimpleNamespace(
+                    training_config=SimpleNamespace(use_legacy_loss=use_legacy),
+                    ppo_config=SimpleNamespace(loss_func=loss_name),
+                )
+            )
+            loss_input_cls = Fsdp2EngineLm._fsdp2_policy_loss_input_cls(use_legacy)
+            with patch(_reduce_factory), patch(_reduce_new):
+                loss, _, _ = Fsdp2EngineLm._call_fsdp2_policy_loss(
+                    loss_fn,
+                    config,
+                    loss_input_cls(
+                        advantages=padded["advantages"],
+                        prev_log_probs=padded["curr_log_probs"].detach() - 0.05,
+                        ref_log_probs=padded["ref_log_probs"],
+                        curr_log_probs=padded["curr_log_probs"],
+                        response_mask=padded["mask"],
+                        scaled_entropy=torch.tensor(0.0, device=self.device),
+                        rollout_log_probs=padded["rollout_log_probs"],
+                        per_token_entropy=padded["per_token_entropy"],
+                        cu_seqlens_padded=None,
+                        local_cp_size=1,
+                    ),
+                    use_legacy,
+                )
+            return loss
+
+        def _cp1_leaf_grad(loss_name, use_legacy):
+            leaf = full_logits.detach().clone().requires_grad_(True)
+            logprobs = selective_log_softmax_raw(leaf, target)
+            entropy = -(leaf.softmax(dim=-1) * leaf.log_softmax(dim=-1)).sum(dim=-1)
+            loss = _loss(loss_name, use_legacy, logprobs, entropy)
+            loss.backward()
+            return loss.detach(), leaf.grad.detach()
+
+        def _cp2_leaf_grad(loss_name, use_legacy):
+            local = prepare.rl_train_cp_chunk_single_data(full_logits.detach()).clone()
+            local.requires_grad_(True)
+            logprobs, entropy = mixin._rl_logprobs_and_entropy_from_head_output(
+                local,
+                target,
+                packed["mask"],
+                pre_shifted=True,
+                allow_compile=False,
+            )
+            loss = _loss(loss_name, use_legacy, logprobs, entropy)
+            loss.backward()
+            return loss.detach(), local, local.grad.detach()
+
+        results = []
+        for loss_name in ("grpo", "gspo"):
+            for use_legacy in (True, False):
+                cp1_loss, cp1_grad = _cp1_leaf_grad(loss_name, use_legacy)
+                cp2_loss, local, cp2_grad = _cp2_leaf_grad(loss_name, use_legacy)
+                expected = prepare.rl_train_cp_chunk_single_data(cp1_grad)
+                loss_diff = (cp2_loss - cp1_loss).abs().item()
+                grad_diff = (cp2_grad - expected).abs().max().item()
+                grad_abs = cp2_grad.abs().sum().item()
+                label = "legacy" if use_legacy else "new"
+                print(
+                    f"[prepare+helper {loss_name} {label}] rank={self.rank} "
+                    f"cp_rank={self.cp_rank} "
+                    f"loss_cp1={cp1_loss.item():.6f} loss_cp2={cp2_loss.item():.6f} "
+                    f"loss_diff={loss_diff:.3e} grad_diff={grad_diff:.3e} "
+                    f"local_logit_grad_abs={grad_abs:.3e} local_logits={list(local.shape)}"
+                )
+                results.extend([loss_diff, grad_diff, grad_abs])
+        torch.cuda.synchronize()
+        return results
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -350,3 +671,35 @@ class CpMappingsTest(unittest.TestCase):
         results = ray.get(refs)
         for rank, (max_diff, ) in enumerate(results):
             self.assertLess(max_diff, 1e-5, f"rank {rank}: max_diff={max_diff}")
+
+    def test_gather_unpack_gspo_backward(self):
+        refs = [w.test_gather_unpack_gspo_backward.remote() for w in self.workers]
+        results = ray.get(refs)
+        for rank, values in enumerate(results):
+            self.assertEqual(len(values), 4, f"rank {rank}: {values}")
+            for i, label in enumerate(("legacy", "new")):
+                max_diff, grad_abs_sum = values[2 * i], values[2 * i + 1]
+                self.assertLess(
+                    max_diff, 1e-5, f"rank {rank} {label}: max_diff={max_diff}"
+                )
+                self.assertGreater(
+                    grad_abs_sum, 0.0, f"rank {rank} {label}: GSPO local grad vanished"
+                )
+
+    def test_prepare_gather_unpack_policy_loss(self):
+        refs = [w.test_prepare_gather_unpack_policy_loss.remote() for w in self.workers]
+        results = ray.get(refs)
+        labels = ("grpo-legacy", "grpo-new", "gspo-legacy", "gspo-new")
+        for rank, values in enumerate(results):
+            self.assertEqual(len(values), 12, f"rank {rank}: {values}")
+            for i, label in enumerate(labels):
+                loss_diff, grad_diff, grad_abs = values[3 * i:3 * i + 3]
+                self.assertLess(
+                    loss_diff, 1e-5, f"rank {rank} {label}: loss_diff={loss_diff}"
+                )
+                self.assertLess(
+                    grad_diff, 1e-4, f"rank {rank} {label}: logit grad_diff={grad_diff}"
+                )
+                self.assertGreater(
+                    grad_abs, 0.0, f"rank {rank} {label}: local logit grad vanished"
+                )

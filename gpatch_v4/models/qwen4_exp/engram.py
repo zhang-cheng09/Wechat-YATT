@@ -29,6 +29,7 @@ and no tokens silently dropped when the hash distribution is skewed.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Optional
 
 import torch
@@ -44,6 +45,7 @@ from .modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
 __all__ = [
     "OwnerShardedNGramEmbedding",
     "Qwen4ExpEngramEmbedding",
+    "iter_engram_hf_shards",
 ]
 
 
@@ -204,6 +206,137 @@ def materialize_engram_tables(
         )
 
 
+def iter_engram_hf_shards(
+    table: OwnerShardedNGramEmbedding,
+    target_key: str,
+    split_ngram_parts: int,
+    *,
+    out_device: torch.device | str | None = None,
+    yield_on_all_ranks: bool = True,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield Engram rows in HF / SGLang ``split_ngram_parts`` disk layout.
+
+    Trainer Engram ownership is ``world_size`` equal row slices named by owner rank.
+    Released checkpoints and SGLang ``load_qwen4_exp_ple_shard`` instead index
+    ``...ngram_embedding.shard_{i}.weight`` with
+    ``i in [0, split_ngram_parts)`` and row start ``i * ceil(N / split_ngram_parts)``.
+    Emitting owner ranks as ``shard_{owner}`` therefore mis-places rows whenever
+    ``world_size != split_ngram_parts`` (e.g. EP32 train vs HF 128).
+
+    Streams one owner broadcast at a time and packs complete HF shards before yield so
+    the full ``[N, dim]`` table is never materialized.
+
+    Parameters
+    ----------
+    table : OwnerShardedNGramEmbedding
+    target_key : str
+        Model FQN ending in ``.weight`` (e.g. ``...ngram_embedding.weight``).
+    split_ngram_parts : int
+        HF / SGLang partition count (128 on Qwen3.8-Flash-Next).
+    out_device : torch.device or str, optional
+        Device for yielded tensors. ``None`` keeps the broadcast buffer's device.
+    yield_on_all_ranks : bool
+        If False, only rank 0 yields (other ranks still join broadcasts).
+
+    Yields
+    ------
+    tuple[str, torch.Tensor]
+        ``(prefix.shard_{i}.weight, bf16 rows)`` with
+        ``rows.shape[0] == min(rows_per_shard, N - i * rows_per_shard)``.
+    """
+    if split_ngram_parts <= 0:
+        raise ValueError(f"split_ngram_parts must be positive, got {split_ngram_parts}")
+    if not target_key.endswith(".weight"):
+        raise ValueError(f"target_key must end with .weight, got {target_key!r}")
+
+    prefix = target_key[:-len(".weight")]
+    rank = table.rank
+    world_size = table.world_size
+    n_rows = table.num_embeddings
+    dim = table.embedding_dim
+    local_rows = table.local_rows
+    rows_per_shard = (n_rows + split_ngram_parts - 1) // split_ngram_parts
+
+    local = table.local_weight.detach()
+    if local.dtype != torch.bfloat16:
+        local = local.to(torch.bfloat16)
+    # Engram PG is NCCL; broadcast must stay on CUDA even when the table was CPU-offloaded.
+    if not local.is_cuda:
+        local = local.cuda()
+    local = local.contiguous()
+
+    pending_idx: Optional[int] = None
+    pending: Optional[torch.Tensor] = None
+    pending_pos = 0
+
+    def _maybe_yield() -> Iterator[tuple[str, torch.Tensor]]:
+        nonlocal pending_idx, pending, pending_pos
+        if pending is None:
+            return
+        assert pending_idx is not None
+        if pending_pos != pending.shape[0]:
+            raise RuntimeError(
+                f"Engram HF shard {pending_idx} filled {pending_pos}/{pending.shape[0]} rows"
+            )
+        out = pending
+        if out_device is not None:
+            out = out.to(out_device)
+        key = f"{prefix}.shard_{pending_idx}.weight"
+        pending_idx = None
+        pending = None
+        pending_pos = 0
+        if yield_on_all_ranks or rank == 0:
+            yield key, out.detach().contiguous()
+        else:
+            del out
+
+    for owner in range(world_size):
+        if dist.is_initialized() and world_size > 1:
+            buffer = local if owner == rank else torch.empty_like(local)
+            dist.broadcast(buffer, src=owner, group=table.process_group)
+        else:
+            buffer = local
+
+        owner_start = owner * local_rows
+        local_off = 0
+        while local_off < local_rows:
+            global_row = owner_start + local_off
+            if global_row >= n_rows:
+                break
+            shard_idx = global_row // rows_per_shard
+            shard_g0 = shard_idx * rows_per_shard
+            shard_g1 = min(shard_g0 + rows_per_shard, n_rows)
+            shard_rows = shard_g1 - shard_g0
+            take = min(local_rows - local_off, shard_g1 - global_row)
+
+            if pending is None:
+                pending_idx = shard_idx
+                pending = torch.empty(shard_rows, dim, device=buffer.device, dtype=torch.bfloat16)
+                pending_pos = global_row - shard_g0
+                if pending_pos != 0:
+                    raise RuntimeError(
+                        f"Engram HF shard {shard_idx} started at local offset "
+                        f"{pending_pos}; owners must be streamed in rank order"
+                    )
+            elif pending_idx != shard_idx:
+                raise RuntimeError(
+                    f"Engram HF shard packing jumped from {pending_idx} to {shard_idx}"
+                )
+
+            assert pending is not None
+            pending[pending_pos:pending_pos + take].copy_(buffer[local_off:local_off + take])
+            pending_pos += take
+            local_off += take
+            if pending_pos == pending.shape[0]:
+                yield from _maybe_yield()
+
+        if owner != rank:
+            del buffer
+
+    if pending is not None:
+        yield from _maybe_yield()
+
+
 class Qwen4ExpEngramEmbedding(Qwen4ExpTextNGramEmbedding):
     """Upstream n-gram embedding with the table replaced by an owner-sharded one.
 
@@ -228,7 +361,9 @@ class Qwen4ExpEngramEmbedding(Qwen4ExpTextNGramEmbedding):
         self.ngram_embedding = OwnerShardedNGramEmbedding(num_embeddings, dim, process_group)
 
     @override
-    def forward(self, input_ids: torch.Tensor, past_key_values: Optional[object] = None) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, past_key_values: Optional[object] = None
+    ) -> torch.Tensor:
         if past_key_values is not None:
             raise NotImplementedError(
                 "Engram training path does not support a KV cache. The n-gram context is "
@@ -246,9 +381,8 @@ class Qwen4ExpEngramEmbedding(Qwen4ExpTextNGramEmbedding):
     ) -> torch.Tensor:
         """Hash globally while looking up only this CP rank's positions."""
         if (
-            sequence_start < 0
-            or sequence_end < sequence_start
-            or sequence_end > global_input_ids.shape[1]
+            sequence_start < 0 or sequence_end < sequence_start or
+            sequence_end > global_input_ids.shape[1]
         ):
             raise ValueError(
                 f"invalid Engram global slice [{sequence_start}, {sequence_end}) for "
@@ -257,17 +391,13 @@ class Qwen4ExpEngramEmbedding(Qwen4ExpTextNGramEmbedding):
         input_ids = global_input_ids.long()
         if segment_boundaries is None:
             shifted_tokens = [
-                self._shift_right_ignore_eos(input_ids, shift)
-                for shift in range(self.ngram_size)
+                self._shift_right_ignore_eos(input_ids, shift) for shift in range(self.ngram_size)
             ]
         else:
             boundaries = segment_boundaries.to(device=input_ids.device, dtype=torch.long)
             if (
-                boundaries.ndim != 1
-                or boundaries.numel() < 2
-                or int(boundaries[0]) != 0
-                or int(boundaries[-1]) != input_ids.shape[1]
-                or bool((boundaries.diff() <= 0).any())
+                boundaries.ndim != 1 or boundaries.numel() < 2 or int(boundaries[0]) != 0 or
+                int(boundaries[-1]) != input_ids.shape[1] or bool((boundaries.diff() <= 0).any())
             ):
                 raise ValueError("segment_boundaries must partition the complete input row")
             positions = torch.arange(input_ids.shape[1], device=input_ids.device)
@@ -296,9 +426,7 @@ class Qwen4ExpEngramEmbedding(Qwen4ExpTextNGramEmbedding):
                 )
             head_vocab_sizes = self.ngram_heads_vocab_sizes[start_idx:end_idx]
             head_offsets = self.ngram_heads_offsets[start_idx:end_idx]
-            ngram_ids = torch.remainder(
-                mixed_ids.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1)
-            )
+            ngram_ids = torch.remainder(mixed_ids.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1))
             blocks.append(ngram_ids + head_offsets.view(1, 1, -1))
 
         local_ids = torch.cat(blocks, dim=-1)[:, sequence_start:sequence_end]

@@ -69,8 +69,12 @@ def _training_ns(*, freeze_csa_indexer: bool) -> SimpleNamespace:
     return SimpleNamespace(
         training=SimpleNamespace(
             freeze_csa_indexer=freeze_csa_indexer,
-            freeze_router_weight=False,
+            freeze_moe_router=False,
             freeze_router_correction_bias=True,
+            enable_mtp=False,
+            online_mtp_sft=False,
+            enable_dspark=False,
+            online_train_dspark=False,
         )
     )
 

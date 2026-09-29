@@ -7,11 +7,47 @@ from typing_extensions import override
 from gpatch_v4.configs.config import RlConfig
 from gpatch_v4.orches.placement_group import create_rollout_controller
 from gpatch_v4.trainer.grpo_trainer import GrpoTrainer
+from gpatch_v4.transfer import close_tq_connector
+from gpatch_v4.transfer.transfer_queue_interface import TQInterface
 from gpatch_v4.utils import log
 from gpatch_v4.utils.placement import (
     is_partial_colocated,
     validate_partial_colocated_config,
 )
+
+
+def apply_e2h_train_schedule(config: RlConfig, train_info: dict, schedule: dict) -> dict:
+    """Replace yaml PPO step counts with the controller E2H cover length.
+
+    Parameters
+    ----------
+    config : RlConfig
+    train_info : dict
+        From ``init_train_state``; ``prev_ppo_step`` is kept.
+    schedule : dict
+        ``get_schedule_info`` payload. Must contain ``total_ppo_step`` and
+        ``ppo_step_per_epoch``.
+
+    Returns
+    -------
+    dict
+        Copy of ``train_info`` with schedule fields overwritten.
+    """
+    if "total_ppo_step" not in schedule or "ppo_step_per_epoch" not in schedule:
+        raise KeyError(
+            "E2H schedule must contain total_ppo_step and ppo_step_per_epoch, "
+            f"got {sorted(schedule)}"
+        )
+    total_ppo_step = schedule["total_ppo_step"]
+    ppo_step_per_epoch = schedule["ppo_step_per_epoch"]
+    if total_ppo_step <= 0 or ppo_step_per_epoch <= 0:
+        raise ValueError(f"invalid E2H schedule: {total_ppo_step=} {ppo_step_per_epoch=}")
+    config.training.total_ppo_step = total_ppo_step
+    config.training.ppo_step_per_epoch = ppo_step_per_epoch
+    out = dict(train_info)
+    out["total_ppo_step"] = total_ppo_step
+    out["ppo_step_per_epoch"] = ppo_step_per_epoch
+    return out
 
 
 class GrpoSingleCtrlTrainer(GrpoTrainer):
@@ -33,6 +69,7 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
 
     def __init__(self):
         super().__init__()
+        self.rollout_controller = None
         # Pipeline timeline: {ppo_step: {"fire": t, "collect": t, "train_done": t,
         # "update_start": t?, "update_done": t?}}.  ``update_*`` are only set on
         # the last trained step of each sampler-weight window.  All timestamps
@@ -60,14 +97,21 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
         ----------
         config : RlConfig
         """
-        await self.launch(config)
+        try:
+            await self.launch(config)
 
-        # Create the RolloutController (0-GPU Ray actor)
-        self.rollout_controller = create_rollout_controller(config)
-        train_actors = self.train_group._actor_handlers if config.placement_type == "colocate" else None
-        await self.rollout_controller.setup.remote(train_actors=train_actors)
+            # Create the RolloutController (0-GPU Ray actor)
+            self.rollout_controller = create_rollout_controller(config)
+            train_actors = self.train_group._actor_handlers if config.placement_type == "colocate" else None
+            await self.rollout_controller.setup.remote(train_actors=train_actors)
 
-        return await self.run_train_loop(config)
+            return await self.run_train_loop(config)
+        finally:
+            if config.tq.enable:
+                await self._close_tq_runtime()
+
+    async def _close_tq_runtime(self) -> None:
+        close_tq_connector()
 
     async def _run_train_loop(self, config: RlConfig):
         """Controller-side rollout/training loop.
@@ -106,11 +150,35 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
         # Window size: s steps trained per sampler-weight window (or 1 step
         # when s=0, giving fully synchronous behavior).
         window_size = max(max_stale, 1)
+        #TODO： 这里的限制是为了处理 eval 和 save 和 window_size 不同步的问题
+        # 先临时处理，后面这里的逻辑得调整一下
+        if not config.debug.disable_save_checkpoint:
+            assert training_cfg.save_interval % window_size == 0, (
+                f"save_interval ({training_cfg.save_interval}) must be a multiple of "
+                f"the weight-update window ({window_size}, rollout_max_staleness={max_stale})"
+            )
+        if training_cfg.eval_interval > 0:
+            assert training_cfg.eval_interval % window_size == 0, (
+                f"eval_interval ({training_cfg.eval_interval}) must be a multiple of "
+                f"the weight-update window ({window_size}, rollout_max_staleness={max_stale})"
+            )
 
         train_info = await tg.init_train_state()
+        if config.data.e2h.enable:
+            schedule = await rc.get_schedule_info.remote()
+            train_info = apply_e2h_train_schedule(config, train_info, schedule)
+            await tg.set_training_schedule(
+                schedule["total_ppo_step"],
+                schedule["ppo_step_per_epoch"],
+            )
         total_ppo_step = train_info["total_ppo_step"]
         ppo_step_per_epoch = train_info["ppo_step_per_epoch"]
         prev_ppo_step = train_info["prev_ppo_step"]
+        if training_cfg.eval_interval > 0:
+            assert prev_ppo_step % window_size == 0, (
+                f"resume step ({prev_ppo_step}) must align with the weight-update "
+                f"window ({window_size}) when evaluation is enabled"
+            )
         # Align with GrpoTrainActor: exit_step (>=1) caps how many PPO steps run.
         exit_step = training_cfg.exit_step
         if exit_step is not None and int(exit_step) > 0:
@@ -135,6 +203,35 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
 
         def epoch_for(step: int) -> int:
             return step // ppo_step_per_epoch
+
+        async def report_eval_results(results, report_step: int, commit: bool = False) -> None:
+            for index, result in enumerate(results):
+                await tg.eval_logging(
+                    result.metrics,
+                    result.source_step,
+                    report_step=report_step,
+                    commit=commit and index == len(results) - 1,
+                )
+
+        async def start_eval(source_step: int, commit: bool = False) -> None:
+            results = await rc.evaluate.remote(source_step)
+            await report_eval_results(results, report_step=source_step, commit=commit)
+
+        async def poll_eval(
+            report_step: int,
+            *,
+            force: bool = False,
+            commit: bool = False,
+        ) -> None:
+            poll_start = time.monotonic()
+            result = await rc.poll_eval.remote(force=force)
+            log(
+                f"[GRPO EVAL] poll report_step={report_step} force={force} "
+                f"result={'ready' if result is not None else 'none'} "
+                f"elapsed_s={time.monotonic() - poll_start:.3f}"
+            )
+            if result is not None:
+                await report_eval_results([result], report_step=report_step, commit=commit)
 
         async def fire_up_to(target: int) -> None:
             """Fire PPO steps until ``fired_step == target``.
@@ -195,6 +292,9 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
 
                 fired_step += n
 
+        if training_cfg.eval_interval > 0 and training_cfg.eval_before_train:
+            await start_eval(prev_ppo_step)
+
         # Cold start: prime the queue with up to ``s + 1`` batches.
         await tg.log_memory(f"memory tracking before fire ppo_step {train_step}")
         await fire_up_to(train_step + (max_stale + 1))
@@ -210,6 +310,7 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
             if debug_skip_rollout:
                 dp_refs = None
                 extra_metrics = {}
+                tq_clear_refs = []
                 t_collect_done = time.monotonic()
                 fire_rollout_elapsed = 0.0
                 collect_elapsed = 0.0
@@ -220,6 +321,7 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
                     abort_metrics = await rc.wait_all_inflight.remote() or {}
                 dp_refs = gen_result.dp_refs
                 extra_metrics = getattr(gen_result, "metrics", {}) or {}
+                tq_clear_refs = gen_result.tq_clear_refs
                 t_collect_done = time.monotonic()
                 fire_time = self._pipeline_ts[train_step]["fire"]
                 fire_rollout_elapsed = t_collect_done - fire_time
@@ -227,6 +329,8 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
             self._pipeline_ts.setdefault(train_step, {})["collect"] = t_collect_done
             await tg.log_memory(f"memory tracking after collect ppo_step {train_step}")
 
+            if training_cfg.eval_interval > 0:
+                await poll_eval(report_step=train_step)
             t_train_start = time.monotonic()
             extra_metrics.update(self._pending_abort_metrics)
             self._pending_abort_metrics = {}
@@ -243,6 +347,8 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
                 dp_refs,
                 extra_metrics=extra_metrics,
             )
+            if config.tq.enable:
+                await TQInterface.async_clear_sample_refs(tq_clear_refs)
             t_train_done = time.monotonic()
             self._pipeline_ts.setdefault(train_step, {})["train_done"] = t_train_done
 
@@ -269,6 +375,9 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
 
             reached_window_boundary = steps_since_update >= window_size
             at_end_of_training = train_step == total_ppo_step
+            eval_due = (
+                training_cfg.eval_interval > 0 and train_step % training_cfg.eval_interval == 0
+            )
 
             if reached_window_boundary or at_end_of_training:
                 # Save-checkpoint first, THEN wait for sampler to drain.
@@ -295,6 +404,9 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
 
                 steps_since_update = 0
 
+                if eval_due:
+                    await start_eval(train_step, commit=at_end_of_training)
+
                 if not at_end_of_training:
                     await fire_up_to(train_step + 1 + max_stale)
 
@@ -314,6 +426,15 @@ class GrpoSingleCtrlTrainer(GrpoTrainer):
             await tg.prepare_for_final_save()
             await tg.save_checkpoint(train_step)
             await rc.save_data_source.remote(train_step)
+
+        if training_cfg.eval_interval > 0:
+            await poll_eval(
+                report_step=train_step + 1,
+                force=True,
+                commit=True,
+            )
+
+        await tg.finish_reporting()
 
         return ret_metrics
 

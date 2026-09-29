@@ -34,6 +34,7 @@ from gpatch_v4.core import (
     register_custom_post_advantage,
     register_custom_post_compute_logprobs,
 )
+from gpatch_v4.core.kl_ctrl import get_kl_in_reward_controller
 from gpatch_v4.core.parallel_state import (
     cpu_barrier,
     cpu_group,
@@ -90,12 +91,14 @@ from gpatch_v4.utils import (
     logging_memory_usage,
     logging_memory_usage_details,
     logging_rank0,
+    record_engine_lrs,
     record_time_to_metrics,
     reduce_metrics,
     register_custom_filter_sampling,
     sync_cuda_and_get_time,
 )
 from gpatch_v4.utils.common_utils import compress_ppo_save_train_data
+from gpatch_v4.utils.e2h_sampler import E2HTaskSampler, collect_e2h_rollout_metrics
 from gpatch_v4.utils.placement import (
     is_partial_colocated,
     validate_partial_colocated_config,
@@ -141,6 +144,10 @@ class GrpoTrainActor(
             get_ppo_feature_store() if self.config.ppo.feature_store_enable else None
         )
         self.validated_config()
+        self.kl_ctrl = (
+            get_kl_in_reward_controller(self.config.ppo)
+            if self.config.ppo.use_kl_in_reward else None
+        )
         logging_rank0(f"{self.__class__.__name__} config {format_config(self.config)}")
 
         if self.require_critic_model():
@@ -215,6 +222,36 @@ class GrpoTrainActor(
                 )
             )
 
+    def _register_rl_policy_loss(self):
+        use_new_policy_loss = (
+            self.config.training.training_backend in ("mcore", "fsdp2") and
+            not self.config.training.use_legacy_loss
+        )
+        if use_new_policy_loss:
+            backend = self.config.training.training_backend
+            if not is_loss_registered(backend, self.config.ppo.loss_func):
+                assert self.config.ppo.loss_func_py_path is not None, (
+                    f"Unregistered policy loss '{self.config.ppo.loss_func}' requires "
+                    "ppo.loss_func_py_path"
+                )
+                assert self.config.ppo.loss_func_py_name is not None, (
+                    f"Unregistered policy loss '{self.config.ppo.loss_func}' requires "
+                    "ppo.loss_func_py_name"
+                )
+                register_backend_custom_loss_fn(
+                    backend=backend,
+                    loss_name=self.config.ppo.loss_func,
+                    py_path=self.config.ppo.loss_func_py_path,
+                    fn_name=self.config.ppo.loss_func_py_name,
+                )
+        elif self.config.ppo.loss_func not in BUILDIN_LOSS_FUNC:
+            assert self.config.ppo.loss_func_py_path is not None and self.config.ppo.loss_func_py_name is not None, "Custom loss function must be provided"
+            register_custom_loss_fn(
+                self.config.ppo.loss_func,
+                self.config.ppo.loss_func_py_path,
+                self.config.ppo.loss_func_py_name,
+            )
+
     def validated_config(self):
         """Validate training configuration constraints and auto-load settings."""
         training_config = self.config.training
@@ -228,10 +265,20 @@ class GrpoTrainActor(
             assert training_config.sampling_repeat_n >= training_config.sampling_keep_n
 
         assert training_config.rollout_gbs * training_config.sampling_keep_n >= training_config.train_gbs
-        assert training_config.rollout_mbs * mpu.get_data_parallel_world_size(
-        ) <= training_config.rollout_gbs
-        assert training_config.train_mbs * mpu.get_data_parallel_world_size(
-        ) <= training_config.train_gbs
+        dp_size = mpu.get_data_parallel_world_size()
+        assert training_config.train_mbs * dp_size <= training_config.train_gbs
+        if training_config.dynamic_batch_train:
+            # Sample-level DP split after expand (rollout_gbs * keep_n * rb_m).
+            # Prompt count need not cover every DP rank; train-step sample count must.
+            if not self.config.policy.dist_config.dynamic_context_parallel:
+                divisor = dp_size * training_config.train_mbs
+                assert training_config.train_gbs % divisor == 0, (
+                    f"dynamic_batch_train without dynamic CP requires train_gbs "
+                    f"({training_config.train_gbs}) divisible by dp_size * train_mbs "
+                    f"({dp_size} * {training_config.train_mbs})"
+                )
+        else:
+            assert training_config.rollout_mbs * dp_size <= training_config.rollout_gbs
 
         if self.config.placement_type == "colocate":
             policy_nnodes = self.config.policy.dist_config.nnodes
@@ -260,33 +307,7 @@ class GrpoTrainActor(
                 training_config.ppo_filter_samplings_path,
                 training_config.ppo_filter_samplings_name,
             )
-        not_use_legacy_loss = (
-            self.config.training.training_backend == "mcore" and not self.config.ppo.use_legacy_loss
-        )
-        if not_use_legacy_loss:
-            if not is_loss_registered("mcore", self.config.ppo.loss_func):
-                assert self.config.ppo.loss_func_py_path is not None, (
-                    f"Unregistered MCore loss '{self.config.ppo.loss_func}' requires "
-                    "ppo.loss_func_py_path"
-                )
-                assert self.config.ppo.loss_func_py_name is not None, (
-                    f"Unregistered MCore loss '{self.config.ppo.loss_func}' requires "
-                    "ppo.loss_func_py_name"
-                )
-                register_backend_custom_loss_fn(
-                    backend="mcore",
-                    loss_name=self.config.ppo.loss_func,
-                    py_path=self.config.ppo.loss_func_py_path,
-                    fn_name=self.config.ppo.loss_func_py_name,
-                )
-            #TODO: FSDP2 RL still resolves losses through loss_factory.py.
-        elif self.config.ppo.loss_func not in BUILDIN_LOSS_FUNC:
-            assert self.config.ppo.loss_func_py_path is not None and self.config.ppo.loss_func_py_name is not None, "Custom loss function must be provided"
-            register_custom_loss_fn(
-                self.config.ppo.loss_func,
-                self.config.ppo.loss_func_py_path,
-                self.config.ppo.loss_func_py_name,
-            )
+        self._register_rl_policy_loss()
         if self.config.ppo.advantage_type not in BUILDIN_ADVANTAGE_TYPE:
             assert self.config.ppo.custom_advantage_py_path is not None and self.config.ppo.custom_advantage_py_name is not None, (
                 f"Non-builtin advantage_type '{self.config.ppo.advantage_type}' requires "
@@ -809,6 +830,11 @@ class GrpoTrainActor(
                 metrics, report_step, log_prefix=log_prefix, commit=commit
             )
 
+    def finish_reporting(self) -> None:
+        """Flush and close reporting backends on the last training rank."""
+        if is_last_rank():
+            TrainReporterSingleton.finish()
+
     def build_dataset_and_dataloader(self, resume_step=None):
         """Build training dataset and dataloader from a user-provided factory function.
 
@@ -833,11 +859,19 @@ class GrpoTrainActor(
             extra_args = {}
             if resume_step is not None and "meta_info" in fn_kwargs:
                 extra_args['meta_info'] = {'resume_step': resume_step}
+            # single_controller: RolloutController owns prompt sampling with
+            # dp_size=1. Train actors still build the factory for schedule /
+            # resume bookkeeping and must match that topology (esp. E2H).
+            if self.config.training.single_controller:
+                sampler_dp_rank, sampler_dp_size = 0, 1
+            else:
+                sampler_dp_rank = mpu.get_data_parallel_rank()
+                sampler_dp_size = mpu.get_data_parallel_world_size()
             fn_ret = fn(
                 config=self.config,
                 tokenizer=self.tokenizer,
-                dp_rank=mpu.get_data_parallel_rank(),
-                dp_size=mpu.get_data_parallel_world_size(),
+                dp_rank=sampler_dp_rank,
+                dp_size=sampler_dp_size,
                 **extra_args,
             )
         else:
@@ -861,11 +895,16 @@ class GrpoTrainActor(
         # skip resume for dynamic sampling datasource, it will handle its own resume logic
         if self.config.policy.rollout_gen_type == "dynamic_sampling":
             return
+        sampler_dp_size = (
+            1 if self.config.training.single_controller else mpu.get_data_parallel_world_size()
+        )
+        rollout_mbs = self.config.training.rollout_mbs
+        rollout_gas = self.config.training.rollout_gbs // (sampler_dp_size * rollout_mbs)
+        if isinstance(self.train_sampler, E2HTaskSampler):
+            self.train_sampler.set_start_index(resume_step * rollout_gas, rollout_mbs)
+            return
         if not isinstance(self.train_sampler, ResumableDistributedSampler):
             return
-        dp_size = mpu.get_data_parallel_world_size()
-        rollout_mbs = self.config.training.rollout_mbs
-        rollout_gas = self.config.training.rollout_gbs // (dp_size * rollout_mbs)
         step_per_epoch = self.train_sampler.num_samples // (rollout_gas * rollout_mbs)
         assert self.config.training.ppo_step_per_epoch == step_per_epoch, f"ppo_step_per_epoch {self.config.training.ppo_step_per_epoch} != {step_per_epoch}"
         align_sampler_num_samples(self.train_sampler, step_per_epoch, rollout_mbs, rollout_gas)
@@ -874,15 +913,18 @@ class GrpoTrainActor(
     def auto_calc_ppo_step(self):
         """Automatically compute total PPO steps, gradient accumulation steps, etc."""
         training_config = self.config.training
-        dp_rank = mpu.get_data_parallel_rank()
         dp_size = mpu.get_data_parallel_world_size()
+        sampler_dp_size = 1 if training_config.single_controller else dp_size
 
         assert training_config.rollout_gbs * training_config.sampling_repeat_n >= training_config.train_gbs
         gas = training_config.train_gbs // (dp_size * training_config.train_mbs)
-        rollout_gas = training_config.rollout_gbs // (dp_size * training_config.rollout_mbs)
+        rollout_gas = training_config.rollout_gbs // (sampler_dp_size * training_config.rollout_mbs)
         # TODO: train_dataloader 允许用户自定义的话，len() 在 dp rank 之间会不会不 match，导致程序
         # hang，有待处理。
-        ppo_step_per_epoch = (len(self.train_dataloader) // rollout_gas)
+        if isinstance(self.train_sampler, E2HTaskSampler):
+            ppo_step_per_epoch = self.train_sampler.steps_per_epoch
+        else:
+            ppo_step_per_epoch = (len(self.train_dataloader) // rollout_gas)
         total_ppo_step = ppo_step_per_epoch * training_config.num_train_epoches
 
         training_config.total_ppo_step = total_ppo_step
@@ -890,7 +932,7 @@ class GrpoTrainActor(
         training_config.gradient_accumulation_steps = gas
         log(
             f"train_dataset length: {len(self.train_dataloader)=} {len(self.train_dataset)=} "
-            f"{dp_size=} {training_config.total_ppo_step=}"
+            f"{dp_size=} {sampler_dp_size=} {training_config.total_ppo_step=}"
         )
 
         if training_config.eval_interval > 0:
@@ -1146,23 +1188,27 @@ class GrpoTrainActor(
         return rollout_nb
 
     def get_num_eval_rollout_micro_batches(self):
-        """Compute the number of eval rollout micro-batches per DP rank.
+        """Compute the number of eval rollout micro-batches for schedule math.
 
         Honors ``eval_rollout_gbs`` / ``eval_rollout_mbs`` when set, otherwise
-        falls back to the training rollout micro-batch count. Kept consistent
-        with ``auto_calc_ppo_step``'s ``total_eval_step`` derivation.
+        falls back to the training rollout sizes. With ``single_controller``,
+        the eval dataloader is built with ``dp_size=1`` (controller topology),
+        so the microbatch count is global rather than per train DP rank.
 
         Returns
         -------
         int
         """
         training_config = self.config.training
-        if training_config.eval_rollout_gbs is None:
-            return self.get_num_rollout_micro_batches()
-        dp_size = mpu.get_data_parallel_world_size()
-        eval_rollout_nb = training_config.eval_rollout_gbs // (
-            dp_size * training_config.eval_rollout_mbs
+        sampler_dp_size = 1 if training_config.single_controller else mpu.get_data_parallel_world_size(
         )
+        if training_config.eval_rollout_gbs is None:
+            gbs = training_config.rollout_gbs
+            mbs = training_config.rollout_mbs
+        else:
+            gbs = training_config.eval_rollout_gbs
+            mbs = training_config.eval_rollout_mbs
+        eval_rollout_nb = gbs // (sampler_dp_size * mbs)
         assert eval_rollout_nb > 0, f"eval_rollout_nb {eval_rollout_nb}"
         return eval_rollout_nb
 
@@ -1302,23 +1348,42 @@ class GrpoTrainActor(
                     metrics = rollout_metrics | ppo_data_metrics | original_metrics
 
             metrics.update(self.train_rollout_generator.pop_step_metrics())
+            if isinstance(self.train_sampler, E2HTaskSampler):
+
+                def reduce_counts(counts):
+                    counts_t = torch.tensor(
+                        counts, dtype=torch.int64, device=torch.cuda.current_device()
+                    )
+                    torch.distributed.all_reduce(counts_t, group=mpu.get_data_parallel_group())
+                    return counts_t.cpu().numpy()
+
+                metrics.update(
+                    collect_e2h_rollout_metrics(
+                        self.train_sampler,
+                        ppo_step_i,
+                        rollout_batches,
+                        unique_by_prompt_idx=False,
+                        reduce_counts=reduce_counts,
+                    )
+                )
 
             if self.config.debug.save_every_rollout_data or (
                 self.config.debug.save_first_rollout_data and ppo_step_i == 0
             ):
+                rollout_debug_dir = self.config.debug.load_rollout_path
                 save_data(
-                    rollout_batches, "debug-tmp",
+                    rollout_batches, rollout_debug_dir,
                     f"rollout_batches_{ppo_step_i}_{torch.distributed.get_rank()}.pt"
                 )
                 save_data(
-                    metrics, "debug-tmp",
+                    metrics, rollout_debug_dir,
                     f"rollout_metrics_{ppo_step_i}_{torch.distributed.get_rank()}.pt"
                 )
                 if self.config.debug.save_decode_jsonl:
                     save_rollout_jsonl(
                         rollout_batches,
                         self.tokenizer,
-                        "debug-tmp",
+                        rollout_debug_dir,
                         f"rollout_trajectories_{ppo_step_i}_{torch.distributed.get_rank()}.jsonl",
                         metric_keys=(["rewards"] + list(self.metrics_report)),
                     )
@@ -1375,8 +1440,7 @@ class GrpoTrainActor(
                         )
                         _metrics = self.critic_engine.rl_train_value(ppo_step_iters)
                         extend_value_to_dict(metrics, _metrics)
-                    lr = self.critic_engine.step_and_get_lr()
-                    metrics["value/lr"] = lr
+                    record_engine_lrs(metrics, self.critic_engine, "value")
                 cpu_barrier()
                 logging_rank0("train value model done")
                 # onload policy model weight, policy model is offload before calculate values
@@ -1412,8 +1476,7 @@ class GrpoTrainActor(
                     self.compact_thread, training_config.ppo_dump_metrics_dir
                 )
 
-            lr = self.policy_engine.step_and_get_lr()
-            metrics["policy/lr"] = lr
+            record_engine_lrs(metrics, self.policy_engine, "policy")
             end_time = sync_cuda_and_get_time()
             metrics["time_perf/total_time"] = end_time - begint_time
         output_metrics = reduce_metrics(metrics)
@@ -1444,7 +1507,7 @@ class GrpoTrainActor(
             Set to False when resuming mid-epoch to preserve the skip offset.
         """
         if self.train_sampler:
-            if isinstance(self.train_sampler, ResumableDistributedSampler):
+            if isinstance(self.train_sampler, (ResumableDistributedSampler, E2HTaskSampler)):
                 self.train_sampler.set_epoch(epoch)
                 if reset_start_index:
                     self.train_sampler.start_index = 0
@@ -1458,8 +1521,9 @@ class GrpoTrainActor(
     def _reset_dynamic_train_iter(self, epoch, skip_batches=0):
         self.maybe_set_epoch(epoch, reset_start_index=True)
         if skip_batches:
-            assert isinstance(self.train_sampler, ResumableDistributedSampler
-                             ), ("dynamic sampling resume requires ResumableDistributedSampler")
+            assert isinstance(
+                self.train_sampler, (ResumableDistributedSampler, E2HTaskSampler)
+            ), ("dynamic sampling resume requires ResumableDistributedSampler or E2HTaskSampler")
             self.train_sampler.start_index = skip_batches * self.config.training.rollout_mbs
         return iter(self.train_dataloader)
 

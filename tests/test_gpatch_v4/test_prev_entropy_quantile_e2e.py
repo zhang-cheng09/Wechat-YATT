@@ -74,7 +74,7 @@ class TestPrevEntropyQuantileE2e(unittest.IsolatedAsyncioTestCase):
         config.training.exit_step = 1
         config.training.save_interval = 1
         assert config.ppo.feature_store_enable
-        assert config.ppo.use_legacy_loss
+        assert config.training.use_legacy_loss
         assert config.ppo.post_compute_logprobs == "prev_entropy_quantile"
         assert config.ppo.post_compute_logprobs_py_path.endswith(
             "tasks/math_rl_v4/pre_entropy_quantile.py"

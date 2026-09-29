@@ -32,7 +32,7 @@ training:
   enable_dspark: True
   online_train_dspark: True
   dspark_num_anchors: 2
-  freeze_router_weight: False
+  freeze_moe_router: False
   freeze_router_correction_bias: True
   router_correction_bias_update_speed: 1e-3
   router_correction_bias_use_abs_update: True

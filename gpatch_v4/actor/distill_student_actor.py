@@ -47,6 +47,7 @@ from gpatch_v4.utils import (
     logging_memory_usage,
     logging_memory_usage_details,
     logging_rank0,
+    record_engine_lrs,
     record_time_to_metrics,
     reduce_metrics,
     sync_cuda_and_get_time,
@@ -473,8 +474,7 @@ class DistillStudentActor(GrpoTrainActor):
         cpu_barrier()
         timers("train_step").stop()
 
-        lr = self.policy_engine.step_and_get_lr()
-        metrics["policy/lr"] = lr
+        record_engine_lrs(metrics, self.policy_engine, "policy")
         end_time = sync_cuda_and_get_time()
         metrics["time_perf/total_time"] = end_time - begint_time
         output_metrics = reduce_metrics(metrics)

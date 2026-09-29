@@ -4,10 +4,10 @@
 
 Exercises the real ``DeepseekV4TopKRouter`` + the real
 ``gpatch_v4/models/deepseek_v4/freeze_update_router.py`` helpers (the code the
-``freeze_router_weight`` / ``freeze_router_correction_bias`` /
+``freeze_moe_router`` / ``freeze_router_correction_bias`` /
 ``router_correction_bias_update_speed`` training switches drive), covering:
 
-1. ``freeze_router_weight`` switch — ``freeze_router_weights`` makes the
+1. ``freeze_moe_router`` switch — ``freeze_router_weights`` makes the
    router ``weight`` non-trainable so an optimizer step leaves it untouched;
    without it the weight updates normally.
 2. ``freeze_router_correction_bias`` switch — when the update runs
@@ -143,7 +143,7 @@ def _enable_bias_tracking(model: nn.Module) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. freeze_router_weight switch
+# 1. freeze_moe_router switch
 # ---------------------------------------------------------------------------
 
 
@@ -164,7 +164,7 @@ def test_freeze_switch_on_blocks_router_weight_update():
     before = [gate.weight.detach().clone() for gate in model.gates]
     optimizer = torch.optim.AdamW(trainable, lr=0.1)
 
-    hidden = torch.randn(4, HIDDEN)
+    hidden = torch.randn(1, 4, HIDDEN)
     loss = model.router_loss(hidden)
     loss.backward()
     optimizer.step()
@@ -185,7 +185,7 @@ def test_freeze_switch_off_allows_router_weight_update():
     before = [gate.weight.detach().clone() for gate in model.gates]
     optimizer = torch.optim.AdamW(_trainable_params(model), lr=0.1)
 
-    hidden = torch.randn(4, HIDDEN)
+    hidden = torch.randn(1, 4, HIDDEN)
     loss = model.router_loss(hidden)
     loss.backward()
     for gate in model.gates:
@@ -215,7 +215,7 @@ def test_bias_tracking_counts_routed_tokens():
     model.train()
     _enable_bias_tracking(model)
 
-    hidden = torch.randn(6, HIDDEN)
+    hidden = torch.randn(1, 6, HIDDEN)
 
     with train_forward_context():
         outs = model(hidden)
@@ -227,7 +227,7 @@ def test_bias_tracking_counts_routed_tokens():
         )[: gate.num_experts].float()
         assert torch.equal(_counts(gate), expected)
         # every token contributes exactly top_k assignments.
-        assert _counts(gate).sum().item() == hidden.shape[0] * gate.top_k
+        assert _counts(gate).sum().item() == hidden.shape[1] * gate.top_k
 
 
 def test_bias_update_matches_reference_formula():
@@ -293,7 +293,7 @@ def test_bias_update_end_to_end_from_real_routing():
         gate.e_score_correction_bias.copy_(torch.randn(gate.num_experts) * 0.01)
 
     speed = 2e-3
-    hidden = torch.randn(32, HIDDEN)
+    hidden = torch.randn(1, 32, HIDDEN)
 
     reset_router_correction_bias_accum(model)
     start_bias = [g.e_score_correction_bias.detach().clone() for g in model.gates]
@@ -311,7 +311,7 @@ def test_bias_update_end_to_end_from_real_routing():
 
     for gate, counts, bias0 in zip(model.gates, observed, start_bias):
         # every token contributes exactly top_k assignments (no pad here).
-        assert counts.sum().item() == hidden.shape[0] * gate.top_k
+        assert counts.sum().item() == hidden.shape[1] * gate.top_k
         expected = _reference_updated_bias(bias0, counts, speed)
         assert torch.allclose(gate.e_score_correction_bias, expected, atol=1e-7, rtol=0)
 
@@ -328,7 +328,7 @@ def test_bias_frozen_when_update_not_called():
     frozen = [g.e_score_correction_bias.detach().clone() for g in model.gates]
 
     optimizer = torch.optim.AdamW(_trainable_params(model), lr=0.1)
-    hidden = torch.randn(8, HIDDEN)
+    hidden = torch.randn(1, 8, HIDDEN)
 
     # Simulate a step with tracking on but the update deliberately skipped.
     reset_router_correction_bias_accum(model)
@@ -375,7 +375,7 @@ def test_counting_only_happens_inside_forward_phase():
     _enable_bias_tracking(model)
     fwd_ctx, recompute_ctx = checkpoint_context_fn()
 
-    hidden = torch.randn(8, HIDDEN)
+    hidden = torch.randn(1, 8, HIDDEN)
 
     # 1. forward outside train_forward_context -> hook is a no-op -> no counting.
     model(hidden)
@@ -387,7 +387,7 @@ def test_counting_only_happens_inside_forward_phase():
         model(hidden)
     counted = [_counts(gate).detach().clone() for gate in model.gates]
     for gate, snap in zip(model.gates, counted):
-        assert snap.sum().item() == hidden.shape[0] * gate.top_k
+        assert snap.sum().item() == hidden.shape[1] * gate.top_k
 
     # 3. forward in the "recompute" phase -> hook is a no-op -> counts frozen
     #    (this is the gradient-checkpointing double-count guard).

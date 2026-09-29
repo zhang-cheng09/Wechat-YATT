@@ -1,4 +1,4 @@
-"""Loss package (``ppo.use_legacy_loss=False`` for PPO path)."""
+"""Loss package (``training.use_legacy_loss=False`` for PPO path)."""
 
 from gpatch_v4.training_backend.loss import mcore_specific_loss as _mcore_specific_loss
 from gpatch_v4.training_backend.loss import mlite_specific_loss as _mlite_specific_loss

@@ -220,7 +220,6 @@ class BaseRolloutGenerator(RolloutGeneratorAbc, SendRequestMixin):
 
     @override
     async def __call__(self, data_iter, num_microbatches, curr_ppo_step, on_ready=None):
-        #TODO: support timer record times per stage
         timers = TimerSingleton.get_timer()
         dp_rank = mpu.get_data_parallel_rank()
         offload_process_group = self.config.training.offload_process_group

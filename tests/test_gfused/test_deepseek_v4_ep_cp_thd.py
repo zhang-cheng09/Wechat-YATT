@@ -107,8 +107,9 @@ PAD_TO_MULTIPLE_OF = 128
 # passed
 # CP_SIZE = 1
 # CP_SIZE = 4
-FAKE_SEQ_LENS = [100, 200, 100]
-PADDED_SEQ_LENS = [128, 256, 128]
+FAKE_SEQ_LENS = [200, 400, 200]
+# >= 256，防止 torch.compile 经过 HCA 128 压缩后被 0/1 特化，mark_dynamic 会挂，其他测试同理
+PADDED_SEQ_LENS = [256, 512, 256]
 
 # passed
 # CP_SIZE = 1

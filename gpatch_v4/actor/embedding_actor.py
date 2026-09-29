@@ -45,14 +45,96 @@ class EmbeddingActor(FinetuneActor):
 
     train_log_tag = "EMB"
 
+    def _fetch_one_gbs(self, num_microbatches):
+        batched_data = []
+        while len(batched_data) < num_microbatches:
+            new_data = next(self.train_iter)
+            if isinstance(new_data, list):
+                batched_data.extend(new_data)
+            else:
+                batched_data.append(new_data)
+        assert len(batched_data) == num_microbatches
+        return self.process_batched_data(batched_data)
+
+    def train_one_step(self, epoch, train_step, expanded_rbs, extra_time_metrics=None):
+        """One embedding GBS: optional GradCache + finetune + log.
+        """
+        timers = TimerSingleton.get_timer()
+        training_config = self.config.training
+        num_microbatches = training_config.gradient_accumulation_steps
+
+        if self.config.debug.save_every_rollout_data or (
+            self.config.debug.save_first_rollout_data and train_step == 0
+        ):
+            save_data(
+                expanded_rbs, "debug-tmp",
+                f"{self.train_log_tag.lower()}_batches_{train_step}_{torch.distributed.get_rank()}.pt"
+            )
+
+        should_dump = training_config.ppo_dump_metrics_interval > 0 and (
+            train_step + 1
+        ) % training_config.ppo_dump_metrics_interval == 0
+        self.model_engine.should_dump_metrics = should_dump
+
+        timers("train_step", log_level=0).start(barrier=True)
+        self.profile_start(train_step)
+        metric = {}
+        if not training_config.skip_train_step:
+            if self.config.training.use_grad_cache:
+                metrics_micro_batch = self.model_engine._embedding_forward_only(
+                    expanded_rbs, num_microbatches, train_step
+                )
+                if mpu.is_pipeline_last_stage():
+                    self.grad_cache_step(metrics_micro_batch, num_microbatches, expanded_rbs)
+            metric = self.model_engine.finetune_step(expanded_rbs, num_microbatches, train_step)
+        self.profile_end(train_step)
+        timers("train_step").stop()
+        self._training_plt_report(TrainingPltMixin.TrainState.TRAIN_STEP, dict(step=train_step))
+
+        if should_dump:
+            self._save_dumped_metrics(metric, expanded_rbs, train_step)
+
+        if clear_gathered_routing_info is not None:
+            clear_gathered_routing_info()
+
+        time_log_keys = ["train_step"]
+        if extra_time_metrics is None:
+            time_log_keys = ["get_batched_data", "train_step"]
+        metric = record_time_to_metrics(timers, time_log_keys, metric, reset=True)
+        if extra_time_metrics:
+            metric.update(extra_time_metrics)
+        if "time_perf/train_step_total" not in metric:
+            metric["time_perf/train_step_total"] = metric.get("time_perf/get_batched_data", 0.0)
+        metric["time_perf/train_step_total"] += metric["time_perf/train_step"]
+
+        mfu, avg_mfu = self.flops_counter_calc(
+            train_step,
+            expanded_rbs,
+            metric['time_perf/train_step'],
+            metric['finetune/seq_length'],
+            seqlen_sum=metric.get('finetune/dyn_cp_seqlen_sum'),
+            seqlen_sq_sum=metric.get('finetune/dyn_cp_seqlen_sq_sum'),
+        )
+        if mfu is not None:
+            metric['finetune/mfu'] = mfu
+            metric['finetune/avg_mfu'] = avg_mfu
+
+        if is_last_rank():
+            log_prefix = (
+                f"[{self.train_log_tag}] training train_step {train_step}/"
+                f"{training_config.total_training_step} epoch {epoch}"
+            )
+            TrainReporterSingleton.log_and_report(metric, train_step, log_prefix=log_prefix)
+        return metric
+
     async def init(self, config):
         await super().init(config)
         self.embedding_cache_backward_fn = None
-        if self.config.training.use_gbs_embedding_in_loss:
+        if self.config.training.use_grad_cache:
             py_path = self.config.training.gradcache_loss_py_path
             py_name = self.config.training.gradcache_loss_py_name
             assert py_path and py_name, (
-                "use_gbs_embedding_in_loss=True (GradCache 回放) 需要指定 "
+                "use_grad_cache=True (GradCache 回放) 需要指定 "
                 "gradcache_loss_py_path 和 gradcache_loss_py_name"
             )
             # GradCache 阶段2: 在 GBS 池(cache 叶子)上重算 loss 并 backward 的
@@ -60,7 +142,7 @@ class EmbeddingActor(FinetuneActor):
             # 回放路径尚未在 pp>1 下验证: 需要把 gather_embs/阶段2 gate 到
             # last stage、加 barrier、并显式传递 mbs index, 先防呆。
             # assert self.config.policy.dist_config.pipeline_model_parallel_size == 1, (
-            #     "use_gbs_embedding_in_loss=True (GradCache 回放) 目前仅支持 "
+            #     "use_grad_cache=True (GradCache 回放) 目前仅支持 "
             #     "pipeline_model_parallel_size == 1"
             # )
 
@@ -76,7 +158,9 @@ class EmbeddingActor(FinetuneActor):
         if self.config.policy.model_arch in (
             MODEL_ARCH.WEMM3_5_EMBEDDING,
             MODEL_ARCH.WEMM3_5_MOE_EMBEDDING,
-        ) and self.config.training.use_gbs_embedding_in_loss:
+            MODEL_ARCH.WEMM3_5_VIDEO_EMBEDDING,
+            MODEL_ARCH.WEMM3_5_MOE_VIDEO_EMBEDDING,
+        ) and self.config.training.use_grad_cache:
             train_step_per_epoch = len(self.train_dataloader)
         else:
             train_step_per_epoch = (len(self.train_dataloader) // gas)
@@ -104,45 +188,13 @@ class EmbeddingActor(FinetuneActor):
             train_state, data
         )
 
-    def extract_embs(self, model_output, batch):
-        hidden_states = model_output['hidden_states']
-        output_layer = model_output['output_layer']
-        if output_layer is not None and getattr(output_layer, "sequence_parallel", False):
-            hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=False
-            )
-        elif output_layer is not None:
-            tp_group = getattr(output_layer, "tp_group", None)
-            if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
-                assert not hidden_states.requires_grad, (
-                    "tensor_model_parallel_size > 1 且 sequence_parallel=False 时, "
-                    "hidden_states 在各 tp rank 间是复制而不是切分的, 但反向不会自动 "
-                    "all-reduce d_hidden, 直接用会导致梯度错误。请开启 sequence_parallel "
-                    "(通常和 tp>1 一起自动启用), 或改用其它方式处理。"
-                )
-
-        # [seqlen, batch, hidden] -> [batch, seqlen, hidden]
-        last_hidden_state = hidden_states.transpose(0, 1).contiguous()
-        if "eos_positions" in batch and batch["eos_positions"] is not None:
-            eos_positions = batch["eos_positions"].to(device=last_hidden_state.device)
-            assert last_hidden_state.size(0) == 1, (
-                f"packed THD expects batch dim 1, got {last_hidden_state.shape}"
-            )
-            return last_hidden_state[0, eos_positions]
-
-        attention_mask = batch["attention_mask"]  # (batch_size, seq_len)
-        eos_positions = attention_mask.sum(dim=1) - 1
-        batch_indices = torch.arange(last_hidden_state.size(0), device=last_hidden_state.device)
-        return last_hidden_state[batch_indices, eos_positions]
-
     def gather_embs(self, model_outputs):
         embs_l = []
         is_source_l = []
         for model_output in model_outputs:
-            batch = model_output['batch']
-            hidden_states = self.extract_embs(model_output, batch)
-            embs_l.append(hidden_states)
-            is_source_l.append(batch['is_source'])
+            batch = model_output
+            embs_l.append(batch.pop('embedding'))
+            is_source_l.append(batch.pop('is_source'))
         eos_embedding = torch.cat(embs_l, dim=0)
         is_source = torch.cat(is_source_l, dim=0)
 
@@ -203,7 +255,7 @@ class EmbeddingActor(FinetuneActor):
         for i in range(num_microbatches):
             eos_embeddings = cache[dp_rank, i * n:(i + 1) * n]
             is_source = all_is_source[dp_rank, i * n:(i + 1) * n]
-            batch = model_outputs[i].pop('batch')
+            batch = model_outputs[i]
             batch['rank_embeddings'] = eos_embeddings
             batch['rank_is_source'] = is_source
             batch['all_embeddings'] = flat_embeddings
@@ -280,7 +332,6 @@ class EmbeddingActor(FinetuneActor):
                 start_steps_per_epoch, training_config.train_step_per_epoch
             ):
                 await asyncio.sleep(0.01)
-                timers("train_step_total", log_level=0).start(barrier=True)
                 self.last_progress_time = time.time()
 
                 if eval_before_train_flag and self.config.training.total_eval_step > 0:
@@ -288,77 +339,16 @@ class EmbeddingActor(FinetuneActor):
                     eval_before_train_flag = False
 
                 timers("get_batched_data", log_level=0).start(barrier=True)
-                batched_data = []
-                while len(batched_data) < num_microbatches:
-                    new_data = next(self.train_iter)
-                    if isinstance(new_data, list):
-                        batched_data.extend(new_data)
-                    else:
-                        batched_data.append(new_data)
-                assert len(batched_data) == num_microbatches
-                expanded_rbs = self.process_batched_data(batched_data)
+                expanded_rbs = self._fetch_one_gbs(num_microbatches)
                 timers("get_batched_data").stop()
-                if self.config.debug.save_every_rollout_data or (
-                    self.config.debug.save_first_rollout_data and train_step == 0
-                ):
-                    save_data(
-                        expanded_rbs, "debug-tmp",
-                        f"{self.train_log_tag.lower()}_batches_{train_step}_{torch.distributed.get_rank()}.pt"
-                    )
-
-                should_dump = training_config.ppo_dump_metrics_interval > 0 and (
-                    train_step + 1
-                ) % training_config.ppo_dump_metrics_interval == 0
-                self.model_engine.should_dump_metrics = should_dump
-
-                timers("train_step", log_level=0).start(barrier=True)
-                self.profile_start(train_step)
-                if not training_config.skip_train_step:
-                    if self.config.training.use_gbs_embedding_in_loss:
-                        metrics_micro_batch = self.model_engine._embedding_forward_only(
-                            expanded_rbs, num_microbatches, train_step
-                        )
-                        # GradCache 阶段2: GBS 池当叶子 backward, 产出阶段3
-                        # 回放所需的 embedding 梯度 / logit_scale 梯度 / 指标。
-                        if mpu.is_pipeline_last_stage():
-                            self.grad_cache_step(
-                                metrics_micro_batch, num_microbatches, expanded_rbs
-                            )
-
-                    metric = self.model_engine.finetune_step(
-                        expanded_rbs, num_microbatches, train_step
-                    )
-                self.profile_end(train_step)
-                timers("train_step").stop()
-                self._training_plt_report(
-                    TrainingPltMixin.TrainState.TRAIN_STEP, dict(step=train_step)
+                get_batched_data_time = timers("get_batched_data", log_level=0).elapsed(reset=True)
+                extra_time_metrics = {
+                    "time_perf/get_batched_data": get_batched_data_time,
+                    "time_perf/train_step_total": get_batched_data_time,
+                }
+                metric = self.train_one_step(
+                    epoch, train_step, expanded_rbs, extra_time_metrics=extra_time_metrics
                 )
-
-                if should_dump:
-                    self._save_dumped_metrics(metric, expanded_rbs, train_step)
-
-                if clear_gathered_routing_info is not None:
-                    clear_gathered_routing_info()
-
-                timers("train_step_total").stop()
-                time_log_keys = ["get_batched_data", "train_step", "train_step_total"]
-                metric = record_time_to_metrics(timers, time_log_keys, metric, reset=True)
-
-                mfu, avg_mfu = self.flops_counter_calc(
-                    train_step,
-                    expanded_rbs,
-                    metric['time_perf/train_step'],
-                    metric['finetune/seq_length'],
-                    seqlen_sum=metric.get('finetune/dyn_cp_seqlen_sum'),
-                    seqlen_sq_sum=metric.get('finetune/dyn_cp_seqlen_sq_sum'),
-                )
-                if mfu is not None:
-                    metric['finetune/mfu'] = mfu
-                    metric['finetune/avg_mfu'] = avg_mfu
-
-                if is_last_rank():
-                    log_prefix = f"[{self.train_log_tag}] training train_step {train_step}/{training_config.total_training_step} epoch {epoch}"
-                    TrainReporterSingleton.log_and_report(metric, train_step, log_prefix=log_prefix)
                 if self.config.debug.trainer_return_ppo_step_metrics:
                     collected_metrics.append(metric)
                 cpu_barrier()

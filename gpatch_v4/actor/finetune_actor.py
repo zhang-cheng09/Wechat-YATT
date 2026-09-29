@@ -52,6 +52,7 @@ from gpatch_v4.training_backend import (
     register_custom_loss_fn,
 )
 from gpatch_v4.training_backend.loss import (
+    is_loss_registered,
     register_custom_loss_fn as register_backend_custom_loss_fn,
 )
 from gpatch_v4.utils import (
@@ -203,16 +204,34 @@ class FinetuneActor(
         if self.config.checkpoint.convert_mcore_to_hf_offline:
             self.config.checkpoint.no_load_optim = True
 
-        if self.config.training.loss_func not in BUILDIN_LOSS_FUNC:
-            assert self.config.training.loss_func == "custom", "Custom loss function must be provided"
-            #TODO: loss refact ing
-            for _backend in ("mcore", "fsdp2"):
-                register_backend_custom_loss_fn(
-                    backend=_backend,
-                    loss_name=self.config.training.loss_func,
-                    py_path=self.config.training.loss_func_py_path,
-                    fn_name=self.config.training.loss_func_py_name,
+        # Keep custom-loss registration on the same table runtime resolves.
+        use_new_finetune_loss = (
+            self.config.training.training_backend == "fsdp2"
+            or not self.config.training.use_legacy_loss
+        )
+        if use_new_finetune_loss:
+            if not is_loss_registered(
+                self.config.training.training_backend, self.config.training.loss_func
+            ):
+                assert self.config.training.loss_func == "custom", (
+                    "Custom loss function must be provided"
                 )
+                for _backend in ("mcore", "fsdp2"):
+                    register_backend_custom_loss_fn(
+                        backend=_backend,
+                        loss_name=self.config.training.loss_func,
+                        py_path=self.config.training.loss_func_py_path,
+                        fn_name=self.config.training.loss_func_py_name,
+                    )
+        elif self.config.training.loss_func not in BUILDIN_LOSS_FUNC:
+            assert self.config.training.loss_func == "custom", (
+                "Custom loss function must be provided"
+            )
+            register_custom_loss_fn(
+                self.config.training.loss_func,
+                self.config.training.loss_func_py_path,
+                self.config.training.loss_func_py_name,
+            )
 
     def _finetune_data_parallel_meta(self) -> Tuple[int, int]:
         """Return (dp_rank, dp_size) used for SFT dataloader / GAS.
@@ -355,8 +374,15 @@ class FinetuneActor(
             training_config.manual_gc and (train_step + 1) % training_config.manual_gc_interval == 0
         ):
             gc.collect()
+            empty_host = getattr(torch._C, "_host_emptyCache", None)
+            if empty_host is None:
+                return
+            try:
+                empty_host()
+            except Exception:
+                pass
 
-    def _eval_loop(self, train_step):
+    def _eval_loop(self, train_step, commit=False):
         self._training_plt_report(TrainingPltMixin.TrainState.EVAL_START, {})
         timers = TimerSingleton.get_timer()
         timers("eval_loop", log_level=0).start(barrier=True)
@@ -386,7 +412,9 @@ class FinetuneActor(
         report_metric = record_time_to_metrics(timers, time_log_keys, report_metric, reset=True)
         if is_last_rank():
             log_prefix = f"[{self.train_log_tag}]eval "
-            TrainReporterSingleton.log_and_report(report_metric, train_step, log_prefix=log_prefix)
+            TrainReporterSingleton.log_and_report(
+                report_metric, train_step, log_prefix=log_prefix, commit=commit
+            )
         cpu_barrier()
         self._training_plt_report(TrainingPltMixin.TrainState.EVAL_END, {})
 
@@ -430,8 +458,7 @@ class FinetuneActor(
                 timers("get_batched_data", log_level=0).start(barrier=True)
                 batched_data = []
                 for _ in range(num_microbatches):
-                    new_data = next(self.train_iter)
-                    batched_data.append(new_data)
+                    batched_data.append(next(self.train_iter))
                 expanded_rbs = self.process_batched_data(batched_data)
                 timers("get_batched_data").stop()
 
@@ -473,6 +500,7 @@ class FinetuneActor(
                 if clear_gathered_routing_info is not None:
                     clear_gathered_routing_info()
 
+                del batched_data
                 self._maybe_manual_gc(train_step)
                 timers("train_step_total").stop()
                 time_log_keys = ["get_batched_data", "train_step", "train_step_total"]
@@ -497,12 +525,15 @@ class FinetuneActor(
                     collected_metrics.append(metric)
                 cpu_barrier()
 
-                if self.config.training.total_eval_step is not None and self.config.training.total_eval_step > 0 and (
-                    train_step + 1
-                ) % training_config.eval_interval == 0:
+                train_step += 1
+
+                if (
+                    training_config.total_eval_step is not None
+                    and training_config.total_eval_step > 0
+                    and train_step % training_config.eval_interval == 0
+                ):
                     self._eval_loop(train_step)
 
-                train_step += 1
                 if train_step % training_config.save_interval == 0 and not self.config.debug.disable_save_checkpoint:
                     self.model_engine.save_checkpoint(train_step, dataloader=self.train_dataloader)
 

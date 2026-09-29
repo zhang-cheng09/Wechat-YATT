@@ -1,13 +1,14 @@
 from gpatch_v4.configs.config import (
     AgenticRlConfig,
     DpoConfig,
+    EmbeddingOffPolicyDistillConfig,
     FinetuneConfig,
     OffPolicyDistillConfig,
     OnPolicyDistillConfig,
     RewardConfig,
     RlConfig,
 )
-from gpatch_v4.core.constants import MODEL_ARCH
+from gpatch_v4.core.constants import MODEL_ARCH, PrepareDataRole
 
 try:
     from gpatch_v4.extended_model.deepseek_v4 import (
@@ -44,6 +45,11 @@ try:
 except Exception:
     Qwen4ExpPostInitModel = None
     Qwen4ExpPrepareDataForwardLLM = None
+
+try:
+    from gpatch_v4.extended_model.qwen4_exp_vl import Qwen4ExpPrepareDataForwardVL
+except Exception:
+    Qwen4ExpPrepareDataForwardVL = None
 from gpatch_v4.extended_model.rollout_attr_hook import ApplySamplingRolloutAttrLLM
 from gpatch_v4.extended_model.wemm3_embedding import Wemm3EmbeddingPrepareDataForward
 from gpatch_v4.extended_model.wemm_video import WemmVideoPrepareDataForward
@@ -86,6 +92,7 @@ DEFAULT = "default"
 
 REGISTER_APPLY_SAMPLING_ROLLOUT_ATTR = {
     DEFAULT: ApplySamplingRolloutAttrLLM,
+    MODEL_ARCH.QWEN4_EXP: ApplySamplingRolloutAttrQwen3_5,
     MODEL_ARCH.QWEN3_VL: ApplySamplingRolloutAttrMultiModal,
     MODEL_ARCH.QWEN3_VL_MOE: ApplySamplingRolloutAttrMultiModal,
     MODEL_ARCH.QWEN3_5: ApplySamplingRolloutAttrQwen3_5,
@@ -98,6 +105,7 @@ REGISTER_APPLY_SAMPLING_ROLLOUT_ATTR = {
 
 REGISTER_SAMPLER_GENERATE_FUNC = {
     DEFAULT: SamplerGenerateFuncLLM,
+    MODEL_ARCH.QWEN4_EXP: SamplerGenerateFuncMultiModal,
     MODEL_ARCH.QWEN3_VL: SamplerGenerateFuncMultiModal,
     MODEL_ARCH.QWEN3_VL_MOE: SamplerGenerateFuncMultiModal,
     MODEL_ARCH.QWEN3_5: SamplerGenerateFuncMultiModal,
@@ -138,6 +146,11 @@ REGISTER_RL_PREPARE_DATA_FORWARD = {
         WemmVideoPrepareDataForward,
     MODEL_ARCH.GEMMA4:
         Gemma4PrepareDataForward,
+    **(
+        {
+            MODEL_ARCH.QWEN4_EXP: Qwen4ExpPrepareDataForwardVL
+        } if Qwen4ExpPrepareDataForwardVL else {}
+    ),
 }
 
 REGISTER_SFT_PREPARE_DATA_FORWARD = {
@@ -177,10 +190,14 @@ REGISTER_SFT_PREPARE_DATA_FORWARD = {
         Wemm3EmbeddingPrepareDataForward,
     MODEL_ARCH.WEMM3_5_MOE_EMBEDDING:
         Wemm3EmbeddingPrepareDataForward,
+    MODEL_ARCH.WEMM3_5_VIDEO_EMBEDDING:
+        Wemm3EmbeddingPrepareDataForward,
+    MODEL_ARCH.WEMM3_5_MOE_VIDEO_EMBEDDING:
+        Wemm3EmbeddingPrepareDataForward,
     **(
         {
-            MODEL_ARCH.QWEN4_EXP: Qwen4ExpPrepareDataForwardLLM
-        } if Qwen4ExpPrepareDataForwardLLM else {}
+            MODEL_ARCH.QWEN4_EXP: Qwen4ExpPrepareDataForwardVL
+        } if Qwen4ExpPrepareDataForwardVL else {}
     ),
 }
 
@@ -312,12 +329,20 @@ class SamplerGenerateFuncFactory:
 class PrepareDataForwardFactory:
     """Factory for data-preparation-and-forward handlers."""
     @staticmethod
-    def get_prepare_data_fwd(config, model_arch=None):
+    def get_prepare_data_fwd(
+        config, model_arch=None, role: PrepareDataRole = PrepareDataRole.POLICY
+    ):
         """Return the appropriate data preparation handler.
 
         Parameters
         ----------
         config : object
+        model_arch : optional
+            Override model architecture. Default: teacher or policy arch
+            depending on ``role``.
+        role : PrepareDataRole, optional
+            Selects ``config.teacher`` or ``config.policy`` as
+            ``role_config``. Default: ``PrepareDataRole.POLICY``.
 
         Returns
         -------
@@ -326,6 +351,8 @@ class PrepareDataForwardFactory:
         register_clss = None
         if isinstance(config, (RlConfig, OnPolicyDistillConfig)):
             register_clss = REGISTER_RL_PREPARE_DATA_FORWARD
+        elif isinstance(config, EmbeddingOffPolicyDistillConfig):
+            register_clss = REGISTER_SFT_PREPARE_DATA_FORWARD
         elif isinstance(config, OffPolicyDistillConfig):
             register_clss = REGISTER_OFF_POLICY_DISTILL_PREPARE_DATA_FORWARD
         elif isinstance(config, FinetuneConfig):
@@ -339,11 +366,14 @@ class PrepareDataForwardFactory:
             raise ValueError(f"Unknown config type: {type(config)}")
 
         if model_arch is None:
-            model_arch = config.policy.model_arch
+            model_arch = (
+                config.teacher.model_arch
+                if role == PrepareDataRole.TEACHER else config.policy.model_arch
+            )
         if model_arch in register_clss:
-            return register_clss[model_arch](config)
+            return register_clss[model_arch](config, role=role)
 
-        return register_clss[DEFAULT](config)
+        return register_clss[DEFAULT](config, role=role)
 
 
 class PostInitModelFactory:

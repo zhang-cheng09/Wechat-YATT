@@ -28,6 +28,14 @@ class Qwen3VlRopeIndexHelper(BaseRopeIndexHelper):
         bind_vision_position_ids_if_available(self, Qwen3VLModel)
 
 
+class Qwen4ExpRopeIndexHelper(BaseRopeIndexHelper):
+    def __init__(self, config):
+        from transformers import Qwen4ExpModel
+
+        super().__init__(config, Qwen4ExpModel)
+        bind_vision_position_ids_if_available(self, Qwen4ExpModel)
+
+
 class Qwen3_5RopeIndexHelper(BaseRopeIndexHelper):
     def __init__(self, config):
         from transformers import Qwen3_5Model
@@ -72,9 +80,17 @@ def get_index_helper(arch, config_path):
 register_index_helper(MODEL_ARCH.GLM4V, Glm4VRopeIndexHelper)
 register_index_helper(MODEL_ARCH.QWEN3_VL, Qwen3VlRopeIndexHelper)
 register_index_helper(MODEL_ARCH.QWEN3_VL_MOE, Qwen3VlRopeIndexHelper)
+register_index_helper(MODEL_ARCH.QWEN4_EXP, Qwen4ExpRopeIndexHelper)
 register_index_helper(MODEL_ARCH.QWEN3_5, Qwen3_5RopeIndexHelper)
 register_index_helper(MODEL_ARCH.QWEN3_5_MOE, Qwen3_5_Moe_RopeIndexHelper)
 register_index_helper(MODEL_ARCH.QWEN3_OMNI_MOE, Qwen3_Omni_Moe_RopeIndexHelper)
 register_index_helper(MODEL_ARCH.WEMM3_EMBEDDING, Qwen3VlRopeIndexHelper)
 register_index_helper(MODEL_ARCH.WEMM3_5_EMBEDDING, Qwen3_5RopeIndexHelper)
 register_index_helper(MODEL_ARCH.WEMM3_5_MOE_EMBEDDING, Qwen3_5_Moe_RopeIndexHelper)
+# WeMM3.5-Video（omni）embedding 与文本 embedding 用同一套文本/视觉 rope index：
+# embedding 训练走 GCorePairWeMMVideoEmbCollator，position_ids 由 omni processor 算好并透传，
+# 不经由此 helper；这里注册只是为了 qwenvl_dataset_map.py 的 DataCollatorForQwenVl /
+# 数据集路径不会因为 get_index_helper() 的 `assert arch in ROPE_INDEX_HELPERS` 直接报错。
+# 注意：该 helper 不感知音频段（与模型 forward 内部 position_ids=None 时的回退行为一致）。
+register_index_helper(MODEL_ARCH.WEMM3_5_VIDEO_EMBEDDING, Qwen3_5RopeIndexHelper)
+register_index_helper(MODEL_ARCH.WEMM3_5_MOE_VIDEO_EMBEDDING, Qwen3_5_Moe_RopeIndexHelper)

@@ -150,6 +150,26 @@ def test_packed_layout_keeps_documents_contiguous_and_only_pads_the_tail() -> No
     assert packed_labels[0, 12:].tolist() == [-100] * 4
 
 
+def test_cp_context_caches_device_and_host_boundaries() -> None:
+    boundaries = torch.tensor([0, 5, 13])
+    context = Qwen4ExpCPContext(
+        group=None,
+        rank=0,
+        size=1,
+        global_input_ids=(torch.arange(16) + 2).unsqueeze(0),
+        global_padding_mask=(torch.arange(16) >= 13).unsqueeze(0),
+        local_sequence_start=0,
+        local_sequence_length=16,
+        global_cu_seqlens=boundaries,
+    )
+
+    cached_segments = context.global_segment_boundaries
+    assert context.global_segment_boundaries is cached_segments
+    assert cached_segments.tolist() == [0, 5, 13, 16]
+    assert context.global_document_boundaries == (0, 5, 13)
+    assert context.global_segment_boundary_values == (0, 5, 13, 16)
+
+
 def _slicing_ple_worker(rank: int, world_size: int, init_file: str) -> None:
     _init_pg(rank, world_size, init_file)
     try:

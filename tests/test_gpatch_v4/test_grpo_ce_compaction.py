@@ -15,6 +15,7 @@ from gpatch_v4.configs.policy_config import PolicyConfig
 from gpatch_v4.configs.ppo_config import PpoConfig
 from gpatch_v4.configs.training_config import RLTrainingConfig, T2iRlTrainingConfig
 from gpatch_v4.core.constants import MODEL_ARCH
+from gpatch_v4.training_backend.loss.ppo_loss import PolicyLossInput, grpo_loss
 from gpatch_v4.utils.dynamic_cp_utils import build_grpo_compact_ce_mask_dyn_cp
 from gpatch_v4.utils.training_utils import build_grpo_compact_ce_mask
 
@@ -177,6 +178,155 @@ def test_grpo_compaction_matches_dense_outputs_and_gradients(
     assert dense[5][0].shape[0] == sequence * batch
     assert [value.shape[0]
             for value in compact[5]] == ([] if expected_rows == 0 else [expected_rows])
+
+
+def test_mcore_tilelang_grpo_matches_dense_loss_and_gradients() -> None:
+    pytest.importorskip("tilelang")
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    batch, sequence, hidden_size, vocab_size = 2, 16, 128, 256
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    hidden_data = torch.randn(
+        sequence,
+        batch,
+        hidden_size,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    weight_data = torch.randn(
+        vocab_size,
+        hidden_size,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    target = torch.randint(
+        vocab_size,
+        (batch, sequence),
+        generator=generator,
+        device="cuda",
+    )
+    mask = torch.ones(
+        batch,
+        sequence - 1,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    mask[:, 1::4] = 0
+    advantages = torch.linspace(
+        -0.5,
+        0.5,
+        mask.numel(),
+        device="cuda",
+    ).view_as(mask)
+    config = SimpleNamespace(
+        ppo=PpoConfig(
+            loss_func="grpo",
+            ppo_entropy_bonus=0.01,
+            grpo_kl_loss_beta=0.01,
+            ppo_ratio_eps=0.2,
+            ppo_dual_clip_ratio_c=None,
+        )
+    )
+
+    def dense_outputs(
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = F.linear(hidden.float(), weight.float())
+        shifted_target = target.roll(shifts=-1, dims=-1).transpose(0, 1)
+        all_logprobs = F.log_softmax(logits, dim=-1)
+        curr_logprobs = all_logprobs.gather(
+            -1,
+            shifted_target.unsqueeze(-1),
+        ).squeeze(-1).transpose(0, 1)[:, :-1]
+        entropy = -(all_logprobs.exp() * all_logprobs).sum(dim=-1)
+        entropy = entropy.transpose(0, 1)[:, :-1]
+        return curr_logprobs.contiguous(), entropy.contiguous()
+
+    with torch.no_grad():
+        baseline_logprobs, _ = dense_outputs(hidden_data, weight_data)
+    prev_logprobs = baseline_logprobs - 0.05
+    ref_logprobs = baseline_logprobs - 0.1
+
+    def policy_loss(
+        curr_logprobs: torch.Tensor,
+        entropy: torch.Tensor,
+    ) -> torch.Tensor:
+        loss_input = PolicyLossInput(
+            advantages=advantages,
+            prev_log_probs=prev_logprobs,
+            ref_log_probs=ref_logprobs,
+            curr_log_probs=curr_logprobs,
+            response_mask=mask,
+            scaled_entropy=(entropy * mask).sum() / mask.sum(),
+            rollout_log_probs=prev_logprobs,
+            per_token_entropy=entropy,
+            calculate_per_token_loss=True,
+            defer_scalar_metric_reduction=True,
+        )
+        loss_sum, loss_count, _ = grpo_loss(config, loss_input)
+        return loss_sum / loss_count
+
+    def run_dense() -> tuple[torch.Tensor, ...]:
+        hidden = hidden_data.detach().clone().requires_grad_(True)
+        weight = weight_data.detach().clone().requires_grad_(True)
+        curr_logprobs, entropy = dense_outputs(hidden, weight)
+        loss = policy_loss(curr_logprobs, entropy)
+        loss.backward()
+        return curr_logprobs, entropy, loss, hidden.grad, weight.grad
+
+    def run_tilelang(compaction: bool) -> tuple[torch.Tensor, ...]:
+        hidden = hidden_data.detach().clone().requires_grad_(True)
+        weight = weight_data.detach().clone().requires_grad_(True)
+        with (
+            patch.object(training_utils.mpu, "get_context_parallel_rank", return_value=0),
+            patch.object(training_utils.mpu, "get_context_parallel_world_size", return_value=1),
+        ):
+            curr_logprobs, _, entropy = training_utils.logprobs_from_linear_ce(
+                linear_ce_backend="tilelang",
+                linear_ce_output=_linear_ce_input(hidden, weight),
+                target=target,
+                mask=mask,
+                return_entropy=True,
+                token_compaction=compaction,
+            )
+        loss = policy_loss(curr_logprobs, entropy)
+        loss.backward()
+        return curr_logprobs, entropy, loss, hidden.grad, weight.grad
+
+    def relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+        return (
+            (actual.float() - expected.float()).norm()
+            / (expected.float().norm() + 1e-8)
+        ).item()
+
+    dense = run_dense()
+    active = mask.bool()
+    for compaction in (False, True):
+        fused = run_tilelang(compaction)
+        torch.testing.assert_close(
+            fused[0][active].float(),
+            dense[0][active].float(),
+            atol=5e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            fused[1][active].float(),
+            dense[1][active].float(),
+            atol=5e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            fused[2].float(),
+            dense[2].float(),
+            atol=5e-2,
+            rtol=1e-2,
+        )
+        assert relative_error(fused[3], dense[3]) < 5e-3
+        assert relative_error(fused[4], dense[4]) < 5e-3
 
 
 def test_grpo_compaction_supports_pre_shifted_dynamic_cp_layout() -> None:
@@ -627,7 +777,7 @@ def test_grpo_compaction_rejects_unsupported_configuration() -> None:
     training = RLTrainingConfig(ce_compaction=True)
     assert not training.use_linear_ce
     assert training.return_hidden_states_for_ce
-    with pytest.raises(AssertionError, match="MCore GRPO only"):
+    with pytest.raises(AssertionError, match="requires use_linear_ce=True"):
         RLTrainingConfig(
             training_backend="fsdp2",
             ce_compaction=True,
@@ -638,7 +788,7 @@ def test_grpo_compaction_rejects_unsupported_configuration() -> None:
             use_linear_ce=True,
             ce_compaction=True,
         )
-    with pytest.raises(AssertionError, match="GRPO loss only"):
+    with pytest.raises(AssertionError, match="GRPO and GSPO losses only"):
         RlConfig(
             training=RLTrainingConfig(
                 use_linear_ce=True,
@@ -664,7 +814,7 @@ def test_grpo_compaction_rejects_other_training_flows() -> None:
     )
     with pytest.raises(AssertionError, match="not on-policy distillation"):
         OnPolicyDistillConfig(training=training)
-    with pytest.raises(AssertionError, match="text GRPO only"):
+    with pytest.raises(AssertionError, match="text GRPO/GSPO only"):
         T2iRlTrainingConfig(
             use_linear_ce=True,
             ce_compaction=True,

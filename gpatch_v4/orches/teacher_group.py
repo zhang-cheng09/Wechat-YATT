@@ -6,8 +6,12 @@ import torch
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from gpatch_v4.actor import DistillTeacherActor
-from gpatch_v4.configs.config import OffPolicyDistillConfig, OnPolicyDistillConfig
+from gpatch_v4.actor import DistillTeacherActor, EmbeddingDistillTeacherActor
+from gpatch_v4.configs.config import (
+    EmbeddingOffPolicyDistillConfig,
+    OffPolicyDistillConfig,
+    OnPolicyDistillConfig,
+)
 from gpatch_v4.core.constants import MODEL_ARCH
 from gpatch_v4.orches.utils import build_actor_env_vars
 from gpatch_v4.utils import log, logging_rank0
@@ -54,7 +58,9 @@ class RayTeacherGroup:
         pg, reordered_bundle_indices = pg
 
         env_vars = build_actor_env_vars({"NCCL_CUMEM_ENABLE": "0"})
-        if isinstance(self.config, (OnPolicyDistillConfig, OffPolicyDistillConfig)):
+        if isinstance(self.config, EmbeddingOffPolicyDistillConfig):
+            actor_impl = EmbeddingDistillTeacherActor
+        elif isinstance(self.config, (OnPolicyDistillConfig, OffPolicyDistillConfig)):
             actor_impl = DistillTeacherActor
         else:
             raise NotImplementedError(f"unknown config {type(self.config)}")

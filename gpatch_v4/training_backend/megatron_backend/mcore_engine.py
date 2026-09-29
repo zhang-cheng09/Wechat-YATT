@@ -38,7 +38,6 @@ from gpatch_v4.training_backend.megatron_backend.mixin import (
     MetricMixin,
 )
 from gpatch_v4.training_backend.megatron_backend.optimizer import (
-    get_megatron_last_lr,
     get_optimizer_and_scheduler,
 )
 
@@ -66,8 +65,13 @@ from gpatch_v4.utils.common_utils import (
     logging_rank0,
     profile_memory_and_time,
 )
+from gpatch_v4.utils.fwd_only_exec import split_microbatches_per_execution
 from gpatch_v4.utils.communication_utils import BroadcastUtils
-from gpatch_v4.utils.dynamic_cp_utils import reverse_reroute_logprobs
+from gpatch_v4.utils.dynamic_cp_utils import (
+    reverse_reroute_hidden_states,
+    reverse_reroute_logprobs,
+)
+from gpatch_v4.utils.param_lr import get_megatron_param_group_lrs, record_named_lrs
 from gpatch_v4.utils.training_utils import (
     from_parallel_logits_to_logprobs,
     get_dump_moe_metrics,
@@ -328,8 +332,12 @@ class McoreEngine(
     def step_and_get_lr(self):
         if not self.config.optimizer.update_lr_by_train_step:
             self.optimizer_scheduler.step(1)
-        lr = get_megatron_last_lr(self.optimizer)
-        return lr
+        return self.get_param_group_lrs()
+
+    def get_param_group_lrs(self):
+        if self.optimizer is None:
+            return {}
+        return get_megatron_param_group_lrs(self.optimizer)
 
     def maybe_post_clip_grad_norm(self, update_successful: bool) -> Optional[float]:
         """Return post-clip total L2 grad norm, or None if disabled/unsupported.
@@ -652,12 +660,17 @@ class McoreEngine(
         num_micro_batches: int,
         seqlen: int,
         batch_log_str: str = "",
+        forward_step_func=None,
     ) -> Dict[int, torch.Tensor]:
         """Forward packed microbatches through forward_backward_func and collect
         per-sample logprobs keyed by global ID.
 
         Uses the same Megatron pipeline scheduler as the non-dynamic-CP path,
         giving PP support and progress logging for free.
+
+        Respects ``training.num_batches_per_execution`` the same way static
+        teacher hidden/logits does: each ``forward_backward_func`` call runs at
+        most that many packed microbatches so PP=1 can cap in-flight activations.
         """
         self.batch_iters = 0
         self.total_iters = num_micro_batches
@@ -665,34 +678,49 @@ class McoreEngine(
 
         batch_iter = iter(packed_batches[:num_micro_batches])
 
-        fwd_bwd_function = get_forward_backward_func()
-        fwd_results = fwd_bwd_function(
-            forward_step_func=self.get_logprob_output_only_func_dynamic_cp(seqlen),
-            data_iterator=batch_iter,
-            model=model,
-            num_microbatches=num_micro_batches,
-            forward_only=True,
-            seq_length=seqlen,
-            micro_batch_size=1,
-            collect_non_loss_data=True,
-            decoder_seq_length=seqlen,
+        if forward_step_func is None:
+            forward_step_func = self.get_logprob_output_only_func_dynamic_cp(seqlen)
+
+        exec_chunks = split_microbatches_per_execution(
+            num_micro_batches,
+            self.config.training.num_batches_per_execution,
         )
 
-        # Collect per-sample logprobs keyed by global ID.
-        # fwd_results is a list of per-microbatch results (List[torch.Tensor] each).
-        # Only populated on the last PP stage.
+        fwd_bwd_function = get_forward_backward_func()
         per_sample_logprobs: Dict[int, torch.Tensor] = {}
-        if mpu.is_pipeline_last_stage():
-            for mb_idx, sample_logprobs_list in enumerate(fwd_results):
-                sample_ids = packed_batches[mb_idx]["_dyn_cp_sample_ids"]
-                if isinstance(sample_ids, torch.Tensor) and not sample_ids.is_cuda:
-                    sample_ids = sample_ids.cuda(non_blocking=True)
-                assert len(sample_logprobs_list) == sample_ids.shape[0], (
-                    f"Expected {sample_ids.shape[0]} samples, got {len(sample_logprobs_list)}"
+        mb_offset = 0
+        for act_gas in exec_chunks:
+            fwd_results = fwd_bwd_function(
+                forward_step_func=forward_step_func,
+                data_iterator=batch_iter,
+                model=model,
+                num_microbatches=act_gas,
+                forward_only=True,
+                seq_length=seqlen,
+                micro_batch_size=1,
+                collect_non_loss_data=True,
+                decoder_seq_length=seqlen,
+            )
+
+            # Collect per-sample outputs keyed by global ID.
+            # fwd_results is a list of per-microbatch results (List[torch.Tensor] each).
+            # Only populated on the last PP stage.
+            if mpu.is_pipeline_last_stage():
+                assert len(fwd_results) == act_gas, (
+                    f"expected {act_gas} packed microbatches, got {len(fwd_results)}"
                 )
-                for idx, lp in enumerate(sample_logprobs_list):
-                    gid = int(sample_ids[idx].item())
-                    per_sample_logprobs[gid] = lp
+                for local_idx, sample_logprobs_list in enumerate(fwd_results):
+                    mb_idx = mb_offset + local_idx
+                    sample_ids = packed_batches[mb_idx]["_dyn_cp_sample_ids"]
+                    if isinstance(sample_ids, torch.Tensor) and not sample_ids.is_cuda:
+                        sample_ids = sample_ids.cuda(non_blocking=True)
+                    assert len(sample_logprobs_list) == sample_ids.shape[0], (
+                        f"Expected {sample_ids.shape[0]} samples, got {len(sample_logprobs_list)}"
+                    )
+                    for idx, lp in enumerate(sample_logprobs_list):
+                        gid = int(sample_ids[idx].item())
+                        per_sample_logprobs[gid] = lp
+            mb_offset += act_gas
 
         return per_sample_logprobs
 
@@ -877,7 +905,7 @@ class McoreEngine(
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
         metric["finetune/grad_norm"] = grad_norm
-        metric["finetune/lr"] = lr
+        record_named_lrs(metric, "finetune", lr)
         metric["finetune/num_zeros_in_grad"] = num_zeros_in_grad
         if post_clip_grad_norm is not None:
             # Mirror grad_norm's reduce_max for ranks-without-trainable-params consistency.
@@ -933,7 +961,7 @@ class McoreEngine(
         metric["pretrain/num_label_tokens_sum"] = num_label_tokens
         metric["pretrain/num_pad_tokens_sum"] = num_pad_tokens
         metric["pretrain/grad_norm"] = grad_norm
-        metric["pretrain/lr"] = lr
+        record_named_lrs(metric, "pretrain", lr)
         metric["pretrain/num_zeros_in_grad"] = num_zeros_in_grad
         if post_clip_grad_norm is not None:
             metric["pretrain/post_clip_grad_norm"] = post_clip_grad_norm
@@ -978,6 +1006,94 @@ class McoreEngine(
         self, rollout_batches: List[Dict[str, torch.Tensor]]
     ) -> tuple[None, List[Optional[torch.Tensor]]]:
         return self._compute_logits_or_hidden_states(rollout_batches, return_logits=False)
+
+    def compute_hidden_states_dynamic_cp(
+        self,
+        samples: List[Dict[str, Any]],
+    ) -> tuple[None, List[Optional[torch.Tensor]]]:
+        """Compute per-sample teacher hidden states with SFT dynamic CP packing.
+
+        Returns full-sequence ``[orig_len, H]`` tensors in the original sample
+        order of ``samples`` (after reverse reroute). TQ protocol is unchanged.
+        """
+        assert self.policy_config.without_ref
+        assert self.training_config.use_linear_ce
+        num_local_samples = len(samples)
+        packed_batches, num_micro_batches, _, _, routing_info = (
+            self.prepare_data.sft_reroute_data_for_dynamic_cp(
+                samples,
+                self.tokenizer.pad_token_id,
+                vocab_size=self.vocab_size,
+                pad_with_random_token=self.config.training.moe_pad_with_random_tokens,
+                max_seqlen_per_dp_cp_rank=self.dist_config.max_seqlen_per_dp_cp_rank_fwd_only,
+                need_routing_info=True,
+            )
+        )
+        assert routing_info is not None, (
+            "compute_hidden_states_dynamic_cp requires default-scheduler routing_info"
+        )
+
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        seqlen = self.dist_config.max_seqlen_per_dp_cp_rank_fwd_only
+        self.set_model_eval()
+        per_sample = self._forward_packed_batches_unified(
+            self.model,
+            packed_batches,
+            num_micro_batches,
+            seqlen,
+            batch_log_str="get_teacher_hidden_states (dyn_cp) microbatch ",
+            forward_step_func=self.get_hidden_state_only_func_dynamic_cp(seqlen),
+        )
+
+        if mpu.is_pipeline_last_stage():
+            local_hs = 0
+            dtype_code = 0
+            if per_sample:
+                hidden = next(iter(per_sample.values()))
+                assert hidden.ndim == 2, (
+                    f"teacher hidden must be [S, H], got {tuple(hidden.shape)}"
+                )
+                local_hs = int(hidden.shape[1])
+                dtype_code = {
+                    torch.bfloat16: 1,
+                    torch.float16: 2,
+                    torch.float32: 3,
+                }.get(hidden.dtype, 3)
+            meta = torch.tensor(
+                [local_hs, dtype_code],
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(
+                meta, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group
+            )
+            hidden_size = max(int(meta[0].item()), 1)
+            transport_dtype = {
+                1: torch.bfloat16,
+                2: torch.float16,
+                3: torch.float32,
+            }.get(int(meta[1].item()), torch.bfloat16)
+
+            restored = reverse_reroute_hidden_states(
+                per_sample,
+                routing_info["global_ids_this_rank"],
+                routing_info["global_id_logprob_lens"],
+                routing_info["gid_to_compute_rank"],
+                routing_info["gid_to_orig_dcp_rank"],
+                dp_cp_group,
+                hidden_size=hidden_size,
+                transport_dtype=transport_dtype,
+            )
+            output = []
+            for i in range(num_local_samples):
+                gid = int(routing_info["global_ids_this_rank"][i])
+                output.append(restored[gid].to(dtype=transport_dtype).cpu())
+            clear_memory()
+        else:
+            output = []
+
+        output = BroadcastUtils.broadcast_object_within_pp(output)
+        return None, output
 
     def _compute_logits_or_hidden_states(
         self,

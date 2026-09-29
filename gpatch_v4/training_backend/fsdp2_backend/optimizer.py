@@ -1,7 +1,8 @@
 import torch
+from torch.distributed.tensor import DTensor
 
-from gpatch_v4.training_backend.fsdp2_backend.lr_scheduler import get_lr_scheduler
 from gpatch_v4.core.muon_optimizer import Muon
+from gpatch_v4.training_backend.fsdp2_backend.lr_scheduler import get_lr_scheduler
 
 _QWEN4_EXP_ENGRAM_LR_MULTIPLIER = 5.0
 
@@ -10,21 +11,51 @@ def _qwen4_exp_param_groups(model: torch.nn.Module) -> list:
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     engram_param_ids = model._engram_param_ids
     engram_params = [param for param in trainable_params if id(param) in engram_param_ids]
-    if not engram_params:
+    vision_params = [param for param in model.model.visual.parameters() if param.requires_grad]
+    if not engram_params and not vision_params:
         return trainable_params
 
-    base_params = [param for param in trainable_params if id(param) not in engram_param_ids]
+    vision_param_ids = {id(param) for param in vision_params}
+    base_params = [
+        param for param in trainable_params
+        if id(param) not in engram_param_ids and id(param) not in vision_param_ids
+    ]
     param_groups = []
-    if base_params:
-        param_groups.append({"params": base_params})
-    param_groups.append(
-        {
-            "params": engram_params,
-            "lr_mult": _QWEN4_EXP_ENGRAM_LR_MULTIPLIER,
-            "weight_decay": 0.0,
-        }
-    )
+    # AdamW foreach cannot mix plain vision tensors with FSDP DTensors in one group.
+    for params in (base_params, vision_params):
+        if params:
+            param_groups.append({"params": params})
+    if engram_params:
+        param_groups.append(
+            {
+                "params": engram_params,
+                "lr_mult": _QWEN4_EXP_ENGRAM_LR_MULTIPLIER,
+                "weight_decay": 0.0,
+            }
+        )
     return param_groups
+
+
+def _split_dtensor_param_groups(params: list) -> list:
+    """Keep DTensor and replicated tensors in separate AdamW groups.
+
+    foreach AdamW batches same-device/dtype params into one ``_foreach_*``
+    call and rejects a mix of DTensor and plain Tensor. Qwen3.5 keeps ViT
+    unsharded, so the two kinds must not share a group.
+    """
+    dtensor_params = []
+    replicated_params = []
+    for param in params:
+        if isinstance(param, DTensor):
+            dtensor_params.append(param)
+        else:
+            replicated_params.append(param)
+    groups = []
+    if dtensor_params:
+        groups.append({"params": dtensor_params})
+    if replicated_params:
+        groups.append({"params": replicated_params})
+    return groups or params
 
 
 def setup_optimizer(config, model, latest_step=None):
@@ -32,6 +63,8 @@ def setup_optimizer(config, model, latest_step=None):
         params_to_optimize = _qwen4_exp_param_groups(model)
     else:
         params_to_optimize = list(filter(lambda p: p.requires_grad, model.parameters()))
+    if params_to_optimize and not isinstance(params_to_optimize[0], dict):
+        params_to_optimize = _split_dtensor_param_groups(params_to_optimize)
     optimizer_config = config.optimizer
 
     opt_type = optimizer_config.optimizer_type
@@ -71,10 +104,7 @@ def create_muon_optimizer(model, optimizer_config):
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if (p.ndim >= 2
-                and "embed" not in name
-                and "lm_head" not in name
-                and "wte" not in name):
+        if (p.ndim >= 2 and "embed" not in name and "lm_head" not in name and "wte" not in name):
             muon_params.append(p)
         else:
             adamw_params.append(p)

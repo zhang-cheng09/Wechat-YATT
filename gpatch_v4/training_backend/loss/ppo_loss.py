@@ -1,6 +1,6 @@
 """Policy-loss path (sum-return + unified agg).
 
-Enabled when ``ppo.use_legacy_loss=False``. Legacy implementations remain in
+Enabled when ``training.use_legacy_loss=False``. Legacy implementations remain in
 ``loss_factory.py``, while entropy regularization is shared by both paths.
 
 New loss expects plain 2D ``[B, S]`` tensors. Dyn-CP / THD packs must be
@@ -57,6 +57,7 @@ class PolicyLossInput:
     # Optional per-sample (shape ``[B, 1]``) or per-token (shape ``[B, S]``) reweight
     # for aggregation. ``None`` means all ones.
     token_weights: Optional[torch.Tensor] = None
+    defer_scalar_metric_reduction: bool = False
 
 
 @dataclass
@@ -745,10 +746,9 @@ def _policy_loss(
     else:
         effective_prev = loss_input.prev_log_probs
 
-    # ============================ COMPUTE ACTOR LOSS ==========================
-    actor = compute_actor_loss(config, loss_input, response_mask, effective_prev)
-
-    # ============================ IS CORRECTION ===============================
+    # ============================ IS / RS CORRECTION ==========================
+    # Mask first so sequence-level losses (GSPO) exclude rejected tokens, matching
+    # verl compute_rollout_correction_and_add_to_batch.
     correction_ratio, response_mask, is_metrics = compute_off_policy_correction_weights(
         ppo_config.enable_off_policy_correction,
         config,
@@ -756,7 +756,10 @@ def _policy_loss(
         loss_input.rollout_log_probs,
         response_mask.float(),
     )
-    if ppo_config.enable_off_policy_correction:
+
+    # ============================ COMPUTE ACTOR LOSS ==========================
+    actor = compute_actor_loss(config, loss_input, response_mask, effective_prev)
+    if correction_ratio is not None:
         actor.actor_loss = actor.actor_loss * correction_ratio
 
     # ============================ AGGREGATE ACTOR LOSS ========================
@@ -838,7 +841,8 @@ def _policy_loss(
         sm = loss_input.sample_mask.float().detach()
         metrics["valid_sample_ratio"] = torch.stack([sm.sum(), sm.new_tensor(float(sm.numel()))])
 
-    reduce_metrics_across_data_parallel_group(metrics)
+    if not loss_input.defer_scalar_metric_reduction:
+        reduce_metrics_across_data_parallel_group(metrics)
     # ============================ DUMP METRICS ================================
     if loss_input.should_dump_metrics:
         dumped = {
@@ -863,31 +867,333 @@ def _policy_loss(
     return bwd_loss, actor_bwd_count, metrics
 
 
-@register_loss(backends=("mcore", ), loss_name="grpo")
+def _opd_topk_surrogate(config, loss_input, response_mask):
+    ppo_config = config.ppo
+    advantages = loss_input.advantages
+    assert loss_input.curr_topk_logprobs is not None and loss_input.prev_topk_logprobs is not None
+    log_ratio = loss_input.curr_topk_logprobs - loss_input.prev_topk_logprobs
+    if ppo_config.ppo_logps_ratio_clamp is not None:
+        ratios = torch.clamp(
+            log_ratio,
+            min=-ppo_config.ppo_logps_ratio_clamp,
+            max=ppo_config.ppo_logps_ratio_clamp,
+        ).exp()
+    else:
+        ratios = log_ratio.exp()
+    clip_ratio_low = (
+        ppo_config.ppo_clip_ratio_low
+        if ppo_config.ppo_clip_ratio_low is not None else ppo_config.ppo_ratio_eps
+    )
+    clip_ratio_high = (
+        ppo_config.ppo_clip_ratio_high
+        if ppo_config.ppo_clip_ratio_high is not None else ppo_config.ppo_ratio_eps
+    )
+    ratios_clamped = ratios.clamp(1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+    loss1 = -advantages * ratios
+    loss2 = -advantages * ratios_clamped
+    entropy_reg_metrics = {}
+    if ppo_config.ppo_entropy_regularization_type is not None:
+        clip_max_loss, entropy_reg_metrics = compute_entropy_regularization_loss(
+            ppo_config,
+            old_log_prob=loss_input.prev_log_probs,
+            log_prob=loss_input.curr_log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            pg_losses1=loss1,
+            pg_losses2=loss2,
+            entropy_aux_figures=loss_input.entropy_aux_figures,
+            rollout_log_probs=loss_input.rollout_log_probs,
+        )
+    else:
+        clip_max_loss = torch.maximum(loss1, loss2)
+
+    loss3 = None
+    if ppo_config.ppo_dual_clip_ratio_c is not None:
+        loss3 = -advantages * ppo_config.ppo_dual_clip_ratio_c
+        actor_loss = torch.where(advantages < 0, torch.min(loss3, clip_max_loss), clip_max_loss)
+    else:
+        actor_loss = clip_max_loss
+
+    with torch.no_grad():
+        numel = response_mask.sum()
+        mask_bool = response_mask.bool().unsqueeze(-1)
+        is_upper_clamped = (ratios > 1.0 + clip_ratio_high) & mask_bool
+        is_lower_clamped = (ratios < 1.0 - clip_ratio_low) & mask_bool
+        loss2_gt_loss1 = loss2 > loss1
+        algo_metrics = {
+            "ppo_ratio_clamped_upper_frac":
+                torch.stack([is_upper_clamped.sum().float(), numel]),
+            "ppo_ratio_clamped_lower_frac":
+                torch.stack([is_lower_clamped.sum().float(), numel]),
+            "ppo_ratio_clamped_effective_upper_frac":
+                torch.stack([(is_upper_clamped & loss2_gt_loss1).sum().float(), numel]),
+            "ppo_ratio_clamped_effective_lower_frac":
+                torch.stack([(is_lower_clamped & loss2_gt_loss1).sum().float(), numel]),
+        }
+        if loss3 is not None:
+            dual_clip_active = ((advantages < 0) & (clip_max_loss > loss3) &
+                                mask_bool).sum().float()
+        else:
+            dual_clip_active = torch.zeros(1, device=ratios.device).squeeze()
+        algo_metrics["ppo_dual_clip_frac"] = torch.stack([dual_clip_active, numel])
+        algo_metrics.update(entropy_reg_metrics)
+
+    return actor_loss, ratios, ratios_clamped, algo_metrics
+
+
+def _opd_report_aggregates(
+    per_token_value: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    sample_mask: Optional[torch.Tensor],
+    token_weights: Optional[torch.Tensor],
+):
+    # Why: new-path OPD reused agg() once for bwd (single calculate_per_token_loss),
+    # which dropped legacy's dual token/sample report metrics. Re-call agg under
+    # no_grad for both modes so W&B keys stay aligned with loss_factory; bwd unchanged.
+    with torch.no_grad():
+        token_sum, token_count = agg(
+            per_token_value.detach(),
+            response_mask,
+            calculate_per_token_loss=True,
+            sample_mask=sample_mask,
+            token_weights=token_weights,
+        )
+        sample_sum, sample_count = agg(
+            per_token_value.detach(),
+            response_mask,
+            calculate_per_token_loss=False,
+            sample_mask=sample_mask,
+            token_weights=token_weights,
+        )
+    return token_sum, token_count, sample_sum, sample_count
+
+
+def _opd_policy_loss(config, loss_input: PolicyLossInput):
+    assert loss_input.cu_seqlens_padded is None, (
+        "new loss expects [B, S] tensors; convert THD/dyn-CP to response-padded "
+        "sequence before loss (cu_seqlens_padded must be None)"
+    )
+    assert loss_input.local_cp_size == 1, (
+        "new loss expects local_cp_size=1; convert THD/dyn-CP to response-padded "
+        "sequence before loss (local_cp_size must be 1)"
+    )
+    assert loss_input.teacher_log_probs is not None, (
+        "opd_loss requires teacher_log_probs in PolicyLossInput"
+    )
+    ppo_config = config.ppo
+    per_token_entropy = loss_input.per_token_entropy
+    if per_token_entropy is None:
+        per_token_entropy = torch.zeros_like(loss_input.curr_log_probs)
+    response_mask = loss_input.response_mask
+    if ppo_config.skip_prev_logps:
+        effective_prev = loss_input.curr_log_probs.detach()
+    else:
+        effective_prev = loss_input.prev_log_probs
+
+    correction_ratio, response_mask, is_metrics = compute_off_policy_correction_weights(
+        ppo_config.enable_off_policy_correction,
+        config,
+        effective_prev,
+        loss_input.rollout_log_probs,
+        response_mask.float(),
+    )
+
+    if loss_input.advantages.dim() == 3:
+        actor_loss, ratios, ratios_clamped, algo_metrics = _opd_topk_surrogate(
+            config, loss_input, response_mask
+        )
+    else:
+        actor = _compute_grpo_actor_loss(config, loss_input, response_mask, effective_prev)
+        actor_loss = actor.actor_loss
+        ratios = actor.ratios
+        ratios_clamped = None
+        algo_metrics = actor.algo_metrics or {}
+
+    if ppo_config.enable_off_policy_correction:
+        if actor_loss.dim() == 3:
+            actor_loss = actor_loss * correction_ratio.unsqueeze(-1)
+        else:
+            actor_loss = actor_loss * correction_ratio
+
+    if actor_loss.dim() == 3:
+        actor_loss = actor_loss.sum(dim=-1)
+        ratio_weights = torch.softmax(loss_input.prev_topk_logprobs.detach(), dim=-1)
+        ratios = (ratios.detach() * ratio_weights).sum(dim=-1)
+        ratios_clamped = (ratios_clamped.detach() * ratio_weights).sum(dim=-1)
+
+    agg_kw = dict(
+        calculate_per_token_loss=loss_input.calculate_per_token_loss,
+        sample_mask=loss_input.sample_mask,
+        token_weights=loss_input.token_weights,
+        cu_seqlens_padded=loss_input.cu_seqlens_padded,
+        local_cp_size=loss_input.local_cp_size,
+    )
+    actor_bwd_sum, actor_bwd_count = agg(actor_loss, response_mask, **agg_kw)
+    entropy_bwd_sum, entropy_bwd_count = agg(per_token_entropy, response_mask, **agg_kw)
+    loss = actor_bwd_sum - entropy_bwd_sum * get_entropy_bonus_coef(ppo_config)
+
+    if loss_input.ref_log_probs is not None:
+        per_token_kl = calculate_kl_loss(
+            cur_log_probs=loss_input.curr_log_probs,
+            ref_log_probs=loss_input.ref_log_probs,
+            use_absolute_kl=False,
+            use_low_var_kl=True,
+            clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
+            clamp_kl_val=ppo_config.ppo_clamp_kl_val,
+        )
+        kl_bwd_sum, kl_bwd_count = agg(per_token_kl, response_mask, **agg_kw)
+        loss = loss + kl_bwd_sum * ppo_config.grpo_kl_loss_beta
+    else:
+        kl_bwd_sum = torch.zeros_like(actor_bwd_sum)
+        kl_bwd_count = actor_bwd_count
+
+    per_token_teacher_kl = calculate_kl_loss(
+        cur_log_probs=loss_input.curr_log_probs,
+        ref_log_probs=loss_input.teacher_log_probs,
+        use_absolute_kl=False,
+        use_low_var_kl=True,
+        clamp_kl_loss=ppo_config.ppo_dual_clip_ratio_c is not None,
+        clamp_kl_val=ppo_config.ppo_clamp_kl_val,
+    )
+    teacher_kl_bwd_sum, teacher_kl_bwd_count = agg(per_token_teacher_kl, response_mask, **agg_kw)
+    loss = loss + teacher_kl_bwd_sum * ppo_config.opd_teacher_kl_loss_beta
+    bwd_loss = loss.clone()
+
+    report_kw = dict(
+        sample_mask=loss_input.sample_mask,
+        token_weights=loss_input.token_weights,
+    )
+    (
+        actor_token_sum,
+        actor_token_count,
+        actor_sample_sum,
+        actor_sample_count,
+    ) = _opd_report_aggregates(actor_loss, response_mask, **report_kw)
+    (
+        entropy_token_sum,
+        entropy_token_count,
+        entropy_sample_sum,
+        entropy_sample_count,
+    ) = _opd_report_aggregates(per_token_entropy, response_mask, **report_kw)
+    if loss_input.ref_log_probs is not None:
+        (
+            policy_ref_kl_token_sum,
+            policy_ref_kl_token_count,
+            policy_ref_kl_sample_sum,
+            policy_ref_kl_sample_count,
+        ) = _opd_report_aggregates(per_token_kl, response_mask, **report_kw)
+    else:
+        policy_ref_kl_token_sum = torch.zeros_like(actor_token_sum)
+        policy_ref_kl_sample_sum = torch.zeros_like(actor_sample_sum)
+        policy_ref_kl_token_count = actor_token_count
+        policy_ref_kl_sample_count = actor_sample_count
+    (
+        teacher_kl_token_sum,
+        teacher_kl_token_count,
+        teacher_kl_sample_sum,
+        teacher_kl_sample_count,
+    ) = _opd_report_aggregates(per_token_teacher_kl, response_mask, **report_kw)
+
+    with torch.no_grad():
+        numel = response_mask.sum()
+        ppo_ratio = masked_mean(ratios.detach(), response_mask)
+        metrics = {
+            "loss":
+                torch.stack([loss.detach(), actor_bwd_count.detach()]),
+            "policy_loss":
+                torch.stack([actor_bwd_sum.detach(),
+                             actor_bwd_count.detach()]),
+            "scaled_entropy":
+                torch.stack([entropy_bwd_sum.detach(),
+                             entropy_bwd_count.detach()]),
+            "policy_ref_kl_loss":
+                torch.stack([kl_bwd_sum.detach(), kl_bwd_count.detach()]),
+            "teacher_student_kl_loss":
+                torch.stack([teacher_kl_bwd_sum.detach(),
+                             teacher_kl_bwd_count.detach()]),
+            "ppo_ratio":
+                torch.stack([ppo_ratio * numel, numel]),
+            "policy_loss_token":
+                torch.stack([actor_token_sum, actor_token_count]),
+            "policy_loss_sample":
+                torch.stack([actor_sample_sum, actor_sample_count]),
+            "entropy_token":
+                torch.stack([entropy_token_sum, entropy_token_count]),
+            "entropy_sample":
+                torch.stack([entropy_sample_sum, entropy_sample_count]),
+            "policy_ref_kl_token":
+                torch.stack([policy_ref_kl_token_sum, policy_ref_kl_token_count]),
+            "policy_ref_kl_sample":
+                torch.stack([policy_ref_kl_sample_sum, policy_ref_kl_sample_count]),
+            "teacher_student_kl_token":
+                torch.stack([teacher_kl_token_sum, teacher_kl_token_count]),
+            "teacher_student_kl_sample":
+                torch.stack([teacher_kl_sample_sum, teacher_kl_sample_count]),
+        }
+        if ratios_clamped is not None:
+            ppo_ratio_clamped = masked_mean(ratios_clamped.detach(), response_mask)
+            metrics["ppo_ratio_clamped"] = torch.stack([ppo_ratio_clamped * numel, numel])
+    if is_metrics:
+        metrics.update(is_metrics)
+    if algo_metrics:
+        metrics.update(algo_metrics)
+    if loss_input.sample_mask is not None:
+        sm = loss_input.sample_mask.float().detach()
+        metrics["valid_sample_ratio"] = torch.stack([sm.sum(), sm.new_tensor(float(sm.numel()))])
+
+    if not loss_input.defer_scalar_metric_reduction:
+        reduce_metrics_across_data_parallel_group(metrics)
+    if loss_input.should_dump_metrics:
+        metrics.update(
+            {
+                "dump/curr_logprobs":
+                    loss_input.curr_log_probs.clone().detach().to(
+                        dtype=torch.bfloat16, device="cpu"
+                    ),
+                "dump/per_token_entropy":
+                    per_token_entropy.clone().detach().to(dtype=torch.bfloat16, device="cpu"),
+                "dump/topk_logprobs":
+                    loss_input.dumped_topk_logprobs,
+                "dump/topk_token_ids":
+                    loss_input.dumped_topk_token_ids,
+                "dump/mask":
+                    response_mask.detach().bool().to(device="cpu"),
+            }
+        )
+    return bwd_loss, actor_bwd_count, metrics
+
+
+@register_loss(backends=("mcore", "fsdp2"), loss_name="grpo")
 def grpo_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_grpo_actor_loss)
 
 
-@register_loss(backends=("mcore", ), loss_name="steer")
+@register_loss(backends=("mcore", "fsdp2"), loss_name="steer")
 def steer_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_steer_actor_loss)
 
 
-@register_loss(backends=("mcore", ), loss_name="cispo")
+@register_loss(backends=("mcore", "fsdp2"), loss_name="cispo")
 def cispo_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_cispo_actor_loss)
 
 
-@register_loss(backends=("mcore", ), loss_name="gspo")
+@register_loss(backends=("mcore", "fsdp2"), loss_name="gspo")
 def gspo_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_gspo_actor_loss)
 
 
-@register_loss(backends=("mcore", ), loss_name="sapo")
+@register_loss(backends=("mcore", "fsdp2"), loss_name="sapo")
 def sapo_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_sapo_actor_loss)
 
 
-@register_loss(backends=("mcore", ), loss_name="vespo")
+@register_loss(backends=("mcore", "fsdp2"), loss_name="vespo")
 def vespo_loss(config, loss_input: PolicyLossInput):
     return _policy_loss(config, loss_input, _compute_vespo_actor_loss)
+
+
+@register_loss(backends=("mcore", "fsdp2"), loss_name="opd")
+def opd_loss(config, loss_input: PolicyLossInput):
+    return _opd_policy_loss(config, loss_input)

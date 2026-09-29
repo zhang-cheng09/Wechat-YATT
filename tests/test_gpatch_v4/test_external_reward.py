@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import torch
 
 from tasks.math_rl_v4.math_external_reward import MathRuleExternalReward
+from tasks.math_rl_v4.math_external_reward_dapo import DapoMathRuleExternalReward
 
 from gpatch_v4.configs.config import RlConfig
 from gpatch_v4_test_helper import load_config
@@ -175,6 +177,177 @@ class MathRuleExternalRewardTest(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(upd["rewards"][i].item(), expected_ext[i])
 
 
+class DapoExternalRewardTest(unittest.IsolatedAsyncioTestCase):
+    async def test_scoring_yields_event_loop_with_and_without_eval_delay(self):
+        for is_eval, delay in ((True, 0.0), (True, 0.01), (False, 60.0)):
+            with self.subTest(is_eval=is_eval, delay=delay):
+                reward = DapoMathRuleExternalReward(
+                    config=SimpleNamespace(external_reward=SimpleNamespace(eval_delay_s=delay)),
+                    tokenizer=_make_mock_tokenizer([]),
+                )
+                loop = asyncio.get_running_loop()
+                loop_thread = threading.get_ident()
+                started = asyncio.Event()
+                scoring = asyncio.Event()
+                release = threading.Event()
+
+                def compute_update(batch):
+                    self.assertNotEqual(threading.get_ident(), loop_thread)
+                    loop.call_soon_threadsafe(scoring.set)
+                    self.assertTrue(release.wait(timeout=5))
+                    return {"rewards": []}
+
+                with patch.object(reward, "_compute_update", side_effect=compute_update):
+                    task = asyncio.create_task(reward.calc_external_reward(
+                        [{}], ppo_step=0, is_eval=is_eval, _started_event=started,
+                    ))
+                    try:
+                        await asyncio.wait_for(started.wait(), timeout=2)
+                        await asyncio.wait_for(scoring.wait(), timeout=2)
+                        # 模拟延迟结束后，打分未完成时事件循环仍可继续运行。
+                        await asyncio.sleep(0.02)
+                        self.assertFalse(task.done())
+                    finally:
+                        release.set()
+                        updates = await asyncio.wait_for(task, timeout=2)
+                    self.assertEqual(updates, [{"rewards": []}])
+
+    async def test_eval_scoring_runs_during_delay(self):
+        reward = DapoMathRuleExternalReward(
+            config=SimpleNamespace(external_reward=SimpleNamespace(eval_delay_s=60)),
+            tokenizer=_make_mock_tokenizer([]),
+        )
+        loop = asyncio.get_running_loop()
+        scoring = asyncio.Event()
+        release_delay = asyncio.Event()
+
+        def compute_update(batch):
+            loop.call_soon_threadsafe(scoring.set)
+            return {"rewards": []}
+
+        async def wait_for_release(delay):
+            self.assertEqual(delay, 60)
+            await release_delay.wait()
+
+        with (
+            patch.object(reward, "_compute_update", side_effect=compute_update),
+            patch(
+                "tasks.math_rl_v4.math_external_reward_dapo.asyncio.sleep",
+                side_effect=wait_for_release,
+            ),
+        ):
+            task = asyncio.create_task(reward.calc_external_reward([{}], 0, is_eval=True))
+            try:
+                await asyncio.wait_for(scoring.wait(), timeout=2)
+                self.assertFalse(task.done())
+            finally:
+                release_delay.set()
+                updates = await asyncio.wait_for(task, timeout=2)
+            self.assertEqual(updates, [{"rewards": []}])
+
+    async def test_scoring_exception_propagates(self):
+        reward = DapoMathRuleExternalReward(tokenizer=_make_mock_tokenizer([]))
+        with patch.object(reward, "_compute_update", side_effect=RuntimeError("score failed")):
+            with self.assertRaisesRegex(RuntimeError, "score failed"):
+                await reward.calc_external_reward([{}], 0, is_eval=True)
+
+    async def test_invalid_eval_delay_does_not_start_scoring(self):
+        reward = DapoMathRuleExternalReward(
+            config=SimpleNamespace(external_reward=SimpleNamespace(eval_delay_s=-2)),
+            tokenizer=_make_mock_tokenizer([]),
+        )
+        started = asyncio.Event()
+        with patch.object(reward, "_compute_update") as compute:
+            with self.assertRaisesRegex(ValueError, "eval_delay_s"):
+                await reward.calc_external_reward([{}], 0, is_eval=True, _started_event=started)
+            compute.assert_not_called()
+            self.assertTrue(started.is_set())
+
+    async def test_threaded_real_grading_matches_synchronous_updates(self):
+        tokenizer = _make_mock_tokenizer([r"\boxed{\frac{1}{2}}", r"\boxed{7}"])
+        reward = DapoMathRuleExternalReward(tokenizer=tokenizer)
+        batch = {
+            "tokens": [torch.tensor([10, 11, 12]), torch.tensor([20, 21, 22])],
+            "sequence_lengths": [3, 3],
+            "prompt_lengths": [1, 1],
+            "gt_label": [r"\frac{1}{2}", "8"],
+            "rewards": [torch.tensor([0.5]), torch.tensor([-0.5])],
+        }
+        expected = reward._compute_update(batch)
+        for is_eval in (False, True):
+            with self.subTest(is_eval=is_eval):
+                actual = (await reward.calc_external_reward([batch], 0, is_eval=is_eval))[0]
+                self.assertEqual(actual.keys(), expected.keys())
+                for key in expected:
+                    torch.testing.assert_close(torch.stack(actual[key]), torch.stack(expected[key]))
+                self.assertEqual([v.item() for v in actual["acc_reward"]], [1.0, 0.0])
+                self.assertEqual([v.item() for v in actual["rewards"]], [2.5, 0.5])
+
+    async def test_async_eval_signals_before_random_delay_finishes(self):
+        reward = DapoMathRuleExternalReward(
+            config=SimpleNamespace(external_reward=SimpleNamespace(eval_delay_s=-1)),
+            tokenizer=_make_mock_tokenizer([]),
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def wait_for_release(delay):
+            self.assertEqual(delay, 65.0)
+            await release.wait()
+
+        with (
+            patch(
+                "tasks.math_rl_v4.math_external_reward_dapo.random.uniform",
+                return_value=65.0,
+            ) as uniform,
+            patch(
+                "tasks.math_rl_v4.math_external_reward_dapo.asyncio.sleep",
+                side_effect=wait_for_release,
+            ),
+            patch.object(reward, "_compute_update", return_value={"rewards": []}),
+        ):
+            task = asyncio.create_task(
+                reward.calc_external_reward(
+                    [{"tokens": []}],
+                    ppo_step=4,
+                    is_eval=True,
+                    _started_event=started,
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertFalse(task.done())
+            uniform.assert_called_once_with(50.0, 200.0)
+            release.set()
+            self.assertEqual(await task, [{"rewards": []}])
+
+    async def test_non_numeric_label_produces_training_reward(self):
+        tokenizer = _make_mock_tokenizer(["\\boxed{\\frac{1}{2}}"])
+        reward = DapoMathRuleExternalReward(tokenizer=tokenizer)
+        batch = {
+            "tokens": [torch.tensor([10, 11, 12])],
+            "sequence_lengths": [torch.tensor(3)],
+            "prompt_lengths": [torch.tensor(1)],
+            "gt_label": ["\\frac{1}{2}"],
+        }
+
+        with (
+            patch(
+                "tasks.math_rl_v4.math_external_reward_dapo.math_accuracy_reward",
+                return_value=1.0,
+            ) as accuracy,
+            patch(
+                "tasks.math_rl_v4.math_external_reward_dapo.math_format_reward",
+                return_value=1.0,
+            ),
+        ):
+            updates = await reward.calc_external_reward([batch], ppo_step=0)
+
+        tokenizer.batch_decode.assert_called_once_with([[11, 12]], skip_special_tokens=True)
+        accuracy.assert_called_once_with("\\boxed{\\frac{1}{2}}", "\\frac{1}{2}")
+        self.assertEqual(updates[0]["rewards"][0].item(), 2.0)
+        self.assertEqual(updates[0]["external_reward"][0].item(), 2.0)
+
+
 class AgentLoopActorSetupExternalRewardTest(unittest.TestCase):
     def test_happy_path_instantiates_reward(self):
         from gpatch_v4.rollout_generator.async_rollout.agent_loop_actor import (
@@ -250,6 +423,26 @@ class AsyncEvalExternalRewardTest(unittest.IsolatedAsyncioTestCase):
         actor.compute_rollout_metrics = MagicMock(return_value={"rewards": 1.0})
         actor.eval_logging = MagicMock()
         return actor
+
+    async def test_controller_returns_after_eval_reward_is_submitted(self):
+        from gpatch_v4.rollout_generator.async_rollout.rollout_controller import (
+            RolloutController,
+        )
+
+        controller = object.__new__(RolloutController)
+        controller.eval_external_reward = self._DelayedExternalReward()
+        rollout_batches = [{"tokens": [[1, 2]]}]
+
+        task = await controller._start_async_eval_reward(
+            rollout_batches,
+            [0],
+            ppo_step=7,
+        )
+
+        self.assertFalse(task.done())
+        self.assertEqual(controller.eval_external_reward.calls, [(7, True)])
+        controller.eval_external_reward.release.set()
+        self.assertEqual(await task, [{}])
 
     async def test_async_rewards_report_on_next_eval_and_final_flush(self):
         from gpatch_v4.actor import grpo_train_actor as actor_module

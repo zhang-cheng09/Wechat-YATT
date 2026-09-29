@@ -1,0 +1,66 @@
+# @package _global_
+_target_: gpatch_v4.configs.config.FinetuneConfig
+
+training:
+  training_backend: mcore
+  use_fast_tokenizer: true
+  # 16 ranks / TP4 = DP4; one unequal-length sample per DP rank.
+  train_gbs: 4
+  train_mbs: 1
+  seq_length: 1280
+  pad_to_mulitiple_of: 128
+  attention_backend: flash
+  comput_attn_mask: false
+  build_from_mbridge: true
+  auto_load_from_save_ckpt: false
+  data_parallel_random_init: false
+  num_train_epoches: 1
+  exit_step: 1
+  save_interval: 1000
+  loss_func: cross_entropy
+  enable_mtp: false
+
+checkpoint:
+  load_ckpt_path: ckpt_test_qwen36_dynamic_cp_sft_sample_level
+  save_ckpt_path: ckpt_test_qwen36_dynamic_cp_sft_sample_level
+
+optimizer:
+  lr: 0.0
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+  weight_decay: 0.0
+
+data:
+  data_pathes: []
+  py_path: tests/test_gpatch_v4/custom_py/dynamic_cp_sft_sample_level_dataset.py
+  fn_name: get_dataset_and_dataloader
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+
+policy:
+  dist_config:
+    num_gpus_per_node: 8
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+    dynamic_context_parallel: false
+    max_seqlen_per_dp_cp_rank: 1280
+    min_dynamic_context_parallel_size: 1
+  model_arch: qwen3_5_moe
+  without_ref: true
+  hf_model_path: /mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/project/workspace3/test/Qwen3.6-35B-A3B-permuted
+  hf_tokenizer_path: /mnt/ceph-hz1-csp/mm-base-plt2/user_xiaotaoliu/project/workspace3/test/Qwen3.6-35B-A3B-permuted
+  override_transformer_config:
+    calculate_per_token_loss: false
+    variable_seq_lengths: false
+    moe_router_load_balancing_type: none
+    moe_aux_loss_coeff: 0.0
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+
+debug:
+  disable_save_checkpoint: true
+  trainer_return_ppo_step_metrics: true

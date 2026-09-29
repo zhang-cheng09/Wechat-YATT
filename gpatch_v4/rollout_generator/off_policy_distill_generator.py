@@ -20,13 +20,10 @@ from gpatch_v4.core.parallel_state import (
     is_mp_and_cp_head,
 )
 from gpatch_v4.rollout_generator.base_generator import BaseRolloutGenerator
-from gpatch_v4.transfer.utils import (
-    TqPayloadType,
-    async_offload_to_tq,
-    async_restore_from_tq,
-)
+from gpatch_v4.transfer.transfer_queue_interface import TQInterface, TqPayloadType
 from gpatch_v4.utils import (
     BroadcastUtils,
+    TimerSingleton,
     clear_memory,
     destroy_process_groups,
     log,
@@ -197,10 +194,10 @@ class OffPolicyDistillRolloutGenerator(BaseRolloutGenerator):
         s_idx = self.sample_idx
 
         async def issue_one(batch, sample_idx):
-            payload = await async_offload_to_tq(
+            payload = await TQInterface.async_offload_to_tq(
                 batch,
                 curr_ppo_step,
-                TqPayloadType.DICT,
+                TqPayloadType.ONE_KEY_PER_DICT,
             )
             return await self.teacher_client.issue_calc_hidden_states(
                 payload, curr_ppo_step, sample_idx
@@ -222,7 +219,7 @@ class OffPolicyDistillRolloutGenerator(BaseRolloutGenerator):
             result = await self.teacher_client.get_calc_hidden_states_result(
                 curr_ppo_step, sample_idx
             )
-            restored = await async_restore_from_tq(result["teacher_hidden_states"])
+            restored = await TQInterface.async_restore_from_tq(result["teacher_hidden_states"])
             hidden_states = restored["teacher_hidden_states"]
             assert len(hidden_states) == len(next(iter(rollout_batch.values())))
             rollout_batch["teacher_hidden_states"] = hidden_states
@@ -252,13 +249,14 @@ class OffPolicyDistillRolloutGenerator(BaseRolloutGenerator):
 
     @override
     async def __call__(self, data_iter, num_microbatches, curr_train_step):
-        #TODO: support timer record times per stage
+        timers = TimerSingleton.get_timer()
         dp_rank = mpu.get_data_parallel_rank()
         offload_process_group = self.config.training.offload_process_group
         if offload_process_group:
             destroy_process_groups()
             clear_memory()
 
+        timers("rollout", log_level=0).start(barrier=True)
         if self.config.training.enable_teacher_rollout:
             rbs = await self.rollout_samples(
                 data_iter, num_microbatches, curr_train_step, dp_rank=dp_rank
@@ -269,9 +267,15 @@ class OffPolicyDistillRolloutGenerator(BaseRolloutGenerator):
         logging_memory_usage_details("memory tracking before bcast data", rank=0)
         rbs = BroadcastUtils.broadcast_rollout_batch(rbs)
         logging_memory_usage_details("memory tracking after bcast data", rank=0)
+        timers("rollout").stop()
 
-        if self.config.training.enable_teacher_kl_loss and self.config.training.setup_teacher_in_independent_topo:
+        if (
+            self.config.training.enable_teacher_kl_loss and
+            self.config.training.setup_teacher_in_independent_topo
+        ):
+            timers("teacher_infer", log_level=0).start(barrier=True)
             await self.calc_teacher_hidden_states(rbs, curr_train_step)
+            timers("teacher_infer").stop()
 
         if self.is_mp_and_cp_head:
             assert check_rollout_batches(rbs), f"rbs format error, may need pop('ready'): {rbs=}"

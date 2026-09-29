@@ -4,13 +4,13 @@ from unittest.mock import patch
 
 import torch
 
-from gpatch_v4.training_backend.loss_factory import (
+from gpatch_v4.training_backend.loss.mcore_specific_loss import (
     FinetuneLossInput,
     rm_bt_loss_func,
 )
 
 _AVG_METRICS_PATH = (
-    "gpatch_v4.training_backend.loss_factory.average_losses_across_data_parallel_group"
+    "gpatch_v4.training_backend.loss.mcore_specific_loss.average_losses_across_data_parallel_group"
 )
 
 

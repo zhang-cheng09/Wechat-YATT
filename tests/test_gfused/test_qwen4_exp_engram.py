@@ -355,6 +355,7 @@ def _dtensor_optimizer_worker(rank: int, world_size: int, init_file: str) -> Non
 
         module = OwnerShardedNGramEmbedding(ROWS, DIM)
         module.weight.data.normal_()
+        module.output_dtype = torch.bfloat16
         container = torch.nn.Module()
         container.engram = module
 
@@ -367,22 +368,32 @@ def _dtensor_optimizer_worker(rank: int, world_size: int, init_file: str) -> Non
 
         per_rank_ids = _make_ids(world_size)
         ids = per_rank_ids[rank].to(module.local_weight.device)
-        values = module(ids)
-        (values.float().sum() * world_size).backward()
-        assert module.weight.grad is not None
-
         expected = torch.zeros(ROWS, DIM)
-        for requester_ids in per_rank_ids:
-            expected.index_add_(
-                0,
-                requester_ids.reshape(-1),
-                torch.ones(requester_ids.numel(), DIM),
-            )
         row_start = rank * module.local_rows
-        torch.testing.assert_close(
-            module.weight.grad.to_local().cpu(),
-            expected[row_start:row_start + module.local_rows],
-        )
+        # BF16 输出、跨 rank 重复行和多次反传都要保持梯度累积的缩放。
+        for scale in (0.25, 1.5):
+            values = module(ids)
+            assert values.dtype == torch.bfloat16
+            weight = torch.arange(values.numel(), dtype=torch.float32).reshape(values.shape) + 1
+            weight = weight.to(values.device) * scale * (rank + 1) / 8
+            ((values.float() * weight).sum() * world_size).backward()
+
+            for requester, requester_ids in enumerate(per_rank_ids):
+                requester_weight = torch.arange(
+                    requester_ids.numel() * DIM, dtype=torch.float32,
+                ).reshape(-1, DIM) + 1
+                requester_weight = requester_weight * scale * (requester + 1) / 8
+                expected.index_add_(
+                    0,
+                    requester_ids.reshape(-1),
+                    requester_weight.to(torch.bfloat16).float(),
+                )
+            torch.testing.assert_close(
+                module.weight.grad.to_local().cpu(),
+                expected[row_start:row_start + module.local_rows],
+            )
+        with torch.no_grad():
+            assert module(ids).dtype == torch.bfloat16
 
         mesh = module.weight.device_mesh
         other = torch.nn.Parameter(

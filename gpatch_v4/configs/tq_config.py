@@ -3,7 +3,7 @@
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -41,10 +41,10 @@ class TqMooncakeConfig(MappingProtocol):
         The driver starts them once and worker processes then reuse them.
     metadata_server : str
         Metadata coordination server address in ``host:port`` form. When empty,
-        :class:`TqConfig` assigns an available address on the head node.
+        :class:`TransferQueueConfig` assigns an available address on the head node.
     master_server_address : str
         Mooncake master RPC address in ``host:port`` form. When empty,
-        :class:`TqConfig` assigns an available address on the head node.
+        :class:`TransferQueueConfig` assigns an available address on the head node.
     local_hostname : str
         Address advertised by the local Mooncake client. An empty value lets
         TransferQueue detect the current Ray node IP.
@@ -76,13 +76,13 @@ class TqMooncakeConfig(MappingProtocol):
 
 
 @dataclass
-class TqConfig(MappingProtocol):
+class TransferQueueConfig(MappingProtocol):
     """Top-level TransferQueue configuration.
 
     Attributes
     ----------
     enable : bool
-        Whether to initialize TransferQueue and use its off-policy data path.
+        Whether to initialize TransferQueue and use the configured TQ data path.
     backend : str
         Storage backend, either ``"SimpleStorage"`` or ``"MooncakeStore"``.
     partition_id : str or None
@@ -96,6 +96,11 @@ class TqConfig(MappingProtocol):
         Settings used when ``backend`` is ``"SimpleStorage"``.
     mooncake : TqMooncakeConfig
         Settings used when ``backend`` is ``"MooncakeStore"``.
+    controller_restore_fields : list of str or None
+        In dynamic-batch mode, extra tensor columns unioned with the built-in
+        finalize whitelist. In fixed-batch mode, the complete set of tensor
+        columns restored by the Controller; the default performs no storage get.
+        Ignored when Bradley-Terry RM is on because that path restores all fields.
     """
     enable: bool = field(default=False)
     backend: str = field(default="SimpleStorage")
@@ -103,6 +108,7 @@ class TqConfig(MappingProtocol):
     log_level: str = field(default="WARNING")
     simple_storage: TqSimpleStorageConfig = field(default_factory=TqSimpleStorageConfig)
     mooncake: TqMooncakeConfig = field(default_factory=TqMooncakeConfig)
+    controller_restore_fields: Optional[List[str]] = field(default=None)
 
     def __post_init__(self) -> None:
         self.log_level = self.log_level.upper()
@@ -171,14 +177,22 @@ class TqConfig(MappingProtocol):
                             },
                         "MooncakeStore":
                             {
-                                "auto_init": self.mooncake.auto_init,
-                                "metadata_server": self.mooncake.metadata_server,
-                                "master_server_address": self.mooncake.master_server_address,
-                                "local_hostname": self.mooncake.local_hostname,
-                                "protocol": self.mooncake.protocol,
-                                "global_segment_size": self.mooncake.global_segment_size_gb * (1024**3),
-                                "local_buffer_size": self.mooncake.local_buffer_size_gb * (1024**3),
-                                "device_name": self.mooncake.device_name,
+                                "auto_init":
+                                    self.mooncake.auto_init,
+                                "metadata_server":
+                                    self.mooncake.metadata_server,
+                                "master_server_address":
+                                    self.mooncake.master_server_address,
+                                "local_hostname":
+                                    self.mooncake.local_hostname,
+                                "protocol":
+                                    self.mooncake.protocol,
+                                "global_segment_size":
+                                    self.mooncake.global_segment_size_gb * (1024**3),
+                                "local_buffer_size":
+                                    self.mooncake.local_buffer_size_gb * (1024**3),
+                                "device_name":
+                                    self.mooncake.device_name,
                             },
                     }
             }

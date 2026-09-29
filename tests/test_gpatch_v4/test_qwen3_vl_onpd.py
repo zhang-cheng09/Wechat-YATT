@@ -6,9 +6,6 @@ import numpy as np
 import pytest
 import ray
 import torch
-from packaging.version import Version
-
-from megatron.core import package_info
 
 from gpatch_v4.configs.config import OnPolicyDistillConfig
 from gpatch_v4.orches.placement_group import create_placement_groups, create_train_group
@@ -30,10 +27,6 @@ class TestQwen3VLOnPolicyDistill(unittest.IsolatedAsyncioTestCase):
         kill_all_actors_and_shutdown_ray()
 
     async def _reuse_train_one_step_and_save(self, backend):
-        mcore_version = Version(package_info.__version__)
-        if mcore_version > Version("0.13.1"):
-            return
-
         config = load_config('test_qwen3_vl_on_distill', OnPolicyDistillConfig)
         config.sampler.backend = backend
 

@@ -12,6 +12,7 @@ from gpatch_v4.orches.placement_group import (
 )
 from gpatch_v4.trainer.helper import convert_mcore_to_hf, set_nnodes_default
 from gpatch_v4.trainer.trainer_mixin import TrainerRetryMixin
+from gpatch_v4.transfer import init_tq_connector
 
 
 class GrpoTrainer(TrainerRetryMixin):
@@ -75,6 +76,8 @@ class GrpoTrainer(TrainerRetryMixin):
             "use GrpoSingleCtrlTrainer when training.single_controller=True"
         )
         orches.init(config)
+        if config.tq.enable:
+            init_tq_connector(config.tq)
         set_nnodes_default(config)
         pgs = create_placement_groups(config)
 

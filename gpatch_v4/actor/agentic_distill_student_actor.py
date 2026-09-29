@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Dict
 
@@ -31,6 +32,7 @@ from gpatch_v4.utils import (
     log,
     logging_memory_usage_details,
     logging_rank0,
+    record_engine_lrs,
     record_time_to_metrics,
     reduce_metrics,
     save_data,
@@ -386,12 +388,46 @@ class AgenticDistillStudentActor(GrpoAsyncTrainActor):
         # ---- teacher logps fan-out (OPD-only addition) ----
         timers("compute_teacher_logps", log_level=0).start(barrier=True)
         num_microbatches = len(rollout_batches)
-        rollout_batches = await self.train_rollout_generator.calc_all_teacher_logps(
-            rollout_batches,
-            num_microbatches,
-            ppo_step,
-            sample_idx_base=self._teacher_sample_idx,
-        )
+        if self.config.ppo.teacher_streaming_enabled:
+            assert self.train_rollout_generator.is_mp_and_cp_head == is_mp_and_cp_head()
+            if is_mp_and_cp_head():
+                result_cos = []
+                result_meta = []
+                for rollout_batch in rollout_batches:
+                    teacher_name = rollout_batch["_stream_teacher_name"][0]
+                    request_id = rollout_batch["_stream_teacher_request_id"][0]
+                    endpoint_idx = int(
+                        rollout_batch["_stream_teacher_endpoint_idx"][0]
+                    )
+                    client = self.teacher_clients[teacher_name]
+                    result_cos.append(
+                        client.stream_get_calc_logps_result(
+                            request_id,
+                            endpoint_idx,
+                        )
+                    )
+                    result_meta.append((rollout_batch, teacher_name))
+                responses = await asyncio.gather(*result_cos)
+                for (rollout_batch, teacher_name), response in zip(
+                    result_meta, responses, strict=True
+                ):
+                    self.train_rollout_generator.fill_routed_teacher_logps(
+                        rollout_batch,
+                        response,
+                        teacher_name,
+                    )
+            cpu_barrier()
+            for rollout_batch in rollout_batches:
+                rollout_batch.pop("_stream_teacher_name", None)
+                rollout_batch.pop("_stream_teacher_request_id", None)
+                rollout_batch.pop("_stream_teacher_endpoint_idx", None)
+        else:
+            rollout_batches = await self.train_rollout_generator.calc_all_teacher_logps(
+                rollout_batches,
+                num_microbatches,
+                ppo_step,
+                sample_idx_base=self._teacher_sample_idx,
+            )
         self._teacher_sample_idx += num_microbatches
         cpu_barrier()
         timers("compute_teacher_logps").stop()
@@ -490,8 +526,7 @@ class AgenticDistillStudentActor(GrpoAsyncTrainActor):
                     )
                     _metrics = self.critic_engine.rl_train_value(ppo_step_iters)
                     extend_value_to_dict(metrics, _metrics)
-                lr = self.critic_engine.step_and_get_lr()
-                metrics["value/lr"] = lr
+                record_engine_lrs(metrics, self.critic_engine, "value")
             cpu_barrier()
             logging_rank0("train value model done")
 
@@ -509,8 +544,7 @@ class AgenticDistillStudentActor(GrpoAsyncTrainActor):
         logging_rank0("train policy model done")
         timers("train_step").stop()
 
-        lr = self.policy_engine.step_and_get_lr()
-        metrics["policy/lr"] = lr
+        record_engine_lrs(metrics, self.policy_engine, "policy")
         end_time = sync_cuda_and_get_time()
         metrics["time_perf/total_time"] = end_time - begin_time
         output_metrics = reduce_metrics(metrics)

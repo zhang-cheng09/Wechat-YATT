@@ -1,66 +1,31 @@
-from contextlib import contextmanager, nullcontext
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+# coding=utf-8
+# Copyright (c) 2026 Tencent Inc. All rights reserved.
+from contextlib import nullcontext
+from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    set_model_state_dict,
-)
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM
 
 from megatron.core import mpu
+from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.utils import divide
 
-from gpatch_v4.configs.config import FinetuneConfig
 from gpatch_v4.core.mappings import (
     all_gather_from_context_parallel_region,
     all_gather_from_context_parallel_region_no_zigzag,
 )
-from gpatch_v4.extended_model import (
-    DeepseekV4DpoPrepareDataForwardLLM,
-    DeepseekV4PrepareDataForwardLLM,
-)
-
-try:
-    from gpatch_v4.models.deepseek_v4 import DeepseekV4ForCausalLM
-    from gpatch_v4.models.deepseek_v4.dspark import (
-        prepare_dspark_batch,
-        shard_dspark_batch_for_contiguous_cp,
-    )
-    from gpatch_v4.models.deepseek_v4.router_replay import (
-        extract_topk_layers,
-        get_topk_layer_indices,
-        router_replay_ctx,
-    )
-except ImportError:
-    DeepseekV4ForCausalLM = None
-    prepare_dspark_batch = None
-    shard_dspark_batch_for_contiguous_cp = None
-    get_topk_layer_indices = None
-    extract_topk_layers = None
-    router_replay_ctx = None
-
-_QWEN4_EXP_IMPORT_ERROR = None
-try:
-    from gpatch_v4.models.qwen4_exp import Qwen4ExpHpForCausalLM
-except Exception as error:
-    Qwen4ExpHpForCausalLM = None
-    _QWEN4_EXP_IMPORT_ERROR = error
 from gpatch_v4.core.seqlen_balancing import convert_mbs_for_pack_seq
+from gpatch_v4.extended_model import (
+    DeepseekV4PrepareDataForwardLLM,
+    Qwen4ExpPrepareDataForwardLLM,
+)
 from gpatch_v4.models.deepseek_v4.thd import count_cross_cp_segments
 from gpatch_v4.models.hp_module import HpModule
-from gpatch_v4.training_backend.fsdp2_backend.checkpoint import (
-    save_checkpoint,
-    save_hf_checkpoint,
-)
-from gpatch_v4.training_backend.fsdp2_backend.hp_builder import get_hp_builder
 from gpatch_v4.training_backend.fsdp2_backend.linear_ce import linear_ce_forward_context
+from gpatch_v4.training_backend.fsdp2_backend.mixin.unpack_seq import (
+    unpack_thd_log_probs,
+)
 from gpatch_v4.training_backend.fsdp2_backend.mtp_loss import mtp_per_depth_valid_count
 from gpatch_v4.training_backend.loss import Fsdp2FinetuneLossInput, get_loss_fn
 from gpatch_v4.training_backend.loss_factory import load_balancing_loss_func
@@ -69,10 +34,26 @@ from gpatch_v4.utils import (
     get_batches_max_seqlen,
     get_k_split_list,
     get_max_seqlen_within_dp,
-    get_max_seqlen_within_ep,
     log,
 )
-from gpatch_v4.utils.training_utils import selective_log_softmax_raw
+from gpatch_v4.utils.dynamic_cp_utils import (
+    as_sequence_sample_mask,
+    packed_to_response_padded,
+    reconstruct_dynamic_cp_packed_tensor,
+)
+from gpatch_v4.utils.training_utils import (
+    build_grpo_compact_ce_mask,
+    selective_log_softmax_raw,
+)
+
+try:
+    from gpatch_v4.models.deepseek_v4.dspark import (
+        prepare_dspark_batch,
+        shard_dspark_batch_for_contiguous_cp,
+    )
+except ImportError:
+    prepare_dspark_batch = None
+    shard_dspark_batch_for_contiguous_cp = None
 
 try:
     from gpatch_v4.training_backend.fsdp2_backend.dspark_loss import (
@@ -85,412 +66,117 @@ except ImportError:
     dspark_loss_denominator = None
     reduce_dspark_metrics = None
 
+_FSDP2_PACKED_RL_PREPARE_TYPES = tuple(
+    cls for cls in (
+        DeepseekV4PrepareDataForwardLLM,
+        Qwen4ExpPrepareDataForwardLLM,
+    ) if cls is not None
+)
+
 selective_log_softmax_compiled = torch.compile(dynamic=True)(selective_log_softmax_raw)
 
 
-def unpack_thd_log_probs(
-    packed_log_probs: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
-) -> list[torch.Tensor]:
-    """Restore per-sample logprobs from a ``[1, T]`` padded THD axis."""
-    assert packed_log_probs.dim() == 2 and packed_log_probs.shape[0] == 1
-    cu = cu_seqlens.detach().cpu().tolist()
-    cu_padded = cu_seqlens_padded.detach().cpu().tolist()
-    assert len(cu) == len(cu_padded) and len(cu) >= 2
-    restored = []
-    flat = packed_log_probs.squeeze(0)
-    assert cu[0] == 0 and cu_padded[0] == 0
-    assert cu_padded[-1] == flat.numel(
-    ), (f"padded THD boundary {cu_padded[-1]} must match packed logprob "
-        f"length {flat.numel()}")
-    for sample_idx in range(len(cu) - 1):
-        actual_len = cu[sample_idx + 1] - cu[sample_idx]
-        start = cu_padded[sample_idx]
-        padded_len = cu_padded[sample_idx + 1] - start
-        assert 0 <= actual_len <= padded_len
-        restored.append(flat[start:start + actual_len].contiguous())
-    return restored
+class ForwardStepMixin:
+    """FSDP2 logprob / SFT forward.
 
-
-class Fsdp2EngineMixin:
-    def _get_vocab_size(self):
-        cfg = self.model.config
-        if hasattr(cfg, 'vocab_size') and cfg.vocab_size is not None:
-            return cfg.vocab_size
-        return cfg.get_text_config().vocab_size
-
-    def get_model_cls(self):
-        model_arch = getattr(self.policy_config, 'model_arch', None)
-        model_cls = AutoModelForCausalLM
-        if model_arch == 'gemma4':
-            from transformers import AutoModelForImageTextToText
-            model_cls = AutoModelForImageTextToText
-        if model_arch == 'deepseek_v4':
-            model_cls = DeepseekV4ForCausalLM
-        if model_arch == 'qwen4_exp':
-            if Qwen4ExpHpForCausalLM is None:
-                raise ImportError(
-                    "model_arch=qwen4_exp requires gpatch_v4.models.qwen4_exp"
-                ) from _QWEN4_EXP_IMPORT_ERROR
-            model_cls = Qwen4ExpHpForCausalLM
-        if model_arch in ["qwen3_5", "qwen3_5_moe"]:
-            from transformers import (
-                Qwen3_5ForConditionalGeneration,
-                Qwen3_5MoeForConditionalGeneration,
+    ``compute_logprobs`` calls ``_maybe_router_replay``. The engine MUST also
+    mix in :class:`RouterReplayMixin`.
+    """
+    def _dynamic_cp_partition_mode(
+        self,
+        batch: Dict[str, Any],
+        fwd_kwargs: Dict[str, Any],
+    ) -> str:
+        packed_seq_params = fwd_kwargs.get("packed_seq_params")
+        if packed_seq_params is None:
+            packed_seq_params = batch.get("full_packed_seq_params")
+        cp_partition_mode = self.prepare_data.cp_partition_mode
+        if packed_seq_params is not None:
+            cp_partition_mode = (
+                getattr(packed_seq_params, "cp_partition_mode", None) or cp_partition_mode
             )
-            model_cls = Qwen3_5MoeForConditionalGeneration if model_arch == "qwen3_5_moe" else Qwen3_5ForConditionalGeneration
-        return model_cls
+        if cp_partition_mode not in ("contiguous", "zigzag"):
+            raise ValueError(f"Unsupported dynamic-CP partition mode: {cp_partition_mode!r}")
+        return cp_partition_mode
 
-    def _setup_device_mesh(self):
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
+    def _dynamic_cp_local_tensor(
+        self,
+        batch: Dict[str, Any],
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        cp_group = batch["cp_group"]
+        cp_size = dist.get_world_size(cp_group)
+        if cp_size == 1:
+            return tensor
+        assert tensor.shape[0] == 1 and tensor.shape[1] % cp_size == 0
+        local_tokens = tensor.shape[1] // cp_size
+        cp_rank = dist.get_rank(cp_group)
+        cp_partition_mode = batch["cp_partition_mode"]
+        if cp_partition_mode == "contiguous":
+            start = cp_rank * local_tokens
+            return tensor[:, start:start + local_tokens].contiguous()
+        if cp_partition_mode == "zigzag":
+            index = get_thd_partitioned_indices(
+                batch["cu_seqlens_padded"],
+                tensor.shape[1],
+                cp_size,
+                cp_rank,
+            ).to(device=tensor.device, dtype=torch.long)
+            return tensor.index_select(1, index).contiguous()
+        raise ValueError(f"Unsupported dynamic-CP partition mode: {cp_partition_mode!r}")
 
-        self.cp_size = self.config.policy.dist_config.context_parallel_size
-        self.dp_size = world_size // self.cp_size
-        self.ep_size = self.config.policy.dist_config.expert_model_parallel_size
-
-        # Create 2D device mesh: (dp_size, cp_size)
-        # Ranks laid out in row-major: mesh[dp_idx, cp_idx] = dp_idx * cp_size + cp_idx
-        # - CP groups: consecutive ranks along dim 1, e.g., [0,1], [2,3], [4,5], [6,7]
-        # - DP groups: striped ranks along dim 0, e.g., [0,2,4,6], [1,3,5,7]
-        # When cp_size=1, this degenerates to pure DP
-        self.mesh = init_device_mesh(
-            "cuda", mesh_shape=(self.dp_size, self.cp_size), mesh_dim_names=("dp", "cp")
+    def _dynamic_cp_response_pad(
+        self,
+        batch: Dict[str, Any],
+        curr_log_probs: torch.Tensor,
+        entropy: torch.Tensor,
+    ) -> Dict[str, Any]:
+        cp_group = batch["cp_group"]
+        local_cp_size = batch["local_cp_size"]
+        cu_seqlens_padded = batch["cu_seqlens_padded"]
+        cp_partition_mode = batch["cp_partition_mode"]
+        reconstructed = {
+            "curr_log_probs":
+                reconstruct_dynamic_cp_packed_tensor(
+                    curr_log_probs,
+                    cu_seqlens_padded,
+                    local_cp_size,
+                    cp_partition_mode=cp_partition_mode,
+                    cp_group=cp_group,
+                ),
+            "per_token_entropy":
+                reconstruct_dynamic_cp_packed_tensor(
+                    entropy,
+                    cu_seqlens_padded,
+                    local_cp_size,
+                    cp_partition_mode=cp_partition_mode,
+                    cp_group=cp_group,
+                ),
+        }
+        padded = packed_to_response_padded(
+            {
+                **reconstructed,
+                "mask": batch["mask"],
+                "advantages": batch["advantages"],
+                "prev_log_probs": batch["prev_log_probs"],
+                "ref_log_probs": batch.get("ref_log_probs"),
+                "rollout_log_probs": batch.get("rollout_log_probs"),
+                "teacher_log_probs": batch.get("teacher_log_probs"),
+                "sample_mask": batch.get("sample_mask"),
+                "token_weights": batch.get("token_weights"),
+            },
+            cu_seqlens_padded,
+            batch["dyn_cp_response_start"],
+            batch["dyn_cp_response_length"],
         )
-        self.dp_group = self.mesh.get_group("dp")  # For FSDP gradient sync, metric reduction
-        self.cp_group = self.mesh.get_group("cp")  # For Ring Flash Attention, logit gathering
-        self.dp_mesh = self.mesh["dp"]
-
-        self.dp_rank = rank // self.cp_size
-        self.cp_rank = rank % self.cp_size
-        assert self.dp_rank == mpu.get_data_parallel_rank(
-        ), f"dp_rank mismatch: {self.dp_rank} vs {mpu.get_data_parallel_rank()}"
-        assert self.cp_rank == mpu.get_context_parallel_rank(
-        ), f"cp_rank mismatch: {self.cp_rank} vs {mpu.get_context_parallel_rank()}"
-
-        log(
-            f"[Rank {rank}] Device mesh (2D): world_size={world_size}, "
-            f"cp_size={self.cp_size}, dp_size={self.dp_size}"
-        )
-        log(
-            f"[Rank {rank}] Mesh shape: {self.mesh.shape}, "
-            f"dp_rank={self.dp_rank}, cp_rank={self.cp_rank}"
-        )
-
-        if self.cp_size > 1:
-            # Setup Ring Flash Attention with CP group from mesh (only when cp_size > 1)
-            # substitute_hf_flash_attn(self.cp_group, heads_k_stride=1)
-            log(f"[Rank {rank}] CP initialized via device mesh")
-        else:
-            log(f"[Rank {rank}] Pure DP mode (cp_size=1)")
-
-        # ---- HpModule (DSV4 / Qwen3.5-MoE): two independent meshes ----
-        # Both span all `world_size` ranks (CP is orthogonal to weight sharding
-        # — it doesn't shrink ep_fsdp_size). `apply_hp(model, ep_2d_mesh,
-        # cp_mesh=cp_mesh_for_hp)` consumes them directly; the existing
-        # `dp_mesh` / `cp_group` above are unused for the HpModule wrap.
-        # When `ep_size == 1` / `cp_size == 1` the corresponding axis is just
-        # trivial (size-1) and HpModule still works.
-        assert world_size % self.ep_size == 0, \
-            f"world_size={world_size} not divisible by ep_size={self.ep_size}"
-        self.ep_2d_mesh = init_device_mesh(
-            "cuda",
-            mesh_shape=(world_size // self.ep_size, self.ep_size),
-            mesh_dim_names=("ep_fsdp", "ep"),
-        )
-        cp_full = init_device_mesh(
-            "cuda",
-            mesh_shape=(world_size // self.cp_size, self.cp_size),
-            mesh_dim_names=("dp_for_cp", "cp_hp"),
-        )
-        self.cp_mesh_for_hp = cp_full["cp_hp"]
-        log(
-            f"[Rank {rank}] HpModule meshes built: ep_size={self.ep_size}, "
-            f"ep_fsdp_size={world_size // self.ep_size}, "
-            f"cp_size_hp={self.cp_size}"
-        )
-
-    def _get_init_weight_context_manager(self):
-        """Ref: verl/utils/fsdp_utils.py::get_init_weight_context_manager.
-
-        NOTE: tie_word_embedding causes meta_tensor init to hang.
-        """
-        from accelerate import init_empty_weights
-
-        self._use_meta_tensor = not self.hf_config.tie_word_embeddings
-
-        def cpu_init_weights():
-            return torch.device("cpu")
-
-        if self._use_meta_tensor:
-            return init_empty_weights if dist.get_rank() != 0 else cpu_init_weights
-        else:
-            return cpu_init_weights
-
-    def _apply_fsdp2_on_model(self, model, device_mesh):
-        layer_cls_to_wrap = model._no_split_modules
-        assert len(layer_cls_to_wrap) > 0 and None not in layer_cls_to_wrap
-
-        modules = [
-            module for name, module in model.named_modules()
-            if module.__class__.__name__ in layer_cls_to_wrap or
-            (isinstance(module, torch.nn.Embedding) and not model.config.tie_word_embeddings)
-        ]
-        param_dtype = torch.bfloat16  # Default to bf16 as before
-        reduce_dtype = torch.float32
-        fsdp_kwargs = {
-            "mp_policy": MixedPrecisionPolicy(
-                param_dtype=param_dtype,
-                reduce_dtype=reduce_dtype,
-            ),
-            "mesh": device_mesh,
+        mask = padded["mask"]
+        per_token_entropy = padded["per_token_entropy"]
+        return {
+            **padded,
+            "sample_mask": as_sequence_sample_mask(padded["sample_mask"]),
+            "scaled_entropy": (per_token_entropy * mask).sum() / mask.sum().clamp(min=1),
         }
 
-        for module in modules:
-            fully_shard(module, **fsdp_kwargs)
-        fully_shard(model, **fsdp_kwargs)
-
-        return model
-
-    def _fsdp2_load_full_state_dict(self, model, full_state):
-        if getattr(self, '_use_meta_tensor', True):
-            if dist.get_rank() == 0:
-                model = model.to(device=torch.cuda.current_device(), non_blocking=True)
-            else:
-                model = model.to_empty(device=torch.cuda.current_device())
-        else:
-            model = model.to(device=torch.cuda.current_device(), non_blocking=True)
-
-        is_cpu_offload = False  # 看什么时候想要 offload cpu
-        options = StateDictOptions(
-            full_state_dict=True, cpu_offload=is_cpu_offload, broadcast_from_rank0=True
-        )
-
-        set_model_state_dict(model, full_state, options=options)
-
-        if getattr(self, '_use_meta_tensor', True):
-            for _name, buf in model.named_buffers():
-                dist.broadcast(buf, src=0)
-
-        if is_cpu_offload:
-            model.to("cpu", non_blocking=True)
-            for buf in model.buffers():
-                buf.data = buf.data.to(torch.cuda.current_device())
-
-        return model
-
-    def get_fsdp2_model(self, init_context, hf_model_path, model_only_inference: bool = False):
-        if self.training_config.enable_mtp:
-            assert self.policy_config.model_arch == "deepseek_v4", (
-                "FSDP2 MTP finetune is currently only supported for model_arch=deepseek_v4"
-            )
-        if self.training_config.enable_dspark:
-            assert self.policy_config.model_arch == "deepseek_v4"
-        if self.training_config.online_train_dspark:
-            assert isinstance(self.config, FinetuneConfig), "DSpark P0 only supports SFT"
-            assert self.policy_config.without_ref, "DSpark draft training does not use a ref model"
-            assert not self.training_config.use_dynamic_mbs
-            self._dspark_anchor_generator = torch.Generator()
-            self._dspark_anchor_generator.manual_seed(self.training_config.seed + self.dp_rank)
-            if self.cp_size > 1:
-                assert not self.policy_config.dist_config.dynamic_context_parallel, (
-                    "DSpark contiguous CP does not support dynamic CP scheduling"
-                )
-                assert self.training_config.moe_balance_loss_coef == 0, (
-                    "DSpark non-compacting CP owner slots require moe_balance_loss_coef=0"
-                )
-                assert not self.policy_config.moe_router_force_load_balancing, (
-                    "DSpark contiguous CP requires deterministic model-driven routing"
-                )
-            assert self.policy_config.attn_implementation == "fused", (
-                "DSpark P0 uses the DeepSeek-V4 sparse fused attention path"
-            )
-        model_cls = self.get_model_cls()
-        if not issubclass(model_cls, HpModule):
-            # ---- existing stock path unchanged ----
-            with init_context():
-                model = model_cls.from_pretrained(
-                    hf_model_path,
-                    trust_remote_code=True,
-                    attn_implementation=self.policy_config.attn_implementation,
-                )
-            if not model_only_inference:
-                model.train()
-            else:
-                model.eval()
-            full_state = model.state_dict()
-
-            model = self._apply_fsdp2_on_model(model, device_mesh=self.dp_mesh)
-            model = self._fsdp2_load_full_state_dict(model, full_state)
-
-        else:
-            # Hybrid-parallel path: meta → apply_hp → load_checkpoint_hp
-            # (per-arch validate / config / apply_hp live in hp_builder).
-            model = get_hp_builder(self.policy_config.model_arch
-                                  ).build(self, model_cls, hf_model_path, model_only_inference)
-
-        return model
-
-
-class CheckpointMixin:
-    def save_checkpoint(self, global_step: int, dataloader=None):
-        if isinstance(self.model, HpModule):
-            # HpModule path (DeepSeek-V4 / Qwen3.5-MoE EP+CP+FSDP2): write a
-            # self-contained ``from_pretrained``-ready bf16 HF directory under
-            # ``<save_ckpt_path>/iter_{step:07d}/hf_hp/``. ``hf_hp`` keeps the
-            # subdir distinct from the stock ``model/`` + ``optimizer/`` layout
-            # so a follow-up reload won't mis-identify it. ``save_checkpoint_hp``
-            # is collective (rank-0 writes, other ranks gather, final barrier),
-            # so call it on every rank.
-            ck = self.config.checkpoint
-            save_path = str(Path(ck.save_ckpt_path).expanduser() / "hf" / f"{global_step}")
-            enable_mtp = bool(self.config.training.enable_mtp)
-            enable_dspark = bool(self.config.training.enable_dspark)
-            preserve_mtp = not enable_mtp or enable_dspark
-            if self.config.policy.model_arch == "qwen4_exp":
-                preserve_mtp = False
-            self.model.save_checkpoint_hp(
-                save_path,
-                orig_ckpt_dir=self.config.policy.hf_model_path,
-                preserve_mtp=preserve_mtp,
-            )
-            log(f"save_checkpoint_hp wrote {save_path}", rank=0)
-            return
-        save_checkpoint(
-            self.config, self.model, self.optimizer, self.lr_scheduler, global_step=global_step
-        )
-        if self.config.checkpoint.convert_mcore_to_hf_online:
-            save_hf_checkpoint(self.config, self.model, self.tokenizer, global_step=global_step)
-        # TODO: Save dataloader state if provided
-
-
-class RouterReplayMixin:
-    """Router Replay (R3) support for FSDP2 backend.
-
-    Replays sampler routing decisions during the actor's forward pass so
-    that TopKRouter selects the same experts as the inference engine —
-    eliminating routing drift caused by FP8/FP4 weight quantization.
-    """
-
-    _topk_layer_indices: Optional[list[int]] = None
-
-    def _get_topk_layer_indices(self) -> list[int]:
-        if self._topk_layer_indices is None:
-            self._topk_layer_indices = get_topk_layer_indices(self.hf_config)
-        return self._topk_layer_indices
-
-    def _prepare_replay_indices(
-        self,
-        batches: List[Dict[str, Any]],
-        seq_length: int,
-        packed_seq_params=None,
-    ) -> Optional[list[torch.Tensor]]:
-        """Build per-TopKRouter-layer replay indices from a micro-batch.
-
-        Parameters
-        ----------
-        batches : list[dict]
-            Micro-batch dicts; each must contain ``"routed_experts"``
-            of shape ``(sample_seq_len, num_all_layers, topk)``.
-        seq_length : int
-            Padded sequence length for this step.
-
-        Returns
-        -------
-        list[Tensor] or None
-            One ``(B * seq_length, topk)`` int64 tensor per TopKRouter
-            layer, ready for :func:`router_replay_ctx`. ``None`` if the
-            batch has no ``routed_experts``.
-        """
-        if batches[0].get("routed_experts") is None:
-            return None
-
-        topk_indices = self._get_topk_layer_indices()
-        cp_size = mpu.get_context_parallel_world_size()
-        cp_rank = mpu.get_context_parallel_rank()
-        dp_rank = mpu.get_data_parallel_rank()
-
-        per_layer_accum: list[list[torch.Tensor]] = [[] for _ in topk_indices]
-
-        if packed_seq_params is not None:
-            padded_boundaries = packed_seq_params.cu_seqlens_q_padded.detach().cpu().tolist()
-            assert len(padded_boundaries) == len(batches) + 1
-            for sample_idx, batch in enumerate(batches):
-                re = batch["routed_experts"]
-                seq_batch = re.shape[0] - 1
-                padded_len = padded_boundaries[sample_idx + 1] - padded_boundaries[sample_idx]
-                assert seq_batch > 0 and padded_len >= seq_batch
-                full_index = torch.arange(padded_len, device=re.device)
-                index = (full_index + (full_index // seq_batch) * 6 * dp_rank) % seq_batch
-                padded = re[index]
-                for out_i, layer_i in enumerate(topk_indices):
-                    per_layer_accum[out_i].append(padded[:, layer_i, :])
-
-            packed_per_layer = [
-                torch.cat(chunks, dim=0).contiguous().long() for chunks in per_layer_accum
-            ]
-            total_tokens = packed_seq_params.total_seqlen
-            assert all(rows.shape[0] == total_tokens for rows in packed_per_layer)
-            if cp_size > 1:
-                assert total_tokens % cp_size == 0
-                local_tokens = total_tokens // cp_size
-                start = cp_rank * local_tokens
-                packed_per_layer = [
-                    rows[start:start + local_tokens].contiguous() for rows in packed_per_layer
-                ]
-            return packed_per_layer
-
-        for batch in batches:
-            re = batch["routed_experts"]
-            seq_batch = re.shape[0] - 1
-
-            full_index = torch.arange(seq_length, device=re.device)
-            index = (full_index + (full_index // seq_batch) * 6 * dp_rank) % seq_batch
-
-            if cp_size > 1:
-                s_local = seq_length // cp_size
-                start = cp_rank * s_local
-                index = index[start:start + s_local]
-
-            padded = re[index]
-
-            for out_i, layer_i in enumerate(topk_indices):
-                per_layer_accum[out_i].append(padded[:, layer_i, :])
-
-        return [torch.cat(chunks, dim=0).contiguous().long() for chunks in per_layer_accum]
-
-    @contextmanager
-    def _maybe_router_replay(
-        self,
-        model,
-        batches: List[Dict[str, Any]],
-        seq_length: int,
-        packed_seq_params=None,
-    ):
-        """Scope router replay for one micro-batch forward **and** backward.
-
-        ``router_replay_ctx`` tears down replay state on exit. When gradient
-        checkpointing is enabled the backward pass re-runs forward (recompute)
-        and still needs the pinned ``expert_idx`` from rollout — callers must
-        keep this context open until ``loss.backward()`` returns.
-        """
-        if not self.config.training.moe_router_replay:
-            yield
-            return
-
-        indices = self._prepare_replay_indices(
-            batches, seq_length, packed_seq_params=packed_seq_params
-        )
-        if indices is None:
-            yield
-            return
-
-        with router_replay_ctx(model, indices):
-            yield
-
-
-class ForwardStepMixin(RouterReplayMixin):
     @torch.no_grad()
     def compute_logprobs(
         self,
@@ -502,8 +188,10 @@ class ForwardStepMixin(RouterReplayMixin):
         total_samples = len(batches_list)
         pack_seq = self.policy_config.ppo_pack_seq
         if pack_seq:
-            assert isinstance(self.prepare_data, DeepseekV4PrepareDataForwardLLM
-                             ), ("FSDP2 packed RL forward currently supports only deepseek_v4")
+            assert _FSDP2_PACKED_RL_PREPARE_TYPES and isinstance(
+                self.prepare_data,
+                _FSDP2_PACKED_RL_PREPARE_TYPES,
+            ), ("FSDP2 packed RL forward currently supports deepseek_v4 and qwen4_exp")
             seq_length = self.training_config.seq_length
             batch_iter = convert_mbs_for_pack_seq(
                 batches_list,
@@ -543,11 +231,16 @@ class ForwardStepMixin(RouterReplayMixin):
             )
             with replay_ctx:
                 pre_shifted = full_psp is not None
+                response_mask = (
+                    build_grpo_compact_ce_mask(batches, target)
+                    if self.training_config.ce_compaction else None
+                )
                 with self._maybe_rl_linear_ce_context(
                     model,
                     target,
                     pre_shifted=pre_shifted,
                     return_entropy=False,
+                    response_mask=response_mask,
                 ):
                     head_out = model(**model_fwd_args).logits
                 logprobs = self._rl_logprobs_from_head_output(
@@ -586,15 +279,30 @@ class ForwardStepMixin(RouterReplayMixin):
         *,
         pre_shifted: bool,
         return_entropy: bool,
+        response_mask: torch.Tensor | None = None,
     ):
         if not self.training_config.use_linear_ce:
             return nullcontext()
         local_labels = self._prepare_rl_linear_ce_labels(target, pre_shifted=pre_shifted)
+        local_mask = None
+        if self.training_config.ce_compaction:
+            assert response_mask is not None
+            if pre_shifted:
+                assert response_mask.shape == target.shape
+                local_mask = response_mask
+            else:
+                assert response_mask.shape == (target.shape[0], target.shape[1] - 1)
+                # The final hidden state has no next-token policy loss.
+                local_mask = torch.cat(
+                    (response_mask, response_mask.new_zeros((target.shape[0], 1))), dim=-1
+                )
+            local_mask = self.prepare_data.rl_train_cp_chunk_single_data(local_mask)
         return linear_ce_forward_context(
             model,
             local_labels,
             self.training_config.linear_ce_backend,
             return_entropy=return_entropy,
+            loss_mask=local_mask,
         )
 
     def _rl_logprobs_from_head_output(
@@ -692,19 +400,18 @@ class ForwardStepMixin(RouterReplayMixin):
     def _all_gather_cp_aware(self, local_tensor: torch.Tensor, gather_dim: int = 1) -> torch.Tensor:
         """All-gather across CP ranks, dispatching the correct pattern.
 
-        DSv4 models use contiguous non-zigzag split; legacy models use
-        mirror-pair zigzag.
+        Qwen4/DSv4 use contiguous splits; standard models use mirror-pair
+        zigzag.
         """
         cp_size = mpu.get_context_parallel_world_size()
         if cp_size <= 1:
             return local_tensor
-        if isinstance(
-            self.prepare_data,
-            (DeepseekV4PrepareDataForwardLLM, DeepseekV4DpoPrepareDataForwardLLM)
-        ):
+        cp_partition_mode = self.prepare_data.cp_partition_mode
+        if cp_partition_mode == "contiguous":
             return all_gather_from_context_parallel_region_no_zigzag(local_tensor, gather_dim)
-        else:
+        if cp_partition_mode == "zigzag":
             return all_gather_from_context_parallel_region(local_tensor, gather_dim)
+        raise ValueError(f"Unsupported CP partition mode: {cp_partition_mode!r}")
 
     def gather_log_probs_packed(
         self,
@@ -877,6 +584,7 @@ class ForwardStepMixin(RouterReplayMixin):
     ):
         training_config = self.config.training
         dp_size = mpu.get_data_parallel_world_size()
+        dynamic_cp = self.policy_config.dist_config.dynamic_context_parallel
 
         is_dpo = training_config.loss_func == "dpo"
         use_linear_ce = training_config.use_linear_ce
@@ -887,17 +595,35 @@ class ForwardStepMixin(RouterReplayMixin):
             )
         loss_fn = get_loss_fn("fsdp2", training_config.loss_func)
         gbs_factor = 2 if is_dpo else 1
-        assert training_config.train_gbs * gbs_factor == len(
-            batch
-        ) * dp_size, f"{training_config.train_gbs=} {gbs_factor=} {len(batch)=} {dp_size=}"
+        if not dynamic_cp:
+            assert training_config.train_gbs * gbs_factor == len(
+                batch
+            ) * dp_size, f"{training_config.train_gbs=} {gbs_factor=} {len(batch)=} {dp_size=}"
 
         if is_dpo:
-            assert not training_config.enable_mtp, "DPO + MTP not yet supported on FSDP2"
+            assert not training_config.online_mtp_sft, (
+                "DPO + online MTP training is not yet supported on FSDP2"
+            )
             assert not training_config.online_train_dspark, "DPO + DSpark is not supported on FSDP2"
             assert not training_config.use_dynamic_mbs, "DPO + dynamic_mbs not yet supported"
 
         pack_seq = self.policy_config.ppo_pack_seq
-        if pack_seq:
+        dynamic_cp_microbatches = None
+        if dynamic_cp:
+            assert training_config.train_gbs == len(batch) * self.dp_size
+            max_seq_length = get_batches_max_seqlen(batch, self.training_config.pad_to_mulitiple_of)
+            max_seq_length = get_max_seqlen_within_dp(max_seq_length)
+            max_seq_length = min(max_seq_length, training_config.seq_length)
+            dynamic_cp_microbatches, num_microbatches, seqlen_sum, seqlen_sq_sum = (
+                self.prepare_data.sft_reroute_data_for_dynamic_cp(
+                    list(batch),
+                    self.tokenizer.pad_token_id,
+                    vocab_size=self._get_vocab_size(),
+                    pad_with_random_token=self.config.training.moe_pad_with_random_tokens,
+                )
+            )
+            data_iter = [[microbatch] for microbatch in dynamic_cp_microbatches]
+        elif pack_seq:
             assert not is_dpo, "DPO + pack_seq not supported"
             assert not training_config.use_dynamic_mbs, (
                 "use_dynamic_mbs is incompatible with ppo_pack_seq "
@@ -950,29 +676,34 @@ class ForwardStepMixin(RouterReplayMixin):
         enable_balance_loss = training_config.moe_balance_loss_coef > 0
 
         # 在 dp rank 与 micro batch 之间统计 valid token 数量，用于后面 loss 的归一化。
-        # MTP（仅 DSV4）额外统计逐 depth 的全局 valid token 数，作为无偏 den 替换
+        # MTP 额外统计逐 depth 的全局 valid token 数，作为无偏 den 替换
         # calculate_mtp_loss 里的 per-micro-batch den。
-        enable_mtp = training_config.enable_mtp
+        enable_mtp_loss = training_config.online_mtp_sft
         online_train_dspark = training_config.online_train_dspark
-        mtp_num_depth = int(self.hf_config.num_nextn_predict_layers) if enable_mtp else 0
+        mtp_num_depth = int(self.hf_config.num_nextn_predict_layers) if enable_mtp_loss else 0
         mtp_cp_rank = dist.get_rank(self.model._cp_group) if self.cp_size > 1 else 0
         device = torch.cuda.current_device()
         global_n = torch.zeros((), device=device)
-        global_n_for_mtp = torch.zeros(mtp_num_depth, device=device) if enable_mtp else None
+        global_n_for_mtp = torch.zeros(mtp_num_depth, device=device) if enable_mtp_loss else None
         global_n_for_dspark = torch.zeros((), device=device) if online_train_dspark else None
         prepared_dspark_data = [] if online_train_dspark else None
         pack_n_seg_max = 0
         pack_n_cross_max = 0
-        pack_is_thd_min = 1 if pack_seq else 0
+        pack_is_thd_min = 1 if pack_seq or dynamic_cp else 0
         pack_total_max = 0
         pack_local_max = 0
         pack_raw_max = 0
         dspark_owned_max = 0
         dspark_slots_max = 0
         logged_thd_pack_layout = False
+        prepare_data_func = (
+            self.prepare_data.sft_train_with_dynamic_cp
+            if dynamic_cp else self.prepare_data.sft_train
+        )
         for mb_samples in data_iter:
-            prep_batch, prep_fwd_kwargs = self.prepare_data.sft_train(
-                mb_samples,
+            prepare_samples = [dict(mb_samples[0])] if dynamic_cp else mb_samples
+            prep_batch, prep_fwd_kwargs = prepare_data_func(
+                prepare_samples,
                 max_seq_length,
                 self.tokenizer.pad_token_id,
                 comput_attn_mask=False,
@@ -980,6 +711,11 @@ class ForwardStepMixin(RouterReplayMixin):
                 input_teacher_hidden_states=False,
                 vocab_size=self._get_vocab_size(),
             )
+            if dynamic_cp:
+                prep_batch["cp_partition_mode"] = self._dynamic_cp_partition_mode(
+                    prep_batch,
+                    prep_fwd_kwargs,
+                )
             local_seqlen = prep_fwd_kwargs["input_ids"].shape[1]
             pack_local_max = max(pack_local_max, local_seqlen)
             full_psp = prep_batch.get("full_packed_seq_params")
@@ -997,7 +733,7 @@ class ForwardStepMixin(RouterReplayMixin):
                 n_cross = count_cross_cp_segments(cu_pad, self.cp_size)
                 pack_n_cross_max = max(pack_n_cross_max, n_cross)
             global_n += (prep_batch["labels"] != -100).sum()
-            if enable_mtp:
+            if enable_mtp_loss:
                 global_n_for_mtp += mtp_per_depth_valid_count(
                     prep_batch["full_labels"],
                     prep_batch["full_loss_mask"],
@@ -1045,7 +781,7 @@ class ForwardStepMixin(RouterReplayMixin):
         dist.all_reduce(pack_is_thd_t, op=dist.ReduceOp.MIN)
         dist.all_reduce(global_n)
         global_n = global_n.clamp_min(1.0)
-        if enable_mtp:
+        if enable_mtp_loss:
             dist.all_reduce(global_n_for_mtp)
             global_n_for_mtp = global_n_for_mtp.clamp_min(1.0)
         if online_train_dspark:
@@ -1061,12 +797,13 @@ class ForwardStepMixin(RouterReplayMixin):
         report_dspark_metrics = {} if online_train_dspark else None
         report_balance_loss = 0.
         train_iter = prepared_dspark_data if online_train_dspark else data_iter
-        for train_item in tqdm(train_iter, disable=True):
+        for microbatch_index, train_item in enumerate(tqdm(train_iter, disable=True)):
             if online_train_dspark:
                 batch, fwd_kwargs = train_item
             else:
-                batch, fwd_kwargs = self.prepare_data.sft_train(
-                    train_item,
+                prepare_samples = [dict(train_item[0])] if dynamic_cp else train_item
+                batch, fwd_kwargs = prepare_data_func(
+                    prepare_samples,
                     max_seq_length,
                     self.tokenizer.pad_token_id,
                     comput_attn_mask=self.training_config.comput_attn_mask,
@@ -1077,6 +814,18 @@ class ForwardStepMixin(RouterReplayMixin):
                         False,
                     ),
                     vocab_size=self._get_vocab_size(),
+                )
+                if dynamic_cp:
+                    batch["cp_partition_mode"] = self._dynamic_cp_partition_mode(
+                        batch,
+                        fwd_kwargs,
+                    )
+
+            if isinstance(self.model, HpModule):
+                self.model.maybe_dump_prepared_microbatch_diagnostics(
+                    batch,
+                    fwd_kwargs,
+                    microbatch_index,
                 )
 
             loss_mask = batch["loss_mask"]
@@ -1094,96 +843,114 @@ class ForwardStepMixin(RouterReplayMixin):
                     labels,
                     training_config.linear_ce_backend,
                     return_entropy=False,
+                    loss_mask=loss_mask if training_config.ce_compaction else None,
                 ) if use_linear_ce else nullcontext()
             )
             # Keep linear_ce context through loss.backward so recomputed lm_head
             # (if ever checkpointed) still sees labels; MTP nests rolled labels.
-            with linear_ce_context:
-                with train_forward_context:
-                    outputs = self.model(**fwd_kwargs)
-                if use_linear_ce:
-                    # SFT uses return_entropy=False → logits is log_probs tensor.
-                    log_probs = outputs.logits
-                    assert isinstance(log_probs, torch.Tensor) and log_probs.dim() >= 2
-                    per_token_linear_ce_loss = -log_probs.float()
-                    logits = None
-                else:
-                    # Cast to fp32 for numerically stable cross entropy (log-sum-exp in
-                    # bf16/fp16 is lossy); consistent with logprob path above.
-                    logits = outputs.logits.float()
-                    per_token_linear_ce_loss = None
+            with self._dynamic_cp_model_context(self.model, batch):
+                with linear_ce_context:
+                    if self.config.debug.debug_dtype:
+                        from gpatch_v4.utils.debug_dtype import debug_dump_dtype
+                        debug_dump_dtype(
+                            model=self.model,
+                            fwd_kwargs=fwd_kwargs,
+                            dump_path="debug-tmp/sft_dtype.md",
+                            watched_files=["modeling_deepseek_v4.py", "mtp.py"],
+                            skip_ops=[],
+                        )
+                    with train_forward_context:
+                        outputs = self.model(**fwd_kwargs)
+                    if use_linear_ce:
+                        # SFT uses return_entropy=False → logits is log_probs tensor.
+                        log_probs = outputs.logits
+                        assert isinstance(log_probs, torch.Tensor) and log_probs.dim() >= 2
+                        per_token_linear_ce_loss = -log_probs.float()
+                        logits = None
+                    else:
+                        # Cast to fp32 for numerically stable cross entropy (log-sum-exp in
+                        # bf16/fp16 is lossy); consistent with logprob path above.
+                        logits = outputs.logits.float()
+                        per_token_linear_ce_loss = None
 
-                mtp_scale = float(
-                    getattr(
-                        outputs,
-                        "mtp_loss_scaling_factor",
-                        training_config.mtp_loss_scaling_factor,
+                    mtp_scale = float(
+                        getattr(
+                            outputs,
+                            "mtp_loss_scaling_factor",
+                            training_config.mtp_loss_scaling_factor,
+                        )
                     )
-                )
-                loss_input = Fsdp2FinetuneLossInput(
-                    labels_2d=labels,
-                    loss_mask_2d=loss_mask,
-                    batch=batch,
-                    dp_size=self.dp_size,
-                    logits=logits,
-                    use_linear_ce=use_linear_ce,
-                    per_token_linear_ce_loss=per_token_linear_ce_loss,
-                    linear_ce_backend=(
-                        training_config.linear_ce_backend if use_linear_ce else None
-                    ),
-                    global_n=global_n,
-                    vocab_size=self._get_vocab_size(),
-                    loss_fct=loss_fct,
-                    online_train_dspark=online_train_dspark,
-                    dspark_output=getattr(outputs, "dspark_output", None)
-                    if online_train_dspark else None,
-                    global_n_for_dspark=global_n_for_dspark,
-                    enable_mtp=enable_mtp,
-                    mtp_per_depth_h=getattr(outputs, "mtp_per_depth_h", None)
-                    if enable_mtp else None,
-                    lm_head=self.model.lm_head if enable_mtp else None,
-                    cp_group=(self.model._cp_group if self.cp_size > 1 else None)
-                    if enable_mtp else None,
-                    packed_seq_params=fwd_kwargs.get("packed_seq_params") if enable_mtp else None,
-                    global_n_for_mtp=global_n_for_mtp,
-                    mtp_loss_scaling_factor=mtp_scale,
-                    all_gather_fn=self._all_gather_cp_aware if is_dpo else None,
-                )
-                result = loss_fn(self.config, loss_input)
-                loss = result.loss
-                main_loss = result.main_loss
-                mtp_loss = result.mtp_loss
-                mtp_depth_losses = result.mtp_depth_losses
-                mtp_depth_loss_metrics = result.mtp_depth_loss_metrics
-                if is_dpo:
-                    for k, v in result.metrics.items():
-                        dpo_metric_sums[k] = dpo_metric_sums.get(k, 0.0) + v
-
-                balance_loss = None
-                if enable_balance_loss:
-                    balance_loss = load_balancing_loss_func(
-                        gate_logits=outputs.router_logits,
-                        num_experts=self.model.num_experts,
-                        top_k=self.model.num_experts_per_tok,
-                        cp_group=self.model._cp_group if self.cp_size > 1 else None,
+                    loss_input = Fsdp2FinetuneLossInput(
+                        labels_2d=labels,
+                        loss_mask_2d=loss_mask,
+                        batch=batch,
+                        dp_size=self.dp_size,
+                        logits=logits,
+                        use_linear_ce=use_linear_ce,
+                        per_token_linear_ce_loss=per_token_linear_ce_loss,
+                        linear_ce_backend=(
+                            training_config.linear_ce_backend if use_linear_ce else None
+                        ),
+                        global_n=global_n,
+                        vocab_size=self._get_vocab_size(),
+                        loss_fct=loss_fct,
+                        online_train_dspark=online_train_dspark,
+                        dspark_output=getattr(outputs, "dspark_output", None)
+                        if online_train_dspark else None,
+                        global_n_for_dspark=global_n_for_dspark,
+                        enable_mtp=enable_mtp_loss,
+                        mtp_per_depth_h=getattr(outputs, "mtp_per_depth_h", None)
+                        if enable_mtp_loss else None,
+                        lm_head=self.model.lm_head if enable_mtp_loss else None,
+                        cp_group=(self.model._cp_group if self.cp_size > 1 else None)
+                        if enable_mtp_loss else None,
+                        packed_seq_params=fwd_kwargs.get("packed_seq_params")
+                        if enable_mtp_loss else None,
+                        global_n_for_mtp=global_n_for_mtp,
+                        mtp_loss_scaling_factor=mtp_scale,
+                        all_gather_fn=self._all_gather_cp_aware if is_dpo else None,
                     )
+                    result = loss_fn(self.config, loss_input)
+                    loss = result.loss
+                    main_loss = result.main_loss
+                    mtp_loss = result.mtp_loss
+                    mtp_depth_losses = result.mtp_depth_losses
+                    mtp_depth_loss_metrics = result.mtp_depth_loss_metrics
+                    if is_dpo:
+                        for k, v in result.metrics.items():
+                            dpo_metric_sums[k] = dpo_metric_sums.get(k, 0.0) + v
 
-                    # The current computation method follows HF.transformers, which introduces a bias due to varying sequence lengths.
-                    # For example:
-                    # ```
-                    # s1 = [
-                    #   [1, 2, ..., 10000],
-                    #   [1],
-                    # ]
-                    # ```
-                    # will produce a different result compared to
-                    # ```
-                    # s2 = [[1, 2, ...., 10000, 1]]
-                    # ```
-                    loss = loss + training_config.moe_balance_loss_coef * balance_loss / num_microbatches
+                    balance_loss = None
+                    if enable_balance_loss:
+                        balance_loss = load_balancing_loss_func(
+                            gate_logits=outputs.router_logits,
+                            num_experts=self.model.num_experts,
+                            top_k=self.model.num_experts_per_tok,
+                            cp_group=(
+                                batch["cp_group"] if dynamic_cp else
+                                self.model._cp_group if self.cp_size > 1 else None
+                            ),
+                        )
 
-                if not forward_only:
-                    loss.backward()
+                        # The current computation method follows HF.transformers, which introduces a bias due to varying sequence lengths.
+                        # For example:
+                        # ```
+                        # s1 = [
+                        #   [1, 2, ..., 10000],
+                        #   [1],
+                        # ]
+                        # ```
+                        # will produce a different result compared to
+                        # ```
+                        # s2 = [[1, 2, ...., 10000, 1]]
+                        # ```
+                        loss = (
+                            loss +
+                            training_config.moe_balance_loss_coef * balance_loss / num_microbatches
+                        )
+
+                    if not forward_only:
+                        loss.backward()
 
             tmp = loss.detach().clone()
             tmp_main = main_loss.detach().clone()
@@ -1215,6 +982,9 @@ class ForwardStepMixin(RouterReplayMixin):
                     cp_group=self.model._cp_group if self.cp_size > 1 else None,
                 )
 
+        if isinstance(self.model, HpModule):
+            self.model.finish_step0_diagnostics()
+
         report_loss = torch.tensor(report_loss).to(torch.cuda.current_device())
         torch.distributed.all_reduce(report_loss, op=torch.distributed.ReduceOp.AVG)
         report_main_loss_t = torch.tensor(report_main_loss).to(torch.cuda.current_device())
@@ -1243,7 +1013,7 @@ class ForwardStepMixin(RouterReplayMixin):
             )
             torch.distributed.all_reduce(report_balance_loss_t, op=torch.distributed.ReduceOp.AVG)
             metrics[f"{metric_prefix}/balance_loss"] = report_balance_loss_t.item()
-        if training_config.enable_mtp:
+        if enable_mtp_loss:
             metrics[f"{metric_prefix}/mtp_loss"] = report_mtp_loss_t.item()
             if report_mtp_depth_loss is not None:
                 for i, value in enumerate(report_mtp_depth_loss):
@@ -1276,6 +1046,12 @@ class ForwardStepMixin(RouterReplayMixin):
         metrics[f"{metric_prefix}/pack_total_seqlen"] = pack_stats[2].item()
         metrics[f"{metric_prefix}/cp_local_seqlen"] = pack_stats[3].item()
         metrics[f"{metric_prefix}/pack_raw_tokens"] = pack_stats[4].item()
+        if dynamic_cp:
+            assert dynamic_cp_microbatches is not None
+            metrics[f"{metric_prefix}/dyn_cp_seqlen_sum"] = seqlen_sum
+            metrics[f"{metric_prefix}/dyn_cp_seqlen_sq_sum"] = seqlen_sq_sum
+            metrics[f"{metric_prefix}/dyn_cp_num_micro_batches"] = num_microbatches
+            metrics.update(self._dynamic_cp_schedule_stats(dynamic_cp_microbatches, metric_prefix))
         if online_train_dspark:
             metrics[f"{metric_prefix}/dspark_n_owned_anchors"] = pack_stats[5].item()
             metrics[f"{metric_prefix}/dspark_n_slots"] = pack_stats[6].item()

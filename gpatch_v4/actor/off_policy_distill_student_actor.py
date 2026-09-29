@@ -30,6 +30,7 @@ from gpatch_v4.rollout_generator import RolloutGeneratorFactory
 from gpatch_v4.training_backend import TrainingEngineFactory
 from gpatch_v4.transfer import get_tq_connector, init_tq_connector
 from gpatch_v4.utils import (
+    TimerSingleton,
     TrainReporterSingleton,
     display_rollout_generation,
     expand_rollout_batches,
@@ -155,15 +156,31 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
         self, rollout_batches_list: List[List[Dict[str, torch.Tensor]]]
     ):
         self.teacher_engine.onload_model()
-        for rollout_batches in rollout_batches_list:
-            _, teacher_outputs = self.teacher_engine.compute_hidden_states(rollout_batches)
-            if (mpu.is_pipeline_last_stage() and mpu.get_context_parallel_world_size() > 1):
-                teacher_outputs = [
-                    all_gather_from_context_parallel_region(teacher_output, gather_dim=0)
-                    for teacher_output in teacher_outputs
-                ]
-            for rollout_batch, teacher_output in zip(rollout_batches, teacher_outputs):
-                rollout_batch["teacher_hidden_states"] = teacher_output
+        use_dyn_cp = bool(self.config.teacher.dist_config.dynamic_context_parallel)
+        if use_dyn_cp:
+            flat = []
+            counts = []
+            for rollout_batches in rollout_batches_list:
+                counts.append(len(rollout_batches))
+                flat.extend(rollout_batches)
+            _, teacher_outputs = self.teacher_engine.compute_hidden_states_dynamic_cp(flat)
+            idx = 0
+            for rollout_batches, n in zip(rollout_batches_list, counts, strict=True):
+                for sample, teacher_output in zip(
+                    rollout_batches, teacher_outputs[idx:idx + n], strict=True
+                ):
+                    sample["teacher_hidden_states"] = teacher_output
+                idx += n
+        else:
+            for rollout_batches in rollout_batches_list:
+                _, teacher_outputs = self.teacher_engine.compute_hidden_states(rollout_batches)
+                if (mpu.is_pipeline_last_stage() and mpu.get_context_parallel_world_size() > 1):
+                    teacher_outputs = [
+                        all_gather_from_context_parallel_region(teacher_output, gather_dim=0)
+                        for teacher_output in teacher_outputs
+                    ]
+                for rollout_batch, teacher_output in zip(rollout_batches, teacher_outputs):
+                    rollout_batch["teacher_hidden_states"] = teacher_output
         self.teacher_engine.offload_model()
         return rollout_batches_list
 
@@ -172,7 +189,7 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
         epoch_i,
         train_step_i,
         batched_data: List[Dict[str, Any]],
-        avg_rollout_time=None,
+        extra_time_metrics=None,
     ):
         begint_time = sync_cuda_and_get_time()
         training_config = self.config.training
@@ -180,8 +197,11 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
         metric = self.model_engine.finetune_step(batched_data, num_microbatches, train_step_i)
         end_time = sync_cuda_and_get_time()
         metric["time_perf/train_step"] = end_time - begint_time
-        if avg_rollout_time is not None:
-            metric["time_perf/avg_rollout_time"] = avg_rollout_time
+        if extra_time_metrics:
+            metric.update(extra_time_metrics)
+        if "time_perf/train_step_total" not in metric:
+            metric["time_perf/train_step_total"] = 0.0
+        metric["time_perf/train_step_total"] += metric["time_perf/train_step"]
         if is_last_rank():
             log_prefix = f"training train_step {train_step_i}/{training_config.total_training_step} epoch {epoch_i}"
             TrainReporterSingleton.log_and_report(metric, train_step_i, log_prefix=log_prefix)
@@ -218,6 +238,7 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
             ) // training_config.prefetch_num_gb
             for prefetch_i in range(prefetch_times):
                 self.last_progress_time = time.time()
+                prefetch_t0 = sync_cuda_and_get_time()
 
                 cpu_barrier()
                 _prefetch_num_gb = min(
@@ -226,14 +247,11 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
                 )
                 rollout_step = train_step
                 with OffloadStudentEngineManager(self.model_engine):
-                    rollout_begin_time = sync_cuda_and_get_time()
                     rollout_batches, metrics = await self.rollout(
                         epoch, train_step,
                         _prefetch_num_gb * training_config.gradient_accumulation_steps
                     )
                     cpu_barrier()
-                    rollout_end_time = sync_cuda_and_get_time()
-                    rollout_times = rollout_end_time - rollout_begin_time
 
                 expanded_rbs = expand_rollout_batches(rollout_batches)
                 total_samples = training_config.train_gbs * _prefetch_num_gb
@@ -259,16 +277,32 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
                 cpu_barrier()
 
                 rollout_batches_list = get_k_split_list(sorted_rbs, _prefetch_num_gb)
-                if self.config.training.enable_teacher_kl_loss and not self.config.training.setup_teacher_in_independent_topo:
-                    rollout_begin_time = sync_cuda_and_get_time()
+                timers = TimerSingleton.get_timer()
+                if (
+                    self.config.training.enable_teacher_kl_loss and
+                    not self.config.training.setup_teacher_in_independent_topo
+                ):
+                    timers("teacher_infer", log_level=0).start(barrier=True)
                     rollout_batches_list = self.compute_teacher_hidden_states_in_same_process(
                         rollout_batches_list
                     )
-                    rollout_end_time = sync_cuda_and_get_time()
-                    rollout_times += (rollout_end_time - rollout_begin_time)
+                    timers("teacher_infer").stop()
+
+                rollout_times = timers("rollout", log_level=0).elapsed(reset=True)
+                teacher_infer_times = timers("teacher_infer", log_level=0).elapsed(reset=True)
 
                 log(f"training begin", rank=0)
                 with OnloadStudentEngineManager(self.model_engine):
+                    n_gb = max(int(_prefetch_num_gb), 1)
+                    train_prep = sync_cuda_and_get_time() - prefetch_t0
+                    avg_train_prep = train_prep / n_gb
+                    extra_time_metrics = {
+                        "time_perf/avg_rollout_time": rollout_times / n_gb,
+                        "time_perf/avg_teacher_infer_time": teacher_infer_times / n_gb,
+                        "time_perf/train_prep": train_prep,
+                        "time_perf/avg_train_prep": avg_train_prep,
+                        "time_perf/train_step_total": avg_train_prep,
+                    }
                     for batch in rollout_batches_list:
                         if train_step == training_config.exit_step:
                             exit_flag = True
@@ -279,7 +313,7 @@ class OffPolicyDistillStudentActor(FinetuneActor, TestActorMixin, ProfileMixin):
                             epoch,
                             train_step,
                             batch,
-                            avg_rollout_time=rollout_times / _prefetch_num_gb
+                            extra_time_metrics=extra_time_metrics,
                         )
                         if self.config.debug.trainer_return_ppo_step_metrics:
                             ret_metrics.append(metric)

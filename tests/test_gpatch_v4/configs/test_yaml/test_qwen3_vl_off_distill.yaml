@@ -62,6 +62,8 @@ policy:
 
 # test 用，理论上不能用相同的模型
 teacher:
+  dist_config:
+    nnodes: 1
   model_arch: "qwen3_vl"
   hf_model_path: "hf-hub/Qwen/Qwen3-VL-2B-Instruct"
   hf_tokenizer_path: "hf-hub/Qwen/Qwen3-VL-2B-Instruct"

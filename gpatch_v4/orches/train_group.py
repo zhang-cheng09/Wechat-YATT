@@ -14,6 +14,7 @@ from gpatch_v4.actor import (
     DpoActor,
     DynBatchGrpoAsyncTrainActor,
     EmbeddingActor,
+    EmbeddingOffPolicyDistillStudentActor,
     EvaluateActor,
     FinetuneActor,
     GrpoAsyncTrainActor,
@@ -28,6 +29,7 @@ from gpatch_v4.configs.config import (
     AgenticOnPolicyDistillConfig,
     DpoConfig,
     EmbeddingConfig,
+    EmbeddingOffPolicyDistillConfig,
     EvaluateConfig,
     FinetuneConfig,
     OffPolicyDistillConfig,
@@ -110,6 +112,9 @@ class RayTrainGroup:
                 actor_impl = GrpoTrainActor
         elif isinstance(self.config, OnPolicyDistillConfig):
             actor_impl = DistillStudentActor
+        elif isinstance(self.config, EmbeddingOffPolicyDistillConfig):
+            # Must come before OffPolicyDistillConfig: EmbeddingOffPolicyDistillConfig subclasses it.
+            actor_impl = EmbeddingOffPolicyDistillStudentActor
         elif isinstance(self.config, OffPolicyDistillConfig):
             actor_impl = OffPolicyDistillStudentActor
         elif isinstance(self.config, T2iEditSftConfig):
@@ -130,7 +135,7 @@ class RayTrainGroup:
         else:
             raise NotImplementedError(f"unknown config {type(self.config)}")
         runtime_env = {"env_vars": env_vars}
-        if self.config.report.profile.use_nsys:
+        if hasattr(self.config, "report") and self.config.report.profile.use_nsys:
             profile_dir = self.config.report.profile.profile_save_dir
             os.makedirs(profile_dir, exist_ok=True)
             runtime_env["nsight"] = {
@@ -325,6 +330,14 @@ class RayTrainGroup:
         results = [await fut for fut in futs]
         return results[0]
 
+    async def set_training_schedule(self, total_ppo_step: int, ppo_step_per_epoch: int) -> None:
+        futs = [
+            actor.set_training_schedule.remote(total_ppo_step, ppo_step_per_epoch)
+            for actor in self._actor_handlers
+        ]
+        for fut in futs:
+            await fut
+
     async def get_overlap_stats(self):
         """Collect overlap timestamps from all actors.
 
@@ -342,8 +355,8 @@ class RayTrainGroup:
         ----------
         epoch : int
         ppo_step : int
-        dp_refs : list[ray.ObjectRef]
-            One ObjectRef per DP rank from the ``RolloutController``.
+        dp_refs : list
+            One Ray envelope or TQ train-batch reference per DP rank.
         extra_metrics : dict or None
             Driver-side timing or other metrics merged into the actor's
             metrics for wandb logging.
@@ -357,6 +370,30 @@ class RayTrainGroup:
             for actor in self._actor_handlers
         ]
         return [await fut for fut in futs]
+
+    async def eval_logging(
+        self,
+        metrics,
+        iteration,
+        report_step=None,
+        commit=False,
+    ):
+        futs = [
+            actor.eval_logging.remote(
+                metrics,
+                iteration,
+                report_step=report_step,
+                commit=commit,
+            ) for actor in self._actor_handlers
+        ]
+        for fut in futs:
+            await fut
+
+    async def finish_reporting(self) -> None:
+        """Wait for training actors to flush and close their reporters."""
+        futs = [actor.finish_reporting.remote() for actor in self._actor_handlers]
+        for fut in futs:
+            await fut
 
     async def save_checkpoint(self, step):
         """Save checkpoint on all actors."""
